@@ -11,9 +11,9 @@ same requests, the same socket, the same terminals with numbered output and
 replays. The shells run right here, in pseudo-terminals of this computer,
 with nothing going over the network.
 
-This is the first version: the terminals of this computer, in the classic
-mode. The feed of blocks with tTerm's own input line comes next, then signing
-in, the servers and notes of tTerm Web, and Windows.
+For now it has the terminals of this computer, in the classic mode. The feed
+of blocks with tTerm's own input line comes next, then signing in, the
+servers and notes of tTerm Web, and Windows.
 
 ## How it is made
 

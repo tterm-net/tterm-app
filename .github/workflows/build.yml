@@ -15,7 +15,7 @@ jobs:
     name: Engine on Linux, with real shells
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Shells and programs the tests drive
         run: |
           sudo apt-get update
@@ -28,7 +28,7 @@ jobs:
     name: App for macOS (Intel and Apple silicon)
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: The page of tTerm Web, at WEB_COMMIT
         run: sh scripts/web.sh
       - uses: dtolnay/rust-toolchain@stable
@@ -36,7 +36,7 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Engine tests on macOS, with its bash and zsh
         run: cargo test -p tterm-engine
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: Tauri's command line
@@ -49,7 +49,7 @@ jobs:
         run: |
           ls -la target/universal-apple-darwin/release/bundle/dmg
           lipo -info target/universal-apple-darwin/release/bundle/macos/tTerm.app/Contents/MacOS/tterm
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tTerm-macOS
           path: target/universal-apple-darwin/release/bundle/dmg/*.dmg

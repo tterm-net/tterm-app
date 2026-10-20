@@ -257,6 +257,13 @@ async fn zsh_as_the_login_shell() {
     let mut env = tterm_engine::pty::clean_env(true);
     env.retain(|(k, _)| k != "SHELL");
     env.push(("SHELL".into(), zsh.into()));
+    // Its own empty settings: a person without a .zshrc gets zsh's wizard
+    // for new users first (as on GitHub's machines), and a person's own
+    // .zshrc is not what this test is about.
+    let dot = data_dir();
+    std::fs::create_dir_all(&dot).unwrap();
+    std::fs::write(dot.join(".zshrc"), "").unwrap();
+    env.push(("ZDOTDIR".into(), dot.to_string_lossy().to_string()));
     let plan = Plan {
         shell: "zsh".into(),
         argv: vec![zsh.into(), "-c".into(), "exec \"${SHELL:-/bin/sh}\" -l".into()],
@@ -277,7 +284,9 @@ async fn a_background_job_does_not_hold_the_end() {
     let e = engine().await;
     let id = open(&e, 80, 24).await;
     let mut page = attached(&e, &id, 80, 24).await;
-    page.keys(1, "sleep 60 & exit\r").await;
+    // Disowned, so that zsh too lets the shell go: by default it does not
+    // exit while it has jobs. The job still holds the terminal.
+    page.keys(1, "sleep 60 & disown; exit\r").await;
     let started = Instant::now();
     assert!(page.until(15, |p| p.state().map(|s| s["state"] == "ended").unwrap_or(false)).await, "{:?}", page.msgs.last());
     assert!(started.elapsed() < Duration::from_secs(12), "{:?}", started.elapsed());
@@ -659,6 +668,67 @@ async fn the_shell_gets_none_of_the_apps_descriptors() {
     // 0 to 2, and what ls opens to list them.
     assert!(fds.iter().all(|&fd| fd < 10), "the shell has more than its own: {fds:?}");
     unsafe { libc::close(leaked) };
+    let t = e.terminals.get(&uuid::Uuid::parse_str(&id).unwrap()).unwrap();
+    t.close("Closed.").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_shell_starts_at_the_size_of_the_window() {
+    // The page asks for a terminal with a guess at its size, then measures
+    // the window and attaches with the real one: the shell starts at that.
+    let e = engine().await;
+    let plan = Plan {
+        shell: "sh".into(),
+        argv: vec!["/bin/sh".into(), "-c".into(), "stty size; exec /bin/sh".into()],
+        markers: false,
+        blocks: false,
+    };
+    let t = e.terminals.open(e.place(), plan, tterm_engine::pty::clean_env(true), tterm_engine::pty::home_dir(), 200, 50, 24).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut page = Page::new(&e);
+    page.send(json!({"op": "attach", "ch": 1, "id": t.id.to_string(), "after": null, "cols": 100, "rows": 30, "focus": true})).await;
+    assert!(page.until(10, |p| p.text().contains("30 100")).await, "{}", page.text());
+    assert!(!page.text().contains("50 200"), "{}", page.text());
+    t.close("Closed.").await;
+
+    // Nobody attaches: it starts at the guess, a moment later.
+    let plan = Plan {
+        shell: "sh".into(),
+        argv: vec!["/bin/sh".into(), "-c".into(), "stty size; exec /bin/sh".into()],
+        markers: false,
+        blocks: false,
+    };
+    let t = e.terminals.open(e.place(), plan, tterm_engine::pty::clean_env(true), tterm_engine::pty::home_dir(), 90, 20, 24).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    assert_eq!(t.describe()["state"], "open");
+    let mut late = Page::new(&e);
+    late.send(json!({"op": "attach", "ch": 1, "id": t.id.to_string(), "after": null})).await;
+    assert!(late.until(10, |p| p.text().contains("20 90")).await, "{}", late.text());
+    t.close("Closed.").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_coming_back_gets_no_more_lines_than_it_keeps() {
+    let e = engine().await;
+    let id = open(&e, 80, 24).await;
+    let mut page = attached(&e, &id, 80, 24).await;
+    page.keys(1, "seq 1 50000; echo seq-done-$((1+1))\r").await;
+    assert!(page.until(20, |p| p.text().contains("seq-done-2")).await);
+    let mut fresh = Page::new(&e);
+    fresh.send(json!({"op": "attach", "ch": 4, "id": id, "after": null, "cols": 80, "rows": 24})).await;
+    assert!(fresh.until(10, |p| p.msgs.iter().any(|m| m["op"] == "replayed")).await);
+    let text = fresh.text();
+    let lines = text.matches('\n').count();
+    assert!(lines <= tterm_engine::terminals::REPLAY_LINES, "{lines} lines in the replay");
+    assert!(lines >= 10_000, "{lines} lines in the replay");
+    assert!(text.contains("seq-done-2"));
+    assert!(text.len() < 200_000, "{} bytes in the replay", text.len());
+    // Whole lines: the first number in it is whole, and the ones after it
+    // follow on.
+    let numbers: Vec<u32> = text.lines().filter_map(|l| l.trim_end_matches('\r').parse().ok()).collect();
+    assert!(numbers.len() > 9_000, "{}", numbers.len());
+    assert!(numbers.windows(2).all(|w| w[1] == w[0] + 1), "the numbers do not follow on");
+    assert_eq!(*numbers.last().unwrap(), 50_000);
     let t = e.terminals.get(&uuid::Uuid::parse_str(&id).unwrap()).unwrap();
     t.close("Closed.").await;
 }

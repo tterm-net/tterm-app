@@ -34,8 +34,17 @@ use uuid::Uuid;
 
 /// Output kept for pages that come back after a moment away.
 pub const KEEP_BYTES: usize = 4 * 1024 * 1024;
-/// What a page that starts over draws: the last of the output.
+/// What a page that starts over draws: the last of the output...
 pub const REPLAY_BYTES: usize = 1024 * 1024;
+/// ...and no more lines than the page keeps: 10,000 of history
+/// (`scrollback` in ClassicTerminal.tsx) and a screen. A megabyte of `yes`
+/// is 170,000 lines, all drawn to be dropped, and seen flying by.
+pub const REPLAY_LINES: usize = 10_000 + 500;
+/// How long a new shell waits for the page to say the size of its window.
+/// The page asks for a terminal with a guess at the size and measures the
+/// window a moment later; a shell started at the guess draws its first
+/// prompt for the wrong width (zsh leaves its mark for a line left open).
+const SIZE_WAIT: Duration = Duration::from_secs(1);
 /// An ended terminal stays this long, so a page can still show how it ended.
 pub const KEEP_ENDED: Duration = Duration::from_secs(15 * 60);
 /// Typed before the shell is up, kept until it is.
@@ -196,6 +205,8 @@ pub struct Terminal {
     done: watch::Sender<bool>,
     /// A page got further: the shell may write on.
     progress: Notify,
+    /// A page said the size of its window: the shell may start.
+    sized: watch::Sender<bool>,
 }
 
 impl Terminal {
@@ -238,6 +249,7 @@ impl Terminal {
             version: watch::channel(0).0,
             done: watch::channel(false).0,
             progress: Notify::new(),
+            sized: watch::channel(false).0,
         })
     }
 
@@ -286,16 +298,21 @@ impl Terminal {
 
     pub fn resize(&self, cols: i64, rows: i64) {
         let (cols, rows) = pty::clamp_size(cols, rows);
-        let mut st = self.lock();
-        if (cols, rows) == (st.cols, st.rows) {
-            return;
-        }
-        st.cols = cols;
-        st.rows = rows;
-        if st.state == State::Open {
-            if let Some(pty) = &st.pty {
-                pty.resize(cols, rows);
+        let starting = {
+            let mut st = self.lock();
+            if (cols, rows) != (st.cols, st.rows) {
+                st.cols = cols;
+                st.rows = rows;
+                if st.state == State::Open {
+                    if let Some(pty) = &st.pty {
+                        pty.resize(cols, rows);
+                    }
+                }
             }
+            st.state == State::Connecting
+        };
+        if starting {
+            self.sized.send_replace(true);
         }
     }
 
@@ -474,7 +491,8 @@ impl Terminal {
 
     /// What a page that starts over draws: the number the replay follows,
     /// the sequences that bring a clean screen to the modes the stream was
-    /// in at that point, and the last REPLAY_BYTES of it.
+    /// in at that point, and the last of it: REPLAY_BYTES, REPLAY_LINES at
+    /// most.
     pub fn snapshot(&self) -> (u64, Vec<u8>, Vec<Event>) {
         let (base, prefix, events, _) = self.snapshot_at();
         (base, prefix, events)
@@ -484,14 +502,37 @@ impl Terminal {
     fn snapshot_at(&self) -> (u64, Vec<u8>, Vec<Event>, u64) {
         let st = self.lock();
         let events: Vec<Event> = st.events.iter().cloned().collect();
-        let (mut start, mut size) = (0usize, 0usize);
+        // From the end back, REPLAY_BYTES and REPLAY_LINES at most. Cut by
+        // lines, the replay starts right after a newline, inside an event
+        // (`split`, the bytes of it left out); cut by bytes, at an event.
+        let (mut start, mut size, mut lines) = (0usize, 0usize, 0usize);
+        let mut split: Option<usize> = None;
         for i in (0..events.len()).rev() {
             if let Kind::Out(d) = &events[i].kind {
+                let n = d.iter().filter(|b| **b == b'\n').count();
+                if lines + n > REPLAY_LINES {
+                    let need = REPLAY_LINES - lines;
+                    let mut seen = 0usize;
+                    let mut at = 0usize;
+                    for (j, b) in d.iter().enumerate().rev() {
+                        if *b == b'\n' {
+                            seen += 1;
+                            if seen == need + 1 {
+                                at = j + 1;
+                                break;
+                            }
+                        }
+                    }
+                    start = i;
+                    split = Some(at);
+                    break;
+                }
                 size += d.len();
                 if size > REPLAY_BYTES {
                     start = i + 1;
                     break;
                 }
+                lines += n;
             }
         }
         let mut modes = st.base_modes.clone();
@@ -500,7 +541,6 @@ impl Terminal {
                 modes.feed(d);
             }
         }
-        let cut = st.trimmed || start > 0;
         let mut events = events[start..].to_vec();
         let base = events.first().map(|e| e.seq - 1).unwrap_or(st.last_seq);
         let base_pos = match events.first() {
@@ -508,7 +548,12 @@ impl Terminal {
             Some(Event { end, .. }) => *end,
             None => st.out_pos,
         };
-        if cut {
+        if let Some(at) = split {
+            if let Some(Event { seq, end, kind: Kind::Out(first) }) = events.first().cloned() {
+                modes.feed(&first[..at]);
+                events[0] = Event { seq, end, kind: Kind::Out(Arc::from(first[at..].to_vec())) };
+            }
+        } else if st.trimmed || start > 0 {
             if let Some(Event { seq, end, kind: Kind::Out(first) }) = events.first().cloned() {
                 // The replay may start inside a line or an escape sequence:
                 // it starts at the next line instead.
@@ -607,6 +652,12 @@ impl Terminal {
     }
 
     async fn start(self: Arc<Self>, plan: Plan, env: Vec<(String, String)>, cwd: std::path::PathBuf) {
+        // The size of the window first, or the guess a second later.
+        let mut sized = self.sized.subscribe();
+        let _ = tokio::time::timeout(SIZE_WAIT, sized.wait_for(|s| *s)).await;
+        if self.state() == State::Ended {
+            return;
+        }
         let (cols, rows, machine) = {
             let st = self.lock();
             (st.cols, st.rows, st.place.machine.clone())
