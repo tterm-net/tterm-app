@@ -1,0 +1,5 @@
+/target/
+/web-dist/
+/app/gen/
+node_modules/
+.DS_Store

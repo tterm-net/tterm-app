@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "tTerm",
+  "version": "0.0.1",
+  "identifier": "net.tterm.desktop",
+  "build": {
+    "frontendDist": "../web-dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self'",
+        "font-src": "'self'",
+        "img-src": "'self' data:",
+        "connect-src": "ipc: http://ipc.localhost",
+        "frame-ancestors": "'none'",
+        "frame-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'",
+        "object-src": "'none'"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "DeveloperTool",
+    "shortDescription": "Terminal of tTerm",
+    "longDescription": "tTerm on your computer: the terminal of tTerm Web, with the shells of this computer.",
+    "copyright": "© 2026 tTerm. AGPL-3.0.",
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}

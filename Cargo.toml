@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["engine", "app"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "AGPL-3.0-only"
+authors = ["Denis Gerasimenko"]
+repository = "https://github.com/tterm-net/tterm-app"
+
+[profile.release]
+# One small, fast binary: the app ships as it is built.
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

@@ -1,0 +1,28 @@
+[package]
+name = "tterm-app"
+description = "tTerm on a computer: the page of tTerm Web in a window of its own, with the shells of this computer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tterm"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time", "macros"] }
+tterm-engine = { path = "../engine" }
+
+# The answer to "may the app quit?" that tao's delegate does not give (src/mac.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"

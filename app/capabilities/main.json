@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "The window of tTerm: its page asks the engine about this computer, and can do nothing else. Remote pages get none of it.",
+  "windows": ["main"],
+  "permissions": [
+    "allow-api",
+    "allow-ws-open",
+    "allow-ws-send",
+    "allow-ws-recv",
+    "allow-ws-close",
+    "allow-open-external"
+  ]
+}

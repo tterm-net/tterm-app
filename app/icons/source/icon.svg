@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- The logo of tTerm (tterm-web/web/public/favicon.svg) on the macOS icon
+       grid: the rounded square at 824 of 1024, centred, as Apple's template
+       has it. -->
+  <g transform="translate(100 100) scale(1.609375)">
+    <rect width="512" height="512" rx="116" fill="#131417"/>
+    <path d="M118 168 L206 256 L118 344" fill="none" stroke="#E9A33F" stroke-width="56" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M330 140 L330 316 C330 344 344 356 372 350" fill="none" stroke="#EDEFF3" stroke-width="56" stroke-linecap="round"/>
+    <path d="M272 212 L392 212" fill="none" stroke="#EDEFF3" stroke-width="56" stroke-linecap="round"/>
+  </g>
+</svg>
