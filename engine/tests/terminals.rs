@@ -257,11 +257,14 @@ async fn zsh_as_the_login_shell() {
     let mut env = tterm_engine::pty::clean_env(true);
     env.retain(|(k, _)| k != "SHELL");
     env.push(("SHELL".into(), zsh.into()));
-    // Its own empty settings: a person without a .zshrc gets zsh's wizard
-    // for new users first (as on GitHub's machines), and a person's own
-    // .zshrc is not what this test is about.
+    // Settings of its own, and none of the machine's: this test is about
+    // the engine, not about how zsh is set up where it runs. On GitHub's
+    // machines a user without a .zshrc gets zsh's wizard for new users, and
+    // Ubuntu's own /etc/zsh/zshrc runs compinit, which asks a question
+    // there about folders it finds unsafe; either one eats what is typed.
     let dot = data_dir();
     std::fs::create_dir_all(&dot).unwrap();
+    std::fs::write(dot.join(".zshenv"), "unsetopt GLOBAL_RCS\n").unwrap();
     std::fs::write(dot.join(".zshrc"), "").unwrap();
     env.push(("ZDOTDIR".into(), dot.to_string_lossy().to_string()));
     let plan = Plan {
