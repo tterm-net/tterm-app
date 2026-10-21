@@ -464,10 +464,11 @@ impl Pty {
         }
     }
 
-    /// A hangup, as when a terminal window closes; the reader and writer
-    /// let go.
+    /// A hangup, as when a terminal window closes. What the shell prints
+    /// from here on is still read, until it is gone: on macOS a dying
+    /// process waits until its last output is read, and a shell killed with
+    /// output nobody reads would linger (tterm-web's checks met that first).
     pub fn hangup(&self) {
-        self.stopping.store(true, Ordering::SeqCst);
         self.signal(Signal::SIGHUP);
     }
 

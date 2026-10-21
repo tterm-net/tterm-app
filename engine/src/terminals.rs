@@ -63,6 +63,9 @@ pub const KEEP_ENDED: Duration = Duration::from_secs(15 * 60);
 const PENDING_MAX: usize = 64 * 1024;
 /// A hangup is given this long before the shell is killed.
 const HANGUP_GRACE: Duration = Duration::from_secs(3);
+/// A killed shell is waited for this long, at most, before its terminal
+/// ends without it.
+const KILL_WAIT: Duration = Duration::from_secs(1);
 /// When the app quits, its shells have this long to end after their
 /// hangups; then they end with the app.
 const QUIT_WAIT: Duration = Duration::from_millis(1500);
@@ -912,12 +915,16 @@ impl Terminal {
             }
             Some(pty) => {
                 pty.hangup();
-                // The pump ends the terminal once the shell is gone.
+                // The pump ends the terminal once the shell is gone. One that
+                // ignores the hangup is killed HANGUP_GRACE after it; should
+                // even its end not come in a moment, the terminal ends
+                // without it.
                 let mut done = self.done.subscribe();
-                let ended = tokio::time::timeout(HANGUP_GRACE * 3, done.wait_for(|d| *d)).await.is_ok();
-                if !ended {
+                if tokio::time::timeout(HANGUP_GRACE, done.wait_for(|d| *d)).await.is_err() {
                     pty.kill();
-                    self.end(reason.to_string(), None);
+                    if tokio::time::timeout(KILL_WAIT, done.wait_for(|d| *d)).await.is_err() {
+                        self.end(reason.to_string(), None);
+                    }
                 }
             }
         }
