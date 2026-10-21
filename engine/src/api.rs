@@ -17,6 +17,9 @@ pub struct Response {
     pub body: Vec<u8>,
 }
 
+/// A line for Tab, at most (characters).
+const MAX_LINE: usize = 64 * 1024;
+
 impl Response {
     fn json(status: u16, value: Value) -> Self {
         Response { status, content_type: "application/json", body: value.to_string().into_bytes() }
@@ -34,7 +37,7 @@ impl Response {
 const LATER_ACCOUNT: &str = "This comes with signing in to tTerm, in a later version of the app. For now the app works with this computer only.";
 const LATER_NOTES: &str = "Notes come to the app with signing in, in a later version. Until then they are in tTerm Web, in your browser.";
 const LATER_MACHINES: &str = "Servers and other computers come to the app with signing in, in a later version. Until then they are in tTerm Web, in your browser.";
-const NOT_OPEN: &str = "The terminal is not open.";
+use crate::terminals::NOT_OPEN;
 
 fn body_json(body: &[u8]) -> Option<Value> {
     if body.is_empty() {
@@ -45,6 +48,25 @@ fn body_json(body: &[u8]) -> Option<Value> {
 
 fn uuid_of(text: &str) -> Option<Uuid> {
     Uuid::parse_str(text).ok()
+}
+
+/// One value of the query, as the page wrote it.
+fn query_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query.split('&').filter_map(|pair| pair.split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| v)
+}
+
+/// A whole number from the query: None when absent, Err when it is not one.
+fn query_int(query: &str, name: &str) -> Result<Option<i64>, ()> {
+    match query_value(query, name) {
+        None => Ok(None),
+        Some(v) => v.parse::<i64>().map(Some).map_err(|_| ()),
+    }
+}
+
+/// A live terminal that is open: what Tab and the lists need.
+fn open_terminal_of(engine: &Arc<Engine>, id: &str) -> Option<Arc<crate::terminals::Terminal>> {
+    let t = uuid_of(id).and_then(|id| engine.terminals.get(&id))?;
+    (t.state() == crate::terminals::State::Open).then_some(t)
 }
 
 /// Answers one request of the page: `path` with its query, as the page
@@ -86,10 +108,16 @@ pub async fn handle(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8])
 
         // ----------------------------------------------------- terminals
         ("POST", ["api", "terminals"]) => open_terminal(engine, body).await,
-        ("GET", ["api", "terminals", id]) => match uuid_of(id).and_then(|id| engine.terminals.get(&id)) {
-            Some(t) => Response::json(200, t.describe()),
-            None => Response::error(404, "no such terminal"),
-        },
+        ("GET", ["api", "terminals", id]) => {
+            let Some(id) = uuid_of(id) else { return Response::error(404, "no such terminal") };
+            if let Some(t) = engine.terminals.get(&id) {
+                return Response::json(200, t.describe());
+            }
+            match engine.ended_json(&id).await {
+                Some(ended) => Response::json(200, ended),
+                None => Response::error(404, "no such terminal"),
+            }
+        }
         ("PATCH", ["api", "terminals", id]) => {
             let Some(id) = uuid_of(id) else { return Response::error(404, "no such terminal") };
             let name = body_json(body).and_then(|b| b.get("name").and_then(Value::as_str).map(str::to_string));
@@ -106,19 +134,66 @@ pub async fn handle(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8])
             t.close("Closed.").await;
             Response::json(200, t.describe())
         }
-        ("GET", ["api", "terminals", id, "blocks"]) => match uuid_of(id).and_then(|id| engine.terminals.get(&id)) {
-            Some(_) => {
-                let _ = query;
-                Response::json(200, json!({"blocks": [], "more": false}))
+        // The feed: finished blocks, the latest page of them, each with the
+        // end of its output. An ended terminal keeps its feed.
+        ("GET", ["api", "terminals", id, "blocks"]) => {
+            let (Ok(before), Ok(limit)) = (query_int(query, "before"), query_int(query, "limit")) else {
+                return Response::error(422, "before and limit are whole numbers.");
+            };
+            let Some(id) = uuid_of(id) else { return Response::error(404, "no such terminal") };
+            match engine.terminals.store.feed(&id.to_string(), before, limit.unwrap_or(60)).await {
+                Some(feed) => Response::json(200, feed),
+                None => Response::error(404, "no such terminal"),
             }
-            None => Response::error(404, "no such terminal"),
-        },
-        ("GET", ["api", "terminals", _, "blocks", _, "output"]) => Response::error(404, "no such block"),
-        ("GET", ["api", "terminals", id, "history"]) => match uuid_of(id).and_then(|id| engine.terminals.get(&id)) {
-            Some(_) => Response::json(200, json!({"commands": []})),
-            None => Response::error(404, "no such terminal"),
-        },
-        ("POST", ["api", "terminals", _, "complete" | "dirs" | "branches"]) => Response::error(409, NOT_OPEN),
+        }
+        // Everything a block kept of its output, as the terminal printed it.
+        ("GET", ["api", "terminals", id, "blocks", seq, "output"]) => {
+            let Ok(seq) = seq.parse::<i64>() else { return Response::error(422, "The block is a whole number.") };
+            let Some(id) = uuid_of(id) else { return Response::error(404, "no such block") };
+            match engine.terminals.store.block_output(&id.to_string(), seq).await {
+                Some((output, _cut)) => Response { status: 200, content_type: "application/octet-stream", body: output },
+                None => Response::error(404, "no such block"),
+            }
+        }
+        ("GET", ["api", "terminals", id, "history"]) => {
+            let Some(id) = uuid_of(id) else { return Response::error(404, "no such terminal") };
+            match engine.terminals.store.history(&id.to_string()).await {
+                Some(commands) => {
+                    let commands: Vec<Value> = commands.into_iter().map(|c| json!({"command": c, "here": true})).collect();
+                    Response::json(200, json!({"commands": commands}))
+                }
+                None => Response::error(404, "no such terminal"),
+            }
+        }
+        // Tab and the two lists run a small script on this computer.
+        ("POST", ["api", "terminals", id, "complete"]) => {
+            let Some(t) = open_terminal_of(engine, id) else { return Response::error(409, NOT_OPEN) };
+            let request = body_json(body).unwrap_or(Value::Null);
+            let (Some(line), Some(cursor)) = (request.get("line").and_then(Value::as_str), request.get("cursor").and_then(Value::as_i64)) else {
+                return Response::error(422, "Tab needs the line and where the cursor is.");
+            };
+            if line.chars().count() > MAX_LINE {
+                return Response::error(422, "The line is too long.");
+            }
+            match t.complete(line, cursor).await {
+                Ok(found) => Response::json(200, found),
+                Err(why) => Response::error(409, &why),
+            }
+        }
+        ("POST", ["api", "terminals", id, "dirs"]) => {
+            let Some(t) = open_terminal_of(engine, id) else { return Response::error(409, NOT_OPEN) };
+            match t.dirs().await {
+                Ok(found) => Response::json(200, found),
+                Err(why) => Response::error(409, &why),
+            }
+        }
+        ("POST", ["api", "terminals", id, "branches"]) => {
+            let Some(t) = open_terminal_of(engine, id) else { return Response::error(409, NOT_OPEN) };
+            match t.branches().await {
+                Ok(found) => Response::json(200, found),
+                Err(why) => Response::error(409, &why),
+            }
+        }
 
         // ------------------------------------------------------ projects
         ("POST", ["api", "projects"]) => Response::error(403, LATER_ACCOUNT),
@@ -240,10 +315,14 @@ async fn open_terminal(engine: &Arc<Engine>, body: &[u8]) -> Response {
     }
     let cols = request.get("cols").and_then(Value::as_i64).unwrap_or(80);
     let rows = request.get("rows").and_then(Value::as_i64).unwrap_or(24);
-    let plan = engine.plan();
+    // Planned in the background, while the terminal connects.
+    let planner = {
+        let engine = engine.clone();
+        async move { engine.plan().await }
+    };
     let env = crate::pty::clean_env(true);
     let home = crate::pty::home_dir();
-    match engine.terminals.open(engine.place(), plan, env, home, cols, rows, crate::MOST_TERMINALS).await {
+    match engine.terminals.open(engine.place(), planner, env, home, cols, rows, crate::MOST_TERMINALS).await {
         Ok(t) => Response::json(201, t.describe()),
         Err(why) => Response::error(404, &why),
     }

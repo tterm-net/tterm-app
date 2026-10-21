@@ -266,8 +266,8 @@ fn quit(handle: AppHandle, app: App) {
     tauri::async_runtime::spawn(async move {
         let engine = app.engine.clone();
         // Hangups for all, and a moment for them; whatever is left goes
-        // with the app, its terminals closed.
-        let _ = tokio::time::timeout(Duration::from_secs(2), engine.terminals.stop_all("tTerm quit.")).await;
+        // with the app, its terminals ended and kept (2.5 s at most).
+        engine.terminals.stop_all("tTerm quit.").await;
         handle.exit(0);
     });
 }

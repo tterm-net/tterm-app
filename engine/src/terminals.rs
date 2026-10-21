@@ -14,6 +14,13 @@
 //! kept, drawn again from a clean screen, and a full-screen program is asked
 //! to redraw itself.
 //!
+//! From the shell's markers (shell.rs) each command becomes a block: its
+//! text, the directory and branch it ran in, how long it took, how it
+//! ended, and its output, the beginning and the end of it if it was long.
+//! Finished blocks go to the store (store.rs), for the page's feed and the
+//! input line's history; the input line types whole commands (`run`), and
+//! asks this computer what a word under Tab can become (`complete`).
+//!
 //! Unlike the core, the shell here is read no faster than the window draws.
 //! A local shell writes a hundred times faster than any network carries, and
 //! a page that falls behind what is kept starts over from a replay, during
@@ -22,14 +29,19 @@
 //! computer does, and a page that stops drawing (hidden, gone) stops holding
 //! it back.
 
+use crate::blocks::Block;
+use crate::complete;
 use crate::modes::Modes;
 use crate::pty::{self, Pty};
+use crate::shell::{self, Marker, MarkerParser, Piece};
+use crate::store::{Finished, Store};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{mpsc, watch, Notify, Semaphore};
 use uuid::Uuid;
 
 /// Output kept for pages that come back after a moment away.
@@ -51,6 +63,9 @@ pub const KEEP_ENDED: Duration = Duration::from_secs(15 * 60);
 const PENDING_MAX: usize = 64 * 1024;
 /// A hangup is given this long before the shell is killed.
 const HANGUP_GRACE: Duration = Duration::from_secs(3);
+/// When the app quits, its shells have this long to end after their
+/// hangups; then they end with the app.
+const QUIT_WAIT: Duration = Duration::from_millis(1500);
 /// Output sent in one frame, at most.
 pub const FRAME_MAX: usize = 32 * 1024;
 /// How far the shell may write ahead of the slowest page that keeps up.
@@ -67,6 +82,18 @@ pub const OUTPUT: u8 = 1;
 pub const INPUT: u8 = 2;
 /// A terminal's name, at most.
 pub const NAME_MAX: usize = 40;
+/// A command typed by `run` that the shell has not answered after this long
+/// never started: a quote or a heredoc left open, or a history expansion
+/// that failed (bash then shows its prompt again without a marker).
+pub const TYPED_STALE: Duration = Duration::from_secs(3);
+/// A side script (Tab, the directory and branch lists) may take this long,
+/// print this much, and this many may run at once for one terminal.
+pub const SIDE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const SIDE_MAX: usize = 1024 * 1024;
+pub const SIDE_AT_ONCE: usize = 2;
+/// The last commands, to say which one a replay starts inside of.
+const RECENT: usize = 64;
+pub const NOT_OPEN: &str = "The terminal is not open.";
 
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -160,6 +187,32 @@ pub struct Plan {
     pub blocks: bool,
 }
 
+/// A command of late: where it starts and ends in the stream.
+#[derive(Clone, Debug)]
+struct Recent {
+    command: String,
+    cwd: String,
+    branch: String,
+    seq_start: u64,
+    seq_end: Option<u64>,
+    cols: u16,
+    at: i64,
+}
+
+impl Recent {
+    fn json(&self) -> Value {
+        json!({
+            "command": self.command,
+            "cwd": self.cwd,
+            "branch": self.branch,
+            "seqStart": self.seq_start,
+            "seqEnd": self.seq_end,
+            "cols": self.cols,
+            "at": self.at,
+        })
+    }
+}
+
 pub struct Inner {
     pub place: Place,
     pub name: String,
@@ -177,6 +230,8 @@ pub struct Inner {
     pub home: String,
     pub branch: String,
     pub venv: String,
+    /// The shell's PATH at its last prompt, for Tab on a command.
+    pub path: String,
     pub events: VecDeque<Event>,
     pub first_seq: u64,
     pub last_seq: u64,
@@ -196,6 +251,17 @@ pub struct Inner {
     pub active: Option<u64>,
     /// How far each page watching it has got; see `room`.
     seen: HashMap<u64, Seen>,
+    /// The one-time key of its markers, and what takes them out.
+    key: String,
+    parser: MarkerParser,
+    /// The command running now.
+    block: Option<Block>,
+    recent: VecDeque<Recent>,
+    /// A command was typed by `run` and the shell has not answered with a
+    /// marker yet: no second one goes in on top of it.
+    typed: bool,
+    typed_at: Instant,
+    typed_stale: Duration,
 }
 
 pub struct Terminal {
@@ -207,10 +273,15 @@ pub struct Terminal {
     progress: Notify,
     /// A page said the size of its window: the shell may start.
     sized: watch::Sender<bool>,
+    store: Arc<Store>,
+    /// Side scripts running for it.
+    side: Semaphore,
 }
 
 impl Terminal {
-    fn new(place: Place, name: String, cols: u16, rows: u16) -> Arc<Self> {
+    fn new(place: Place, name: String, cols: u16, rows: u16, store: Arc<Store>) -> Arc<Self> {
+        let key = shell::new_key();
+        let parser = MarkerParser::new(&key);
         Arc::new(Self {
             id: Uuid::new_v4(),
             inner: Mutex::new(Inner {
@@ -230,6 +301,7 @@ impl Terminal {
                 home: String::new(),
                 branch: String::new(),
                 venv: String::new(),
+                path: String::new(),
                 events: VecDeque::new(),
                 first_seq: 1,
                 last_seq: 0,
@@ -245,11 +317,20 @@ impl Terminal {
                 nudging: false,
                 active: None,
                 seen: HashMap::new(),
+                key,
+                parser,
+                block: None,
+                recent: VecDeque::new(),
+                typed: false,
+                typed_at: Instant::now(),
+                typed_stale: TYPED_STALE,
             }),
             version: watch::channel(0).0,
             done: watch::channel(false).0,
             progress: Notify::new(),
             sized: watch::channel(false).0,
+            store,
+            side: Semaphore::new(SIDE_AT_ONCE),
         })
     }
 
@@ -316,17 +397,40 @@ impl Terminal {
         }
     }
 
-    /// Types a whole command at the shell's prompt, the way tTerm's own
-    /// input line hands it over. Returns why not, or None. Commands become
-    /// blocks only with the markers; without them the shell runs in the
-    /// classic mode only, as on the web.
+    /// Types a whole command at the shell's prompt and presses Enter, the
+    /// way tTerm's own input line hands it over. Returns why not, or None.
+    ///
+    /// The command goes in as a bracketed paste when the shell has that on
+    /// (bash 5.1+ and zsh do): the line editor then takes it as text, every
+    /// line of it, with no key in it read as a binding, and Enter runs it
+    /// all. Without it the text is typed as is.
+    ///
+    /// Ctrl+U goes first and empties the line. Keys typed into the previous
+    /// command that it never read wait in the terminal, and the line editor
+    /// takes them in at the prompt; they would end up in front of this
+    /// command.
     pub fn run(&self, command: &str) -> Option<String> {
-        let st = self.lock();
-        if st.state != State::Open || st.pty.is_none() {
-            return Some("The terminal is not open.".into());
-        }
+        let mut st = self.lock();
+        let Some(pty) = st.pty.clone().filter(|_| st.state == State::Open) else {
+            return Some(NOT_OPEN.into());
+        };
         if !st.blocks {
             return Some("This shell does not mark where commands start, so it runs in the classic mode only.".into());
+        }
+        if st.block.is_some() {
+            return Some("A command is still running.".into());
+        }
+        if st.typed {
+            if st.typed_at.elapsed() < st.typed_stale {
+                return Some("A command is still running.".into());
+            }
+            // The last one never started. Ctrl+C sets the shell back to an
+            // empty prompt; whatever follows it in the same moment would be
+            // thrown away by the terminal, so this command waits for Enter
+            // again.
+            pty.write(b"\x03");
+            st.typed_at = Instant::now();
+            return Some("The shell had not taken the last command (an open quote, or a history expansion with ! that failed). It is cancelled now: press Enter again.".into());
         }
         let text = clean_command(command);
         if text.trim().is_empty() {
@@ -337,10 +441,105 @@ impl Terminal {
         } else {
             [b"\x15".as_slice(), text.replace('\t', " ").as_bytes(), b"\r"].concat()
         };
-        if let Some(pty) = &st.pty {
-            pty.write(&data);
-        }
+        st.typed = true;
+        st.typed_at = Instant::now();
+        pty.write(&data);
         None
+    }
+
+    /// For checks: how long a typed command may go unanswered.
+    pub fn set_typed_stale(&self, wait: Duration) {
+        self.lock().typed_stale = wait;
+    }
+
+    /// Whether a command typed by `run` is still waiting for the shell.
+    pub fn typed(&self) -> bool {
+        self.lock().typed
+    }
+
+    /// The command running now, as the page gets it.
+    pub fn running(&self) -> Option<Value> {
+        running_of(&self.lock())
+    }
+
+    /// The command whose output goes on past the number `seq`: a replay
+    /// that starts there starts inside it, after its start marker, and the
+    /// feed still has to know what it was.
+    pub fn block_at(&self, seq: u64) -> Option<Value> {
+        let st = self.lock();
+        st.recent.iter().rev().find(|e| e.seq_start <= seq && e.seq_end.is_none_or(|end| end > seq)).map(Recent::json)
+    }
+
+    // ------------------------------------------------------- side scripts
+
+    /// Runs a small sh script on this computer, outside the terminal, and
+    /// returns the lines it listed. An empty list when it fails: Tab then
+    /// simply finds nothing.
+    async fn side(&self, script: String) -> Result<Vec<String>, String> {
+        if self.state() != State::Open {
+            return Err(NOT_OPEN.into());
+        }
+        let _turn = self.side.acquire().await.map_err(|_| NOT_OPEN.to_string())?;
+        let (_, out) = crate::machine::run_script(&script, SIDE_TIMEOUT).await;
+        Ok(complete::listed(&out[..out.len().min(SIDE_MAX)]))
+    }
+
+    /// What the word under the cursor can become. `cursor` counts
+    /// characters, as the page's line does.
+    pub async fn complete(&self, line: &str, cursor: i64) -> Result<Value, String> {
+        let chars: Vec<char> = line.chars().collect();
+        let cursor = cursor.clamp(0, chars.len() as i64) as usize;
+        let before: String = chars[..cursor].iter().collect();
+        let (words, word) = complete::split(&before);
+        let ctx = complete::context(&words, word);
+        let (cwd, home, path) = {
+            let st = self.lock();
+            (st.cwd.clone(), st.home.clone(), st.path.clone())
+        };
+        let word = &ctx.word;
+        let mut items: Vec<Value> = Vec::new();
+        if ctx.kind == "command" {
+            let names = self.side(complete::commands_script(&path, &word.value)).await?;
+            items = complete::command_items(word, &names);
+        } else if ctx.kind == "git" {
+            items = complete::git_items(word);
+        }
+        if ctx.kind == "branch" || ctx.kind == "branch+file" {
+            let refs = self.side(complete::branches_script(&cwd)).await?;
+            items = complete::branch_items(word, &refs, ctx.switch);
+        }
+        if ctx.kind == "file" || ctx.kind == "dir" || ctx.kind == "branch+file" {
+            let (place, _, _) = complete::dir_part(&word.value, &home);
+            let entries = self.side(complete::list_script(&cwd, &place)).await?;
+            items.extend(complete::file_items(word, &entries, &home, ctx.kind == "dir"));
+        }
+        let more = items.len() > complete::MAX_ITEMS;
+        items.truncate(complete::MAX_ITEMS);
+        Ok(json!({"start": word.start, "end": cursor, "quote": word.quote, "kind": ctx.kind, "items": items, "more": more}))
+    }
+
+    /// The directories in the terminal's current one.
+    pub async fn dirs(&self) -> Result<Value, String> {
+        let (cwd, home) = {
+            let st = self.lock();
+            (st.cwd.clone(), st.home.clone())
+        };
+        let entries = self.side(complete::list_script(&cwd, ".")).await?;
+        Ok(json!({"cwd": cwd, "home": home, "dirs": complete::dirs_of(&entries)}))
+    }
+
+    /// The branches of the repository the terminal is in.
+    pub async fn branches(&self) -> Result<Value, String> {
+        let (cwd, branch) = {
+            let st = self.lock();
+            (st.cwd.clone(), st.branch.clone())
+        };
+        if branch.is_empty() {
+            return Ok(json!({"current": "", "local": [], "remote": []}));
+        }
+        let refs = self.side(complete::branches_script(&cwd)).await?;
+        let (local, remote) = complete::branches_of(&refs);
+        Ok(json!({"current": branch, "local": local, "remote": remote}))
     }
 
     /// Asks a full-screen program to draw itself again: the window narrows
@@ -378,7 +577,11 @@ impl Terminal {
         st.modes.feed(&data);
         let seq = st.last_seq;
         let end = st.out_pos;
-        st.events.push_back(Event { seq, end, kind: Kind::Out(Arc::from(data)) });
+        let data: Arc<[u8]> = Arc::from(data);
+        if let Some(block) = st.block.as_mut() {
+            block.add(&data);
+        }
+        st.events.push_back(Event { seq, end, kind: Kind::Out(data) });
         while st.kept > KEEP_BYTES && st.events.len() > 1 {
             let old = st.events.pop_front().expect("an event");
             st.first_seq = old.seq + 1;
@@ -390,12 +593,100 @@ impl Terminal {
         }
     }
 
+    fn event(st: &mut Inner, value: Value) {
+        st.last_seq += 1;
+        let (seq, end) = (st.last_seq, st.out_pos);
+        st.events.push_back(Event { seq, end, kind: Kind::Ev(value) });
+    }
+
+    /// What the shell printed: the screen's bytes, and our markers out of
+    /// them.
     pub fn take(&self, data: Vec<u8>) {
         {
             let mut st = self.lock();
-            Self::output(&mut st, data);
+            let pieces = st.parser.feed(&data);
+            for piece in pieces {
+                match piece {
+                    Piece::Out(bytes) => Self::output(&mut st, bytes),
+                    Piece::Mark(m) => self.marker(&mut st, m),
+                }
+            }
         }
         self.changed();
+    }
+
+    fn marker(&self, st: &mut Inner, m: Marker) {
+        // Markers carry the engine's clock, so that a page drawing them
+        // again later still knows when each command started and ended.
+        let at = now_ms();
+        match m.kind.as_str() {
+            "P" => {
+                let code = code_of(m.field(0));
+                let trim = if st.block.is_some() { self.finish_block(st, code) } else { 0 };
+                st.typed = false;
+                st.markers = true;
+                st.cwd = m.field(1).to_string();
+                st.home = m.field(2).to_string();
+                st.branch = m.field(3).to_string();
+                st.venv = m.field(4).to_string();
+                st.path = m.field(5).to_string();
+                // trim: how much of the end of the block's output was zsh's
+                // partial-line mark, which the block does not keep.
+                let value = json!({"t": "P", "code": code, "cwd": st.cwd, "home": st.home, "branch": st.branch, "venv": st.venv, "trim": trim, "at": at});
+                Self::event(st, value);
+            }
+            "C" => {
+                let prev = code_of(m.field(1));
+                if st.block.is_some() {
+                    // One line of several commands: the one before ended here.
+                    self.finish_block(st, prev);
+                }
+                st.typed = false;
+                let command = m.field(0).to_string();
+                Self::event(st, json!({"t": "C", "command": command, "prev": prev, "at": at}));
+                let seq = st.last_seq;
+                st.block = Some(Block::new(command.clone(), st.cwd.clone(), st.branch.clone(), seq, at, st.cols));
+                st.recent.push_back(Recent { command, cwd: st.cwd.clone(), branch: st.branch.clone(), seq_start: seq, seq_end: None, cols: st.cols, at });
+                while st.recent.len() > RECENT {
+                    st.recent.pop_front();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Saves the running command's block; returns how many bytes of zsh's
+    /// partial-line mark came off the end of its output.
+    fn finish_block(&self, st: &mut Inner, code: Option<i64>) -> usize {
+        let Some(block) = st.block.take() else { return 0 };
+        let last = st.last_seq;
+        if let Some(entry) = st.recent.iter_mut().rev().find(|e| e.seq_start == block.seq_start) {
+            entry.seq_end = Some(last);
+        }
+        let (mut output, cut) = block.output();
+        let mut trim = 0;
+        if st.shell.as_deref() == Some("zsh") {
+            let stripped = shell::strip_eol_mark(&output, st.cols as usize);
+            trim = output.len() - stripped.len();
+            output = stripped;
+        }
+        self.store.save_block(
+            &self.id.to_string(),
+            Finished {
+                seq_start: block.seq_start,
+                seq_end: last,
+                command: block.command,
+                started_ms: block.started_ms,
+                finished_ms: now_ms(),
+                exit_code: code,
+                cwd: block.cwd,
+                branch: block.branch,
+                output,
+                cut,
+                cols: block.cols,
+            },
+        );
+        trim
     }
 
     // ------------------------------------------------------------ pace
@@ -633,28 +924,38 @@ impl Terminal {
     }
 
     fn end(&self, reason: String, code: Option<i32>) {
-        {
+        let (last_seq, shell, home) = {
             let mut st = self.lock();
             if st.state == State::Ended {
                 return;
             }
+            // A command still running ended with the shell.
+            if st.block.is_some() {
+                self.finish_block(&mut st, code.map(i64::from));
+            }
             st.state = State::Ended;
-            st.reason = Some(reason);
+            st.reason = Some(reason.clone());
             st.exit_code = code;
             st.ended_at = Some(Instant::now());
             // Dropping it lets the reader and writer go; the terminal closes
             // with the last of them.
             st.pty = None;
             st.pending.clear();
-        }
+            (st.last_seq, st.shell.clone(), st.home.clone())
+        };
+        self.store.ended(&self.id.to_string(), last_seq, &reason, shell.as_deref(), &home);
         self.changed();
         self.done.send_replace(true);
     }
 
-    async fn start(self: Arc<Self>, plan: Plan, env: Vec<(String, String)>, cwd: std::path::PathBuf) {
-        // The size of the window first, or the guess a second later.
+    async fn start(self: Arc<Self>, planner: impl Future<Output = Plan>, env: Vec<(String, String)>, cwd: std::path::PathBuf) {
+        // How to start it (the scripts in place, the shells looked up), and
+        // meanwhile the size of the window, or the guess a second later.
         let mut sized = self.sized.subscribe();
-        let _ = tokio::time::timeout(SIZE_WAIT, sized.wait_for(|s| *s)).await;
+        let size = async {
+            let _ = tokio::time::timeout(SIZE_WAIT, sized.wait_for(|s| *s)).await;
+        };
+        let (plan, ()) = tokio::join!(planner, size);
         if self.state() == State::Ended {
             return;
         }
@@ -680,9 +981,15 @@ impl Terminal {
                 return;
             }
             st.shell = Some(plan.shell.clone());
+            // Markers once the first one comes; blocks as planned.
             st.markers = false;
-            st.blocks = false;
+            st.blocks = plan.blocks;
             st.home = cwd.to_string_lossy().to_string();
+            // The key first, with echo off: the shell reads it, then turns
+            // echo back on.
+            if plan.markers {
+                pty.write(format!("{}\n", st.key).as_bytes());
+            }
             let pending = std::mem::take(&mut st.pending);
             if !pending.is_empty() {
                 pty.write(&pending);
@@ -696,6 +1003,14 @@ impl Terminal {
             self.room().await;
             self.take(data);
         }
+        {
+            let mut st = self.lock();
+            let held = st.parser.flush();
+            if !held.is_empty() {
+                Self::output(&mut st, held);
+            }
+        }
+        self.changed();
 
         // The stream is over: the shell ended, or was hung up on. Hung up
         // on purpose, it has HANGUP_GRACE from the hangup, then a kill, as
@@ -759,9 +1074,36 @@ fn describe(id: Uuid, st: &Inner) -> Value {
         "home": st.home,
         "branch": st.branch,
         "venv": st.venv,
-        "running": Value::Null,
+        "running": running_of(st),
         "openedAt": iso_seconds(st.opened_ms),
     })
+}
+
+/// The command running now.
+fn running_of(st: &Inner) -> Option<Value> {
+    st.block.as_ref().map(|b| {
+        json!({"command": b.command, "cwd": b.cwd, "branch": b.branch, "seqStart": b.seq_start, "cols": b.cols, "at": b.started_ms})
+    })
+}
+
+/// An exit code as the shell wrote it: digits, or nothing.
+fn code_of(text: &str) -> Option<i64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// A command as the question at quitting names it: its first line, short.
+pub fn short_command(command: &str) -> String {
+    let line = command.trim().lines().next().unwrap_or("").trim();
+    let many = command.trim().lines().count() > 1;
+    let mut short: String = line.chars().take(40).collect();
+    if many || line.chars().count() > 40 {
+        short = short.trim_end().to_string();
+        short.push('…');
+    }
+    short
 }
 
 /// A command from the page as it will be typed: lines joined by \n, control
@@ -787,22 +1129,19 @@ pub fn clean_name(name: &str) -> Option<String> {
 pub struct Terminals {
     live: Mutex<HashMap<Uuid, Arc<Terminal>>>,
     opening: tokio::sync::Mutex<()>,
-}
-
-impl Default for Terminals {
-    fn default() -> Self {
-        Self::new()
-    }
+    pub store: Arc<Store>,
 }
 
 impl Terminals {
-    pub fn new() -> Self {
-        Self { live: Mutex::new(HashMap::new()), opening: tokio::sync::Mutex::new(()) }
+    pub fn new(store: Arc<Store>) -> Self {
+        Self { live: Mutex::new(HashMap::new()), opening: tokio::sync::Mutex::new(()), store }
     }
 
-    /// A new terminal on this computer. It starts in the background; the
-    /// page attaches to it over the socket and watches it come up.
-    pub async fn open(&self, place: Place, plan: Plan, env: Vec<(String, String)>, cwd: std::path::PathBuf, cols: i64, rows: i64, most: usize) -> Result<Arc<Terminal>, String> {
+    /// A new terminal on this computer. It starts in the background, as
+    /// `plan` says once it is ready; the page attaches to it over the
+    /// socket and watches it come up.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open(&self, place: Place, plan: impl Future<Output = Plan> + Send + 'static, env: Vec<(String, String)>, cwd: std::path::PathBuf, cols: i64, rows: i64, most: usize) -> Result<Arc<Terminal>, String> {
         let _one_at_a_time = self.opening.lock().await;
         let count = self.live().len();
         if count >= most {
@@ -820,7 +1159,8 @@ impl Terminals {
             (1..).map(|n: u32| n.to_string()).find(|n| !used.contains(n)).expect("a free number")
         };
         let (cols, rows) = pty::clamp_size(cols, rows);
-        let terminal = Terminal::new(place, name, cols, rows);
+        let terminal = Terminal::new(place, name.clone(), cols, rows, self.store.clone());
+        self.store.opened(&terminal.id.to_string(), &name, terminal.lock().opened_ms);
         self.live.lock().unwrap().insert(terminal.id, terminal.clone());
         tokio::spawn(terminal.clone().start(plan, env, cwd));
         Ok(terminal)
@@ -871,13 +1211,18 @@ impl Terminals {
         if cleaned.chars().all(|c| c.is_ascii_digit()) {
             return Err((422, "A name needs a letter in it: numbers alone are how tTerm counts terminals.".into()));
         }
-        {
+        let renamed = {
             let mut st = t.lock();
-            if st.name != cleaned {
-                st.name = cleaned;
+            let renamed = st.name != cleaned;
+            if renamed {
+                st.name = cleaned.clone();
             }
+            renamed
+        };
+        if renamed {
+            self.store.renamed(&t.id.to_string(), &cleaned);
+            t.changed();
         }
-        t.changed();
         Ok(t)
     }
 
@@ -896,25 +1241,51 @@ impl Terminals {
     pub async fn stop_all(&self, reason: &str) {
         let all: Vec<Arc<Terminal>> = self.live.lock().unwrap().values().cloned().collect();
         let mut tasks = Vec::new();
-        for t in all {
-            let reason = reason.to_string();
+        for t in &all {
+            let (t, reason) = (t.clone(), reason.to_string());
             tasks.push(tokio::spawn(async move { t.close(&reason).await }));
         }
+        let deadline = tokio::time::Instant::now() + QUIT_WAIT;
         for task in tasks {
-            let _ = task.await;
+            let _ = tokio::time::timeout_at(deadline, task).await;
         }
+        // A shell that has not ended by now ignores its hangup: it is
+        // killed sooner than the three seconds a closed terminal gives it,
+        // and its terminal ends here, with the command it was running, as
+        // the core ends its terminals when it stops.
+        for t in &all {
+            let pty = t.lock().pty.clone();
+            if let Some(pty) = pty {
+                pty.kill();
+            }
+            t.end(reason.to_string(), None);
+        }
+        // The last of their blocks, on the disk before the app goes.
+        self.store.flush(Duration::from_secs(1)).await;
     }
 
-    /// What would stop if every terminal ended now: the programs running in
-    /// front of their shells, by terminal.
+    /// What would stop if every terminal ended now, by terminal: the
+    /// command running, or, in a shell without markers, the program in
+    /// front of it.
     pub fn busy(&self) -> Vec<(String, String)> {
         self.live()
             .iter()
             .filter_map(|t| {
-                let st = t.lock();
-                let pgrp = st.pty.as_ref()?.foreground()?;
-                let name = pty::process_name(pgrp).unwrap_or_else(|| "a program".to_string());
-                Some((label_of(&st), name))
+                let (label, pgrp, running) = {
+                    let st = t.lock();
+                    // bash with its history off marks a command without
+                    // its text: then the program in front names it.
+                    match st.block.as_ref().map(|b| short_command(&b.command)) {
+                        Some(command) if !command.is_empty() => return Some((label_of(&st), command)),
+                        running => (label_of(&st), st.pty.as_ref().and_then(|p| p.foreground()), running.is_some()),
+                    }
+                };
+                let name = match pgrp {
+                    Some(pgrp) => pty::process_name(pgrp).unwrap_or_else(|| "a program".to_string()),
+                    None if running => "a command".to_string(),
+                    None => return None,
+                };
+                Some((label, name))
             })
             .collect()
     }
@@ -1103,7 +1474,10 @@ impl Watching {
     async fn replay(&mut self) -> Result<(), Gone> {
         let (base, prefix, events, base_pos) = self.t.snapshot_at();
         self.t.seen(self.id, base_pos, true);
-        self.json(json!({"op": "reset", "ch": self.channel, "seq": base, "running": Value::Null})).await?;
+        // The replay may begin inside a command, after its start marker:
+        // the feed needs to know which, to put its output under it.
+        let running = self.t.block_at(base);
+        self.json(json!({"op": "reset", "ch": self.channel, "seq": base, "running": running})).await?;
         if !prefix.is_empty() {
             self.frame(base, &prefix).await?;
         }
@@ -1200,5 +1574,92 @@ mod tests {
     fn frames() {
         let f = output_frame(7, 42, b"hi");
         assert_eq!(f, vec![1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 42, b'h', b'i']);
+    }
+
+    #[test]
+    fn commands_are_named_short() {
+        assert_eq!(short_command("sleep 30"), "sleep 30");
+        assert_eq!(short_command("  make\nmake install"), "make…");
+        assert_eq!(short_command(&"x".repeat(50)), format!("{}…", "x".repeat(40)));
+        assert_eq!(short_command(""), "");
+        assert_eq!(code_of("130"), Some(130));
+        assert_eq!(code_of(""), None);
+        assert_eq!(code_of("-1"), None);
+    }
+
+    fn terminal() -> (Arc<Terminal>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("tterm-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let place = Place { machine_id: Uuid::new_v4(), machine: "vm".into(), code: "P".into() };
+        let t = Terminal::new(place, "1".into(), 80, 24, Store::open(&dir));
+        t.store.opened(&t.id.to_string(), "1", 0);
+        (t, dir)
+    }
+
+    fn mark(t: &Terminal, fields: &[&str]) -> Vec<u8> {
+        format!("\x1b]6973;{};{}\x07", t.lock().key, fields.join(";")).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_replay_knows_the_command_it_starts_in() {
+        let (t, dir) = terminal();
+        t.take(mark(&t, &["P", "0", "/h", "/h", "", "", "/bin"]));
+        t.take(mark(&t, &["C", "yes", "0"]));
+        let start = t.range().1;
+        assert_eq!(t.running().unwrap()["command"], "yes");
+        assert_eq!(t.describe()["running"]["seqStart"], start);
+        for _ in 0..5 {
+            t.take(b"y\r\ny\r\n".to_vec());
+        }
+        let inside = t.range().1 - 2;
+        assert_eq!(t.block_at(inside).unwrap()["command"], "yes", "running: inside it");
+        t.take(mark(&t, &["P", "130", "/h", "/h", "", "", "/bin"]));
+        let end = t.range().1;
+        let got = t.block_at(inside).unwrap();
+        assert_eq!(got["seqStart"], start);
+        assert_eq!(got["command"], "yes");
+        assert!(t.block_at(end).is_none(), "the prompt after it is not inside it");
+        assert!(t.block_at(start - 1).is_none());
+        assert!(t.running().is_none());
+        // The block, in the store, as the stream had it.
+        let feed = t.store.feed(&t.id.to_string(), None, 60).await.unwrap();
+        let block = &feed["blocks"][0];
+        assert_eq!(block["command"], "yes");
+        assert_eq!(block["exitCode"], 130);
+        assert_eq!(block["seqStart"], start);
+        assert_eq!(block["seqEnd"], end - 1);
+        assert_eq!(block["cwd"], "/h");
+        assert_eq!(t.store.block_output(&t.id.to_string(), start as i64).await.unwrap().0, b"y\r\ny\r\n".repeat(5));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn markers_become_events_and_others_pass() {
+        let (t, dir) = terminal();
+        let mut data = b"before".to_vec();
+        data.extend(mark(&t, &["P", "0", "/w%3Bx", "/h", "main", "venv", "/bin:/usr/bin"]));
+        data.extend_from_slice(b"\x1b]6973;0000;P;9\x07after");
+        t.take(data);
+        let events = t.events_after(0).unwrap();
+        let kinds: Vec<String> = events
+            .iter()
+            .map(|e| match &e.kind {
+                Kind::Out(d) => String::from_utf8_lossy(d).to_string(),
+                Kind::Ev(v) => format!("ev:{}", v["t"].as_str().unwrap()),
+            })
+            .collect();
+        assert_eq!(kinds.concat(), "beforeev:P\x1b]6973;0000;P;9\x07after");
+        let Kind::Ev(p) = &events[1].kind else { panic!("{kinds:?}") };
+        assert_eq!(p["cwd"], "/w;x");
+        assert_eq!(p["branch"], "main");
+        assert_eq!(p["venv"], "venv");
+        assert_eq!(p["code"], 0);
+        assert_eq!(p["trim"], 0);
+        assert_eq!(events[1].end, 6, "an event's place in the output");
+        let st = t.lock();
+        assert!(st.markers);
+        assert_eq!((st.cwd.as_str(), st.home.as_str(), st.path.as_str()), ("/w;x", "/h", "/bin:/usr/bin"));
+        drop(st);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

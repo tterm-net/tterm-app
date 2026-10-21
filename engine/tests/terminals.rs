@@ -2,126 +2,12 @@
 //! them: requests through api::handle, keys and output through the socket.
 
 use serde_json::{json, Value};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-use tterm_engine::socket::PageSocket;
 use tterm_engine::terminals::{Outgoing, Plan};
-use tterm_engine::{api, Engine};
+use tterm_engine::Engine;
 
-/// Tests that flood a shell or count CPU time take turns: CPU time is the
-/// whole test process's.
-static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn heavy() -> std::sync::MutexGuard<'static, ()> {
-    HEAVY.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn data_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("tterm-engine-test-{}", uuid::Uuid::new_v4()))
-}
-
-async fn engine() -> Arc<Engine> {
-    let e = Engine::new(&data_dir()).expect("engine");
-    e.start_background();
-    e
-}
-
-async fn request(e: &Arc<Engine>, method: &str, path: &str, body: Value) -> (u16, Value) {
-    let raw = if body.is_null() { Vec::new() } else { body.to_string().into_bytes() };
-    let r = api::handle(e, method, path, &raw).await;
-    let value = if r.body.is_empty() { Value::Null } else { serde_json::from_slice(&r.body).unwrap_or(Value::Null) };
-    (r.status, value)
-}
-
-/// What one page sees of one channel: the output, as bytes, and the JSON
-/// messages, in order.
-struct Page {
-    sock: Arc<PageSocket>,
-    rx: mpsc::Receiver<Outgoing>,
-    out: Vec<u8>,
-    msgs: Vec<Value>,
-    last_seq: u64,
-}
-
-impl Page {
-    fn new(e: &Arc<Engine>) -> Page {
-        let (sock, rx) = PageSocket::new(e.clone());
-        Page { sock, rx, out: Vec::new(), msgs: Vec::new(), last_seq: 0 }
-    }
-
-    async fn send(&self, msg: Value) {
-        self.sock.text(&msg.to_string()).await;
-    }
-
-    async fn keys(&self, ch: u32, data: &str) {
-        let mut frame = vec![2u8];
-        frame.extend_from_slice(&ch.to_be_bytes());
-        frame.extend_from_slice(data.as_bytes());
-        self.sock.binary(&frame).await;
-    }
-
-    fn take(&mut self, m: Outgoing) {
-        match m {
-            Outgoing::Binary(f) => {
-                assert_eq!(f[0], 1);
-                self.last_seq = u64::from_be_bytes(f[5..13].try_into().unwrap());
-                self.out.extend_from_slice(&f[13..]);
-            }
-            Outgoing::Text(t) => {
-                let v: Value = serde_json::from_str(&t).unwrap();
-                if let Some(seq) = v.get("seq").and_then(Value::as_u64) {
-                    if v["op"] == "ev" || v["op"] == "reset" {
-                        self.last_seq = seq;
-                    }
-                }
-                self.msgs.push(v);
-            }
-        }
-    }
-
-    /// Waits until `done` holds, at most `secs` seconds.
-    async fn until(&mut self, secs: u64, done: impl Fn(&Page) -> bool) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(secs);
-        loop {
-            if done(self) {
-                return true;
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return false;
-            }
-            match tokio::time::timeout(left, self.rx.recv()).await {
-                Ok(Some(m)) => self.take(m),
-                _ => return done(self),
-            }
-        }
-    }
-
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.out).to_string()
-    }
-
-    fn state(&self) -> Option<Value> {
-        self.msgs.iter().rev().find(|m| m["op"] == "state" || m["op"] == "attached").map(|m| m["terminal"].clone())
-    }
-}
-
-async fn open(e: &Arc<Engine>, cols: i64, rows: i64) -> String {
-    let machine = e.settings.lock().unwrap().machine_id.to_string();
-    let (status, t) = request(e, "POST", "/api/terminals", json!({"machineId": machine, "cols": cols, "rows": rows})).await;
-    assert_eq!(status, 201, "{t}");
-    assert_eq!(t["state"], "connecting");
-    t["id"].as_str().unwrap().to_string()
-}
-
-async fn attached(e: &Arc<Engine>, id: &str, cols: i64, rows: i64) -> Page {
-    let mut page = Page::new(e);
-    page.send(json!({"op": "attach", "ch": 1, "id": id, "after": null, "cols": cols, "rows": rows, "focus": true})).await;
-    assert!(page.until(10, |p| p.msgs.iter().any(|m| m["op"] == "replayed")).await, "{:?}", page.msgs);
-    assert!(page.until(10, |p| p.state().map(|s| s["state"] == "open").unwrap_or(false)).await, "{:?}", page.msgs);
-    page
-}
+mod common;
+use common::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_shell_runs_commands_and_ends() {
@@ -273,7 +159,7 @@ async fn zsh_as_the_login_shell() {
         markers: false,
         blocks: false,
     };
-    let t = e.terminals.open(e.place(), plan, env, tterm_engine::pty::home_dir(), 80, 24, 24).await.unwrap();
+    let t = e.terminals.open(e.place(), std::future::ready(plan), env, tterm_engine::pty::home_dir(), 80, 24, 24).await.unwrap();
     let id = t.id.to_string();
     let mut page = attached(&e, &id, 80, 24).await;
     page.keys(1, "echo $ZSH_NAME-$((2*21))\r").await;
@@ -391,7 +277,7 @@ async fn what_is_running_is_named_before_quitting() {
     }
     let busy = e.terminals.busy();
     assert_eq!(busy.len(), 1, "{busy:?}");
-    assert_eq!(busy[0].1, "sleep");
+    assert_eq!(busy[0].1, "sleep 30", "the command, from its block");
     assert_eq!(busy[0].0, format!("P/{}", e.machine_name));
     e.terminals.stop_all("tTerm quit.").await;
     assert!(e.terminals.live().is_empty());
@@ -686,7 +572,7 @@ async fn the_shell_starts_at_the_size_of_the_window() {
         markers: false,
         blocks: false,
     };
-    let t = e.terminals.open(e.place(), plan, tterm_engine::pty::clean_env(true), tterm_engine::pty::home_dir(), 200, 50, 24).await.unwrap();
+    let t = e.terminals.open(e.place(), std::future::ready(plan), tterm_engine::pty::clean_env(true), tterm_engine::pty::home_dir(), 200, 50, 24).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     let mut page = Page::new(&e);
     page.send(json!({"op": "attach", "ch": 1, "id": t.id.to_string(), "after": null, "cols": 100, "rows": 30, "focus": true})).await;
@@ -701,7 +587,7 @@ async fn the_shell_starts_at_the_size_of_the_window() {
         markers: false,
         blocks: false,
     };
-    let t = e.terminals.open(e.place(), plan, tterm_engine::pty::clean_env(true), tterm_engine::pty::home_dir(), 90, 20, 24).await.unwrap();
+    let t = e.terminals.open(e.place(), std::future::ready(plan), tterm_engine::pty::clean_env(true), tterm_engine::pty::home_dir(), 90, 20, 24).await.unwrap();
     tokio::time::sleep(Duration::from_millis(2000)).await;
     assert_eq!(t.describe()["state"], "open");
     let mut late = Page::new(&e);

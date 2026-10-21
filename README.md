@@ -11,16 +11,25 @@ same requests, the same socket, the same terminals with numbered output and
 replays. The shells run right here, in pseudo-terminals of this computer,
 with nothing going over the network.
 
-For now it has the terminals of this computer, in the classic mode. The feed
-of blocks with tTerm's own input line comes next, then signing in, the
-servers and notes of tTerm Web, and Windows.
+It has the terminals of this computer as tTerm Web has a machine's: the feed
+of blocks, where each command is a block with what it printed, how long it
+took and how it ended, and tTerm's own input line, with history, Tab, and a
+question before a command that cannot be undone; or the classic mode, where
+every key goes straight to the shell. Signing in, the servers and notes of
+tTerm Web, and Windows come next.
 
 ## How it is made
 
 ```
 engine/   Rust: the shells (pty.rs), the terminals and their pages
-          (terminals.rs, socket.rs), the requests of the page (api.rs).
-          A port of tterm-web's core where the page needs it to be the same.
+          (terminals.rs, socket.rs), the requests of the page (api.rs),
+          the shell's markers (shell.rs), blocks and where they are kept
+          (blocks.rs, store.rs), Tab (complete.rs), the question before
+          a dangerous command (danger.rs). A port of tterm-web's core
+          where the page needs it to be the same.
+engine/shell/
+          the scripts that make bash and zsh mark their prompts and
+          commands: tterm-web's own, byte for byte.
 app/      Tauri: the window, the menu, the bridge (src/shim.js) that sends
           the page's requests and socket to the engine over Tauri's IPC.
 web-dist/ the page of tTerm Web, put there by scripts/web.sh at the commit
@@ -38,12 +47,27 @@ at once and little is left to scroll by. A window that stops taking output,
 hidden or gone, holds the shell back for two seconds at most; one still
 drawing what it has, for ten.
 
+**The shell marks its commands,** as on the web: bash and zsh start with
+tterm-web's scripts (engine/shell; scripts/web.sh checks they are the same
+files), which mark where each prompt and each command begins with a one-time
+key, and the engine takes the marks out before anything is drawn. The
+scripts live in the app's own folder (on a Mac
+`~/Library/Application Support/net.tterm.desktop/shell`), not in `~/.tterm`,
+where tterm-agent keeps those of tTerm Web. Without bash or zsh, or with a
+bash older than 4.4, terminals work in the classic mode only.
+
+**Commands stay on this computer.** Each finished command is kept in the
+app's folder, readable by you alone: its text, folder and branch, its code,
+and what it printed, the beginning and the end of it if it was long. They
+stay 30 days, as on the web by default, and the feed of a terminal that has
+ended, or of one from before the app was last quit, is still there.
+
 **Shells as a login gives them.** The login shell runs as a login shell, in a
 clean environment made the way sshd makes one, with a UTF-8 locale. Closing a
 terminal hangs it up, as closing a window does; a shell that ignores that is
 killed three seconds later. Quitting the app asks first when shells would end,
-and names what is running: from the menu, the window, the Dock, or at log
-out. Nothing of the app's own is left open in a shell.
+and names the commands running: from the menu, the window, the Dock, or at
+log out. Nothing of the app's own is left open in a shell.
 
 ## Building
 

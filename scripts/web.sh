@@ -48,4 +48,14 @@ awk '
   END { if (!done) exit 1 }
 ' "$page" > "$page.new" || { echo "No <meta charset> in the page: the style number has nowhere to go" >&2; exit 1; }
 mv "$page.new" "$page"
-echo "web-dist: the page of tterm-web $(git -C "$src" rev-parse --short HEAD 2>/dev/null || echo "from $src")"
+# The shell's marker scripts are the core's own (tterm/templates/shell),
+# kept in engine/shell so that the engine builds on its own. They must be
+# the same as the core's, byte for byte: the core and the engine read the
+# same markers.
+for f in bash.sh zshenv.zsh zprofile.zsh zshrc.zsh zlogin.zsh; do
+  if ! cmp -s "$src/tterm/templates/shell/$f" "$here/engine/shell/$f"; then
+    echo "engine/shell/$f differs from tterm/templates/shell/$f of tterm-web" >&2
+    exit 1
+  fi
+done
+echo "web-dist: the page of tterm-web $(git -C "$src" rev-parse --short HEAD 2>/dev/null || echo "from $src"), and its shell scripts"

@@ -12,13 +12,16 @@
   "use strict";
   if (window.__ttermApp) return;
 
-  // The terminals of this version run in the classic mode only. The page
-  // shows a terminal in its remembered mode as soon as it is not open
-  // (while it connects, after it ended), and its feed is empty without
-  // blocks: the last screen, with why the shell ended, would be gone. Until
-  // the feed comes to the app, the remembered mode is the classic one.
+  // From 0.1.0 the app has the feed, and its terminals open in the line
+  // mode, as on the web. The versions before it had the classic mode only
+  // and kept "classic" as the page's remembered mode: forgotten once, so
+  // the page starts in its own default. A choice made after that is the
+  // person's, and stays.
   try {
-    localStorage.setItem("tterm.mode", "classic");
+    if (localStorage.getItem("tterm.app.feed") === null) {
+      localStorage.removeItem("tterm.mode");
+      localStorage.setItem("tterm.app.feed", "1");
+    }
   } catch {
     // Without storage the page remembers nothing; nothing to do.
   }

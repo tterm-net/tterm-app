@@ -8,9 +8,12 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64 = "0.22"
+flate2 = "1"
 libc = "0.2"
 nix = { version = "0.29", features = ["term", "process", "signal", "fs", "user", "hostname"] }
-regex = { version = "1", default-features = false, features = ["std", "perf"] }
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "process", "io-util"] }

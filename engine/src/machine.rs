@@ -158,9 +158,13 @@ pub fn parse(output: &str) -> (Map<String, Value>, Vec<String>) {
 /// environment: the exit code (None when it did not finish in time) and
 /// what it printed.
 pub async fn run_script(script: &str, timeout: Duration) -> (Option<i32>, Vec<u8>) {
+    run_script_with(script, timeout, &crate::pty::clean_env(false), &crate::pty::home_dir()).await
+}
+
+/// The same, in the environment `env`, from the folder `home`.
+pub async fn run_script_with(script: &str, timeout: Duration, env: &[(String, String)], home: &std::path::Path) -> (Option<i32>, Vec<u8>) {
     use tokio::io::AsyncWriteExt;
-    let env = crate::pty::clean_env(false);
-    let home = crate::pty::home_dir();
+    let home = home.to_path_buf();
     let mut cmd = tokio::process::Command::new("/bin/sh");
     cmd.arg("-s")
         .env_clear()

@@ -13,7 +13,13 @@
 //!                 | "gone" | "confirm" | "refused" | "error", ...}
 //!                binary: 0x01, channel (4 bytes), number (8 bytes), output
 //! ```
+//!
+//! "run" is a whole command from tTerm's own input line. A command that
+//! would do damage nothing brings back is first answered with "confirm"; the
+//! page asks, and sends it again with "confirmed". A command the shell
+//! cannot take now (another one is running) is answered with "refused".
 
+use crate::danger;
 use crate::terminals::{clean_command, Outgoing, Watcher, INPUT};
 use crate::Engine;
 use serde_json::{json, Value};
@@ -95,7 +101,18 @@ impl PageSocket {
             }
             "run" => {
                 let Some(command) = msg.get("command").and_then(Value::as_str) else { return };
+                // Checked as it will be typed: a control character in the
+                // middle of a word must not hide it from the check and then
+                // vanish.
                 let command = clean_command(command);
+                if msg.get("confirmed") != Some(&Value::Bool(true)) {
+                    if let Some(held) = danger::looks_destructive(&command) {
+                        drop(guard);
+                        let everything = danger::hits_everything(&command);
+                        self.json(json!({"op": "confirm", "ch": ch, "command": command, "what": held.what, "lost": held.lost, "everything": everything})).await;
+                        return;
+                    }
+                }
                 // Running a command is typing: this page becomes the one
                 // that types.
                 w.focus();
@@ -114,14 +131,15 @@ impl PageSocket {
         if let Some(old) = watchers.remove(&ch) {
             old.stop();
         }
-        let terminal = msg
-            .get("id")
-            .and_then(Value::as_str)
-            .and_then(|id| Uuid::parse_str(id).ok())
-            .and_then(|id| self.engine.terminals.get(&id));
-        let Some(terminal) = terminal else {
+        let id = msg.get("id").and_then(Value::as_str).and_then(|id| Uuid::parse_str(id).ok());
+        let Some(terminal) = id.and_then(|id| self.engine.terminals.get(&id)) else {
             drop(guard);
-            self.json(json!({"op": "gone", "ch": ch, "terminal": Value::Null})).await;
+            // One no longer in memory: as the store remembers it.
+            let ended = match id {
+                Some(id) => self.engine.ended_json(&id).await,
+                None => None,
+            };
+            self.json(json!({"op": "gone", "ch": ch, "terminal": ended})).await;
             return;
         };
         if watchers.len() >= MAX_CHANNELS {
