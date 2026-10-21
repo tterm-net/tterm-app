@@ -277,7 +277,12 @@ async fn what_is_running_is_named_before_quitting() {
     }
     let busy = e.terminals.busy();
     assert_eq!(busy.len(), 1, "{busy:?}");
-    assert_eq!(busy[0].1, "sleep 30", "the command, from its block");
+    // The command, from its block, where the shell marks where commands
+    // start (bash 4.4 and newer, zsh); the program in front where it does
+    // not (bash 3.2, the login shell of GitHub's Macs).
+    let t = e.terminals.get(&uuid::Uuid::parse_str(&id).unwrap()).unwrap();
+    let expected = if t.describe()["blocks"] == true { "sleep 30" } else { "sleep" };
+    assert_eq!(busy[0].1, expected, "{:?}", t.describe());
     assert_eq!(busy[0].0, format!("P/{}", e.machine_name));
     e.terminals.stop_all("tTerm quit.").await;
     assert!(e.terminals.live().is_empty());
