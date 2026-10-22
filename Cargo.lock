@@ -4086,7 +4086,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tterm-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "objc2",
  "serde",
@@ -4101,7 +4101,7 @@ dependencies = [
 
 [[package]]
 name = "tterm-engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "flate2",
