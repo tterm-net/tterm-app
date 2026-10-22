@@ -4,7 +4,7 @@
 /// Marks that only steer or hide the text (Unicode's format characters,
 /// such as U+202E, which turns it around, or U+200B, which is not seen),
 /// and private-use characters: left out of names.
-fn hidden(c: char) -> bool {
+pub(crate) fn hidden(c: char) -> bool {
     matches!(c as u32,
         0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 | 0x08E2
         | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F
@@ -15,6 +15,11 @@ fn hidden(c: char) -> bool {
 
 /// A name as lists show it: what prints, on one line. Controls and line
 /// breaks become spaces; hidden marks are left out; spaces tidied.
+///
+/// One difference from the core, met on random names: a character Unicode
+/// has not assigned yet stays here, while Python leaves it out (it is not
+/// printable to Python). Which ones are assigned depends on the version of
+/// Unicode either side knows, so the two could not agree on all of them.
 pub fn one_line(text: &str) -> String {
     let shown: String = text
         .chars()

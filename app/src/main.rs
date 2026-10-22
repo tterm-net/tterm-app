@@ -451,6 +451,12 @@ fn main() {
                     }
                 })
                 .build()?;
+            // What went wrong with the app's file at start (a damaged file
+            // kept aside, or one it could not open): said once, plainly, so
+            // that notes missing, or not taken, are not a mystery.
+            if let Some(text) = shared.engine.terminals.store.trouble.clone() {
+                app.dialog().message(text).title("tTerm").kind(MessageDialogKind::Warning).show(|_| {});
+            }
             Ok(())
         });
 

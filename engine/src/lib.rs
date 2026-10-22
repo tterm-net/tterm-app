@@ -9,7 +9,12 @@
 //! nothing going over the network. Their markers (shell.rs) cut what they
 //! print into commands, kept on this computer (blocks.rs, store.rs), and the
 //! input line asks before what cannot be undone (danger.rs) and completes
-//! words with Tab (complete.rs).
+//! words with Tab (complete.rs). Notes, in folders of Personal, are kept on
+//! this computer too (notes.rs), the way the core keeps them.
+//!
+//! No one signs in yet: the engine tells the page so (`"local": true` in
+//! the state, from tTerm Web 0.1.4), and the page then shows this computer
+//! only.
 
 pub mod api;
 pub mod blocks;
@@ -18,6 +23,7 @@ pub mod danger;
 pub mod machine;
 pub mod modes;
 pub mod names;
+pub mod notes;
 pub mod pty;
 pub mod settings;
 pub mod shell;
@@ -62,6 +68,13 @@ pub struct Engine {
     /// When the engine started, in milliseconds: the "agent" of this
     /// computer is connected since then.
     pub since_ms: i64,
+    /// Set while the notes cannot be read (state_json).
+    notes_trouble: Mutex<Option<String>>,
+}
+
+/// What every request for notes says while they cannot be read.
+fn notes_unread(why: &str) -> String {
+    format!("The notes on this computer could not be read ({why}). Until they can, nothing is changed in them. Quit tTerm and open it again; if it goes on, write to {SUPPORT}.")
 }
 
 impl Engine {
@@ -69,8 +82,22 @@ impl Engine {
     /// the first run, for the person alone).
     pub fn new(data_dir: &Path) -> std::io::Result<Arc<Self>> {
         private_dir(data_dir)?;
-        let settings = Settings::load(data_dir)?;
+        let mut settings = Settings::load(data_dir)?;
         let store = Store::open(data_dir);
+        // The notes are kept under the ids of the store: settings made anew
+        // take them back (Store::identity).
+        let (person, project) = store.identity(&settings.person_id.to_string(), &settings.project_id.to_string());
+        if let (Ok(person), Ok(project)) = (Uuid::parse_str(&person), Uuid::parse_str(&project)) {
+            if (person, project) != (settings.person_id, settings.project_id) {
+                eprintln!("tterm: the settings take back the ids the notes are kept under");
+                settings.person_id = person;
+                settings.project_id = project;
+                if let Err(e) = settings.save(data_dir) {
+                    // Kept for this run; written with the next change.
+                    eprintln!("tterm: could not save the settings: {e}");
+                }
+            }
+        }
         store.close_left_open(LEFT_OPEN);
         Ok(Arc::new(Engine {
             data_dir: data_dir.to_path_buf(),
@@ -81,6 +108,7 @@ impl Engine {
             commands: Mutex::new(Vec::new()),
             terminals: Terminals::new(store),
             since_ms: terminals::now_ms(),
+            notes_trouble: Mutex::new(None),
         }))
     }
 
@@ -95,14 +123,19 @@ impl Engine {
         });
         let me = self.clone();
         tokio::spawn(async move {
-            let mut minutes = 0u64;
+            // What expired in the store: soon after the start, once the page
+            // has what it needs to start (it waits for the store: notes),
+            // then hourly, and once more when the app quits (stop_all).
+            tokio::time::sleep(Duration::from_secs(15)).await;
             loop {
-                // What expired in the store: at the start, then hourly.
-                if minutes.is_multiple_of(60) {
-                    me.terminals.store.sweep();
-                }
+                me.terminals.store.sweep();
+                tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+            }
+        });
+        let me = self.clone();
+        tokio::spawn(async move {
+            loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                minutes += 1;
                 me.terminals.sweep();
             }
         });
@@ -115,6 +148,16 @@ impl Engine {
         next.save(&self.data_dir)?;
         *settings = next.clone();
         Ok(next)
+    }
+
+    /// The person of this computer, as the notes name them.
+    pub fn notes_me(&self) -> notes::Me {
+        let s = self.settings.lock().unwrap();
+        notes::Me {
+            id: s.person_id.to_string(),
+            name: s.name.clone().unwrap_or_else(|| self.account_name.clone()),
+            project_id: s.project_id.to_string(),
+        }
     }
 
     pub fn person_name(&self) -> String {
@@ -251,13 +294,40 @@ impl Engine {
         })
     }
 
-    pub fn state_json(&self) -> Value {
+    /// What the page needs on start. With `"local": true`: no one has
+    /// signed in on this computer (the page shows this computer only).
+    ///
+    /// Notes that cannot be read do not keep the page, and the terminals,
+    /// from starting: the folders are left out, and until they can be read
+    /// again every request for notes says why (notes_trouble), rather than
+    /// a page that shows no notes as if there were none, or writes into a
+    /// damaged file.
+    pub async fn state_json(&self) -> Value {
+        let mut project = self.project_json();
+        let me = self.notes_me();
+        let read = self.terminals.store.run(move |c| notes::folders_of(c, &me)).await;
+        let mut trouble = self.notes_trouble.lock().unwrap();
+        match read {
+            Some(Ok(folders)) => {
+                project["folders"] = Value::Array(folders);
+                *trouble = None;
+            }
+            Some(Err(why)) => *trouble = Some(notes_unread(why.message())),
+            None => *trouble = Some(notes_unread("the store stopped")),
+        }
+        drop(trouble);
         json!({
             "version": format!("app {VERSION}"),
             "me": self.me_json(),
-            "projects": [self.project_json()],
+            "projects": [project],
             "terminals": self.terminals.live().iter().map(|t| t.describe()).collect::<Vec<_>>(),
+            "local": true,
         })
+    }
+
+    /// Why notes are not taken now, if they are not.
+    pub fn notes_trouble(&self) -> Option<String> {
+        self.notes_trouble.lock().unwrap().clone()
     }
 
     pub fn legal_json(&self) -> Value {

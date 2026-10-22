@@ -2,10 +2,11 @@
 //! answers them (`tterm/api/page.py`): the same paths, the same JSON, the
 //! same refusals where the page reads them.
 //!
-//! What only an account can do (sign-in, more projects, servers, notes) is
-//! refused with a sentence the page shows: it comes with signing in, in a
-//! later version of the app.
+//! What only an account can do (sign-in, more projects, servers) is refused
+//! with a sentence the page shows: it comes with signing in, in a later
+//! version of the app. Notes are kept on this computer (notes.rs).
 
+use crate::notes::{self, Refused};
 use crate::{names, settings, Engine};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -35,7 +36,6 @@ impl Response {
 }
 
 const LATER_ACCOUNT: &str = "This comes with signing in to tTerm, in a later version of the app. For now the app works with this computer only.";
-const LATER_NOTES: &str = "Notes come to the app with signing in, in a later version. Until then they are in tTerm Web, in your browser.";
 const LATER_MACHINES: &str = "Servers and other computers come to the app with signing in, in a later version. Until then they are in tTerm Web, in your browser.";
 use crate::terminals::NOT_OPEN;
 
@@ -84,7 +84,7 @@ pub async fn handle(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8])
         ("GET", ["health"]) => Response::json(200, json!({"ok": true, "service": "tterm app", "version": crate::VERSION})),
 
         // ---------------------------------------------- the person, the page
-        ("GET", ["api", "state"]) => Response::json(200, engine.state_json()),
+        ("GET", ["api", "state"]) => Response::json(200, engine.state_json().await),
         ("PATCH", ["api", "me"]) => patch_me(engine, body),
         ("GET", ["api", "account"]) => Response::json(200, json!({
             "plan": {"id": "free", "name": "Free", "limits": {"machines": 1, "terminals": crate::MOST_TERMINALS}},
@@ -200,12 +200,206 @@ pub async fn handle(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8])
         ("PATCH", ["api", "projects", id]) => edit_project(engine, id, body),
         ("DELETE", ["api", "projects", _]) => Response::error(403, "Personal is yours alone and stays."),
 
-        // --------------------------------------------------------- notes
-        ("POST", ["api", "folders"]) | ("POST", ["api", "notes"]) => Response::error(403, LATER_NOTES),
-        (_, ["api", "folders", ..]) | (_, ["api", "notes", ..]) => Response::error(404, "The note is not there any more."),
+        // ------------------------------------------- notes (as from web 0.1.0)
+        ("POST", ["api", "folders"]) => new_folder(engine, body).await,
+        ("PATCH", ["api", "folders", id]) => {
+            let Some(id) = id_of(id) else { return Response::error(404, "No such folder.") };
+            let b = match note_body(body) {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
+            let Some(name) = b.get("name").filter(|n| n.is_string()).cloned() else { return no_name() };
+            notes_call(engine, 200, move |c, me| notes::rename_folder(c, me, &id, &name)).await
+        }
+        ("DELETE", ["api", "folders", id]) => {
+            let Some(id) = id_of(id) else { return Response::error(404, "No such folder.") };
+            notes_call(engine, 200, move |c, me| notes::delete_folder(c, me, &id)).await
+        }
+        ("POST", ["api", "notes"]) => new_note(engine, body).await,
+        ("GET", ["api", "notes", id]) => {
+            let Some(id) = id_of(id) else { return Response::error(404, "No such note.") };
+            notes_call(engine, 200, move |c, me| notes::get_note(c, me, &id)).await
+        }
+        ("PUT", ["api", "notes", id]) => save_note(engine, id, body).await,
+        ("POST", ["api", "notes", id, "tick"]) => {
+            let Some(id) = id_of(id) else { return Response::error(404, "No such note.") };
+            let b = match note_body(body) {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
+            let (Some(block), Some(done)) = (b.get("blockId").and_then(Value::as_str).map(str::to_string), b.get("done").and_then(lax_bool)) else {
+                return Response::error(422, "Say which item, and whether it is done.");
+            };
+            notes_call(engine, 200, move |c, me| notes::tick(c, me, &id, &block, done)).await
+        }
+        ("PATCH", ["api", "notes", id]) => {
+            let Some(id) = id_of(id) else { return Response::error(404, "No such note.") };
+            let b = match note_body(body) {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
+            let (folder, project) = match (optional_id(&b, "folderId"), optional_id(&b, "projectId")) {
+                (Ok(f), Ok(p)) => (f, p),
+                _ => return Response::error(422, "Say where the note goes: a folder, or a project."),
+            };
+            notes_call(engine, 200, move |c, me| notes::move_note(c, me, &id, folder.as_deref(), project.as_deref())).await
+        }
+        ("DELETE", ["api", "notes", id]) => {
+            let Some(id) = id_of(id) else { return Response::error(404, "No such note.") };
+            notes_call(engine, 200, move |c, me| notes::delete_note(c, me, &id)).await
+        }
 
         _ => Response::error(404, "Not found."),
     }
+}
+
+// ------------------------------------------------------------------ notes
+
+/// An id in a path or a body, written as the core writes it.
+fn id_of(text: &str) -> Option<String> {
+    uuid_of(text).map(|id| id.to_string())
+}
+
+/// An id that may be left out, or null; Err if it is there and no id.
+fn optional_id(body: &Value, key: &str) -> Result<Option<String>, ()> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => id_of(s).map(Some).ok_or(()),
+        Some(_) => Err(()),
+    }
+}
+
+/// Whether JSON has an escape for half of a character (`\ud800`, of the
+/// range U+D800 to U+DFFF that only pairs use).
+fn half_character(json: &[u8]) -> bool {
+    let mut i = 0;
+    while i < json.len() {
+        if json[i] == b'\\' {
+            if json.get(i + 1) == Some(&b'u') && json.len() >= i + 6 {
+                let hex = &json[i + 2..i + 6];
+                if hex[0].eq_ignore_ascii_case(&b'd') && matches!(hex[1].to_ascii_lowercase(), b'8'..=b'9' | b'a'..=b'f') {
+                    return true;
+                }
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// A note's request as JSON. A broken character is named as the core names
+/// it: JSON from the page can carry half of one, which the core reads and
+/// then refuses to keep, and which serde does not read at all.
+fn note_body(body: &[u8]) -> Result<Value, Response> {
+    if body.is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_slice(body).map_err(|_| {
+        if half_character(body) {
+            Response::error(422, "The text has a broken character in it.")
+        } else {
+            Response::error(422, "That is not JSON.")
+        }
+    })
+}
+
+/// A yes or no as the core's models take it (pydantic's lax booleans):
+/// true and false, 1 and 0, and words such as "yes" and "off".
+fn lax_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => match n.as_f64() {
+            Some(1.0) => Some(true),
+            Some(0.0) => Some(false),
+            _ => None,
+        },
+        Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "1" | "on" | "t" | "true" | "y" | "yes" => Some(true),
+            "0" | "off" | "f" | "false" | "n" | "no" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn no_name() -> Response {
+    Response::error(422, &format!("A folder's name is 1 to {} characters.", notes::NAME_MAX))
+}
+
+/// What a change to notes gets while the store lives in memory: notes
+/// would be lost when the app quits, so none are taken.
+const NOT_KEPT: &str = "Notes cannot be kept now: tTerm could not open its file on this computer. Quit tTerm and open it again.";
+
+/// Runs a change to the notes in turn with the other writes, as one
+/// transaction, and answers as the core does.
+async fn notes_call(engine: &Arc<Engine>, ok: u16, job: impl FnOnce(&rusqlite::Connection, &notes::Me) -> Result<Value, Refused> + Send + 'static) -> Response {
+    if engine.terminals.store.path.is_none() {
+        return Response::error(503, NOT_KEPT);
+    }
+    if let Some(why) = engine.notes_trouble() {
+        return Response::error(503, &why);
+    }
+    let me = engine.notes_me();
+    match engine.terminals.store.run(move |c| notes::in_turn(c, |c| job(c, &me))).await {
+        Some(Ok(value)) => Response::json(ok, value),
+        Some(Err(Refused::Conflict(note))) => Response::json(409, json!({"error": notes::CHANGED, "conflict": true, "note": note})),
+        Some(Err(why)) => Response::error(why.status(), why.message()),
+        None => Response::error(500, "The notes on this computer could not be read or saved."),
+    }
+}
+
+async fn new_folder(engine: &Arc<Engine>, body: &[u8]) -> Response {
+    let b = match note_body(body) {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let Some(name) = b.get("name").filter(|n| n.is_string()).cloned() else { return no_name() };
+    let project = match optional_id(&b, "projectId") {
+        Ok(Some(p)) => p,
+        Ok(None) => return Response::error(422, "Say which project the folder is for."),
+        Err(()) => return Response::error(422, "No such project."),
+    };
+    notes_call(engine, 201, move |c, me| notes::create_folder(c, me, &project, &name)).await
+}
+
+async fn new_note(engine: &Arc<Engine>, body: &[u8]) -> Response {
+    let b = match note_body(body) {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let Ok(Some(folder)) = optional_id(&b, "folderId") else { return Response::error(422, "Say which folder the note is for.") };
+    let title = match b.get("title") {
+        None => None,
+        Some(t @ Value::String(_)) => Some(t.clone()),
+        Some(_) => return Response::error(422, "A note's title is text."),
+    };
+    notes_call(engine, 201, move |c, me| notes::create_note(c, me, &folder, title.as_ref())).await
+}
+
+/// The title and the blocks as the page has them, made from the version it
+/// names. Where the same things changed elsewhere since, 409 with the note as
+/// it is now: the page merges, asking whose change to keep where both
+/// changed, and saves from that version.
+async fn save_note(engine: &Arc<Engine>, id: &str, body: &[u8]) -> Response {
+    let Some(id) = id_of(id) else { return Response::error(404, "No such note.") };
+    if body.len() > notes::SAVE_MAX {
+        return Response::error(413, "The note is too long to save. Split it into two.");
+    }
+    let b = match note_body(body) {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let base = b.as_object().and_then(|o| o.get("baseVersion")).and_then(|v| match v {
+        Value::Number(n) if !n.is_f64() => n.as_i64(),
+        _ => None,
+    });
+    let Some(base) = base.filter(|v| (1..(1i64 << 31)).contains(v)) else {
+        return Response::error(422, "Say which version the save was made from.");
+    };
+    let (title, blocks) = (b.get("title").cloned(), b.get("blocks").cloned());
+    notes_call(engine, 200, move |c, me| notes::save_note(c, me, &id, base, title.as_ref(), blocks.as_ref())).await
 }
 
 fn patch_me(engine: &Arc<Engine>, body: &[u8]) -> Response {

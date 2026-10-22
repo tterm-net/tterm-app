@@ -249,10 +249,11 @@ async fn the_api_answers_like_the_core() {
 
     // Remembered on the computer.
     let again = Engine::new(&e.data_dir).unwrap();
-    assert_eq!(again.state_json()["projects"][0]["color"], "teal");
-
-    let (status, refused) = request(&e, "POST", "/api/folders", json!({"projectId": pid, "name": "x"})).await;
-    assert_eq!(status, 403);
+    assert_eq!(again.state_json().await["projects"][0]["color"], "teal");
+    // No one has signed in: the page shows this computer only.
+    assert_eq!(state["local"], true);
+    let (status, refused) = request(&e, "POST", "/api/auth/link", json!({})).await;
+    assert_eq!(status, 409);
     assert!(refused["error"].as_str().unwrap().contains("later version"));
     let (status, _) = request(&e, "POST", "/api/installs", json!({"projectId": pid, "kind": "server"})).await;
     assert_eq!(status, 403);

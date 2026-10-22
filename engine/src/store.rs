@@ -10,6 +10,8 @@
 //!
 //! A command's output is kept compressed, its beginning and end if it was
 //! long (see blocks.rs), for 30 days, as tTerm Web keeps it by default.
+//! The notes made on this computer (notes.rs) live in the same file, in
+//! tables of their own, and stay until they are deleted.
 //! What expired is taken out of the file itself, not only out of sight:
 //! deleted rows are overwritten, the space they took goes back to the
 //! disk, and the write-ahead log is emptied after each sweep. Commands
@@ -65,6 +67,9 @@ pub struct Store {
     /// Where it is, or None when it lives in memory only (the file could not
     /// be opened: the app works, and forgets).
     pub path: Option<PathBuf>,
+    /// What went wrong with the file when the app started, in words for the
+    /// person: the app says it when its window opens.
+    pub trouble: Option<String>,
 }
 
 fn now_ms() -> i64 {
@@ -108,6 +113,13 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 2 {
+        // Notes, from 0.2.0.
+        conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = 2; COMMIT;", crate::notes::TABLES))?;
+    }
+    // The ids the notes are kept under (identity). Not by version: a file
+    // of a build of 0.2.0 made before it gets it too.
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
     Ok(())
 }
 
@@ -146,30 +158,61 @@ fn open_file(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// Whether SQLite found the file damaged, or no database at all: then, and
+/// only then, it is kept aside for a new one. A file busy or out of reach
+/// for a moment stays as it is, for the next run.
+fn damaged(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(f, _) if matches!(f.code, rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase))
+}
+
+/// A store in memory: the app works, and forgets when it quits.
+fn in_memory() -> Connection {
+    let c = Connection::open_in_memory().expect("a store in memory");
+    prepare(&c).expect("a store in memory");
+    c
+}
+
 impl Store {
-    /// The store in `dir`. A file that cannot be read is kept aside and a
-    /// new one made; if even that fails, the store lives in memory.
+    /// The store in `dir`. A damaged file is kept aside, under a name of its
+    /// own that no later one takes, and a new one made; a file that cannot
+    /// be opened otherwise is left alone, and the store lives in memory
+    /// until the app quits. Either way `trouble` says so.
     pub fn open(dir: &Path) -> Arc<Store> {
         let path = dir.join(FILE);
-        let (conn, path) = match open_file(&path) {
-            Ok(c) => (c, Some(path)),
-            Err(first) => {
-                eprintln!("tterm: the store {} could not be opened ({first}); a new one is made", path.display());
+        let shown = path.display().to_string();
+        let unopened = |e: &rusqlite::Error| {
+            eprintln!("tterm: no store on disk ({e}): the commands are kept until the app quits");
+            format!(
+                "tTerm could not open its file on this computer ({shown}: {e}). Until it can, notes cannot be kept, and commands are kept only until tTerm quits. Quit tTerm and open it again."
+            )
+        };
+        let (conn, path, trouble) = match open_file(&path) {
+            Ok(c) => (c, Some(path), None),
+            Err(first) if damaged(&first) => {
+                let aside = format!("{}.unreadable-{}", path.display(), now_ms());
+                eprintln!("tterm: the store {} is damaged ({first}): kept as {aside}, a new one is made", path.display());
                 for suffix in ["", "-wal", "-shm"] {
                     let from = PathBuf::from(format!("{}{suffix}", path.display()));
                     if from.exists() {
-                        let _ = std::fs::rename(&from, format!("{}.unreadable{suffix}", path.display()));
+                        let _ = std::fs::rename(&from, format!("{aside}{suffix}"));
                     }
                 }
                 match open_file(&path) {
-                    Ok(c) => (c, Some(path)),
+                    Ok(c) => {
+                        let told = format!(
+                            "tTerm could not read its file on this computer: it was damaged. It is kept as {aside}, and a new one was made. The notes and the commands from before are in the old file."
+                        );
+                        (c, Some(path), Some(told))
+                    }
                     Err(second) => {
-                        eprintln!("tterm: no store on disk ({second}): the commands are kept until the app quits");
-                        let c = Connection::open_in_memory().expect("a store in memory");
-                        prepare(&c).expect("a store in memory");
-                        (c, None)
+                        let told = unopened(&second);
+                        (in_memory(), None, Some(told))
                     }
                 }
+            }
+            Err(first) => {
+                let told = unopened(&first);
+                (in_memory(), None, Some(told))
             }
         };
         let conn = Arc::new(Mutex::new(conn));
@@ -195,7 +238,32 @@ impl Store {
                 })
                 .expect("the store's thread");
         }
-        Arc::new(Store { conn, jobs: Mutex::new(tx), pending, idle, path })
+        Arc::new(Store { conn, jobs: Mutex::new(tx), pending, idle, path, trouble })
+    }
+
+    /// The ids of the person and of Personal that the notes are kept under.
+    /// They live here, with the notes, and the first run writes those of the
+    /// settings: a settings file made anew (lost, or unreadable) takes them
+    /// back, rather than hiding every note behind new ones. At start, before
+    /// anything else waits on the store.
+    pub fn identity(&self, person: &str, project: &str) -> (String, String) {
+        let c = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let read = |key: &str| c.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| r.get::<_, String>(0)).optional();
+        match (read("person_id"), read("project_id")) {
+            (Ok(Some(p)), Ok(Some(j))) => (p, j),
+            (Ok(None), Ok(None)) => {
+                let saved = c.execute("INSERT INTO meta (key, value) VALUES ('person_id', ?1), ('project_id', ?2)", params![person, project]);
+                if let Err(e) = saved {
+                    eprintln!("tterm: could not keep the ids of the notes: {e}");
+                }
+                (person.to_string(), project.to_string())
+            }
+            // Half there, or not readable: nothing is written over them.
+            (p, j) => {
+                eprintln!("tterm: the ids of the notes could not be read ({p:?}, {j:?}): this run uses those of the settings");
+                (person.to_string(), project.to_string())
+            }
+        }
     }
 
     fn write(&self, job: impl FnOnce(&Connection) -> rusqlite::Result<()> + Send + 'static) {
@@ -208,6 +276,22 @@ impl Store {
         if self.jobs.lock().unwrap().send(job).is_err() {
             self.pending.fetch_sub(1, Ordering::SeqCst);
         }
+    }
+
+    /// Runs `job` on the store, in turn with the writes sent before it, and
+    /// gives back what it returns: for what reads and writes at once, such
+    /// as a note's save. None if the store's thread is gone.
+    pub async fn run<T: Send + 'static>(&self, job: impl FnOnce(&Connection) -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        let job: Job = Box::new(move |c| {
+            let _ = tx.send(job(c));
+        });
+        if self.jobs.lock().unwrap().send(job).is_err() {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        rx.await.ok()
     }
 
     /// Waits until what was sent to be written is written, at most `wait`;
@@ -580,12 +664,59 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_file_is_kept_aside() {
         let d = dir();
+        let aside = |d: &Path| {
+            let mut found: Vec<Vec<u8>> = std::fs::read_dir(d)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{FILE}.unreadable-")))
+                .map(|e| std::fs::read(e.path()).unwrap())
+                .collect();
+            found.sort();
+            found
+        };
         std::fs::write(d.join(FILE), b"this is not a database, and it is long enough to be read as one").unwrap();
         let s = Store::open(&d);
         assert!(s.path.is_some());
+        assert!(s.trouble.as_deref().unwrap().contains("damaged"), "{:?}", s.trouble);
         s.opened("t", "1", 1);
         assert!(s.known("t").await);
-        assert!(d.join(format!("{FILE}.unreadable")).exists());
+        assert_eq!(aside(&d).len(), 1);
+        drop(s);
+        // Damaged again: the copy kept the first time stays as it was.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        std::fs::write(d.join(FILE), b"and this one is not a database either, damaged a second time").unwrap();
+        let again = Store::open(&d);
+        assert!(again.path.is_some());
+        let kept = aside(&d);
+        assert_eq!(kept.len(), 2, "each damaged file is kept");
+        assert!(kept.iter().any(|k| k.starts_with(b"this is not a database")));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_file_out_of_reach_is_left_alone() {
+        let d = dir();
+        // A folder where the file should be: SQLite cannot open it, and it
+        // is not damaged; nothing is moved, the store lives in memory.
+        std::fs::create_dir(d.join(FILE)).unwrap();
+        let s = Store::open(&d);
+        assert!(s.path.is_none());
+        assert!(s.trouble.as_deref().unwrap().contains("notes cannot be kept"), "{:?}", s.trouble);
+        assert!(d.join(FILE).is_dir(), "left where it was");
+        s.opened("t", "1", 1);
+        assert!(s.known("t").await, "the store works, in memory");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_ids_of_the_notes_are_kept_with_them() {
+        let d = dir();
+        let s = Store::open(&d);
+        assert_eq!(s.identity("p1", "j1"), ("p1".to_string(), "j1".to_string()), "the first run writes them");
+        assert_eq!(s.identity("p2", "j2"), ("p1".to_string(), "j1".to_string()), "later runs read them");
+        drop(s);
+        let again = Store::open(&d);
+        assert_eq!(again.identity("p3", "j3"), ("p1".to_string(), "j1".to_string()));
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

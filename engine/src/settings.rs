@@ -73,20 +73,35 @@ impl Settings {
         dir.join("settings.json")
     }
 
-    /// The settings in `dir`, made there on the first run.
+    /// The settings in `dir`, made there on the first run. A file that
+    /// cannot be read is kept aside, under a name of its own that no later
+    /// one takes, and a new one made, rather than an app that does not
+    /// start. The ids of the person and of Personal then come back from the
+    /// store, where the notes keep them (Engine::new).
     pub fn load(dir: &Path) -> std::io::Result<Self> {
         let path = Self::path(dir);
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(found) = serde_json::from_str::<Settings>(&text) {
-                return Ok(found.tidied());
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                if let Ok(found) = serde_json::from_slice::<Settings>(&bytes) {
+                    return Ok(found.tidied());
+                }
+                Self::keep_aside(dir);
             }
-            // Unreadable: kept aside, and a new one made, rather than an
-            // app that does not start.
-            let _ = std::fs::rename(&path, dir.join("settings.json.unreadable"));
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!("tterm: the settings could not be read ({e})");
+                Self::keep_aside(dir);
+            }
         }
         let fresh = Self::fresh();
         fresh.save(dir)?;
         Ok(fresh)
+    }
+
+    fn keep_aside(dir: &Path) {
+        let aside = dir.join(format!("settings.json.unreadable-{}", crate::terminals::now_ms()));
+        eprintln!("tterm: the settings could not be read: kept as {}, new ones made", aside.display());
+        let _ = std::fs::rename(Self::path(dir), aside);
     }
 
     fn tidied(mut self) -> Self {
@@ -143,6 +158,18 @@ mod tests {
         std::fs::write(Settings::path(&dir), "{not json").unwrap();
         let fresh = Settings::load(&dir).unwrap();
         assert_ne!(fresh.machine_id, first.machine_id);
+        // Not even text: kept aside too, not written over.
+        std::fs::write(Settings::path(&dir), b"\xff\xfe broken").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        Settings::load(&dir).unwrap();
+        let kept: Vec<Vec<u8>> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("settings.json.unreadable-"))
+            .map(|e| std::fs::read(e.path()).unwrap())
+            .collect();
+        assert_eq!(kept.len(), 2, "each unreadable file is kept");
+        assert!(kept.iter().any(|k| k.starts_with(b"\xff\xfe")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

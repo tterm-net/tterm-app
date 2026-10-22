@@ -15,7 +15,9 @@ It has the terminals of this computer as tTerm Web has a machine's: the feed
 of blocks, where each command is a block with what it printed, how long it
 took and how it ended, and tTerm's own input line, with history, Tab, and a
 question before a command that cannot be undone; or the classic mode, where
-every key goes straight to the shell. Signing in, the servers and notes of
+every key goes straight to the shell. Notes too, in folders, as in tTerm Web:
+Markdown as you type, checklists, kept on this computer. No one signs in
+yet, and the page shows this computer only; signing in, with the servers of
 tTerm Web, and Windows come next.
 
 ## How it is made
@@ -25,8 +27,8 @@ engine/   Rust: the shells (pty.rs), the terminals and their pages
           (terminals.rs, socket.rs), the requests of the page (api.rs),
           the shell's markers (shell.rs), blocks and where they are kept
           (blocks.rs, store.rs), Tab (complete.rs), the question before
-          a dangerous command (danger.rs). A port of tterm-web's core
-          where the page needs it to be the same.
+          a dangerous command (danger.rs), notes (notes.rs). A port of
+          tterm-web's core where the page needs it to be the same.
 engine/shell/
           the scripts that make bash and zsh mark their prompts and
           commands: tterm-web's own, byte for byte.
@@ -61,6 +63,14 @@ app's folder, readable by you alone: its text, folder and branch, its code,
 and what it printed, the beginning and the end of it if it was long. They
 stay 30 days, as on the web by default, and the feed of a terminal that has
 ended, or of one from before the app was last quit, is still there.
+
+**Notes stay on this computer too,** in the same file, until you delete
+them. They are kept as tTerm Web keeps notes: blocks of text, a version
+with every change, two tabs' changes merged block by block and a question
+only where both changed the same block, and who ticked an item and when. A
+note saved is on the disk before the page says Saved. If the file is ever
+damaged, the app keeps it aside, starts a new one and says so; while it
+cannot open its file at all, it takes no notes rather than lose them.
 
 **Shells as a login gives them.** The login shell runs as a login shell, in a
 clean environment made the way sshd makes one, with a UTF-8 locale. Closing a

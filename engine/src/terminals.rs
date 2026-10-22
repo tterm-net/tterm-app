@@ -1267,7 +1267,10 @@ impl Terminals {
             }
             t.end(reason.to_string(), None);
         }
-        // The last of their blocks, on the disk before the app goes.
+        // What expired goes from the file before the app does, also after a
+        // run too short for the sweep in the background; then the last of
+        // the blocks, on the disk before the app goes.
+        self.store.sweep();
         self.store.flush(Duration::from_secs(1)).await;
     }
 
