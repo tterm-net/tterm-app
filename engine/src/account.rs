@@ -931,6 +931,11 @@ impl Account {
     /// that ended is renewed with the device's key, and the request made
     /// again.
     pub async fn call(self: &Arc<Self>, method: &str, path: &str, body: Option<&[u8]>, background: bool) -> Result<Answer, Trouble> {
+        self.call_as(method, path, body, "application/json", background).await
+    }
+
+    /// The same, with a body of another type than JSON (a photo).
+    pub async fn call_as(self: &Arc<Self>, method: &str, path: &str, body: Option<&[u8]>, body_type: &str, background: bool) -> Result<Answer, Trouble> {
         if !self.signed_in() {
             return Err(Trouble::SignedOut);
         }
@@ -938,7 +943,7 @@ impl Account {
             return Err(Trouble::Offline);
         }
         let session = self.session().await?;
-        let answer = match self.cloud.send(method, path, body, Some(&self.cookie(&session)), background).await {
+        let answer = match self.cloud.send_as(method, path, body, body_type, Some(&self.cookie(&session)), background).await {
             Ok(a) => a,
             Err(why) => {
                 self.went_offline(&why);
@@ -949,7 +954,7 @@ impl Account {
             return Ok(answer);
         }
         let session = self.renew(Some(&session)).await?;
-        match self.cloud.send(method, path, body, Some(&self.cookie(&session)), background).await {
+        match self.cloud.send_as(method, path, body, body_type, Some(&self.cookie(&session)), background).await {
             // A session just given, and not taken: not a reason to sign out,
             // nor to ask again and again.
             Ok(a) if session_over(&a) => {

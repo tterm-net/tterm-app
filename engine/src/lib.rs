@@ -42,6 +42,7 @@ pub mod names;
 pub mod notes;
 pub mod proxy;
 pub mod pty;
+pub mod search;
 pub mod settings;
 pub mod shell;
 pub mod socket;
@@ -179,6 +180,16 @@ impl Engine {
                 me.terminals.sweep();
             }
         });
+        let me = self.clone();
+        tokio::spawn(async move {
+            // The text to search of blocks from before 0.3.1, once the start
+            // is over.
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            let made = me.terminals.store.fill_texts().await;
+            if made > 0 {
+                eprintln!("tterm: search: made the text of {made} earlier blocks");
+            }
+        });
         #[cfg(feature = "cloud")]
         if let Some(account) = self.cloud.clone() {
             let me = self.clone();
@@ -221,6 +232,31 @@ impl Engine {
         }
         let s = self.settings.lock().unwrap();
         Place { machine_id: s.machine_id, machine: self.machine_name.clone(), code: s.project_code.clone() }
+    }
+
+    /// Where this computer's terminals are, as search says it (search.rs):
+    /// its machine, and the project that machine is in.
+    pub fn search_place(&self) -> search::Where {
+        let place = self.place();
+        let (project_id, project) = self.place_project();
+        search::Where { machine_id: place.machine_id.to_string(), machine: place.machine, project_id, code: place.code, project }
+    }
+
+    /// The project this computer's machine is in: in tTerm once signed in,
+    /// as tTerm said last, Personal of the app's own until then.
+    fn place_project(&self) -> (String, String) {
+        #[cfg(feature = "cloud")]
+        if let Some(account) = self.cloud.as_ref() {
+            if let Some(here) = account.here() {
+                let name = account
+                    .last_state()
+                    .and_then(|s| s["projects"].as_array().and_then(|ps| ps.iter().find(|p| p["id"].as_str() == Some(here.project_id.as_str())).and_then(|p| p["name"].as_str().map(str::to_string))))
+                    .unwrap_or_else(|| "Personal".to_string());
+                return (here.project_id, name);
+            }
+        }
+        let s = self.settings.lock().unwrap();
+        (s.project_id.to_string(), s.project_name.clone())
     }
 
     /// The terminals of this computer follow it to the machine it is now.

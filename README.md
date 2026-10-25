@@ -20,7 +20,9 @@ Markdown as you type, checklists. Before signing in the page shows this
 computer only, and notes are kept on it. Signed in to tTerm Web (from 0.3.0),
 the window has the person's servers, projects and notes as tTerm Web has
 them, and this computer is a machine of theirs in Personal, marked as the
-one the window runs on. Windows comes later.
+one the window runs on. Search (from 0.3.1), Cmd+K, finds the commands of
+every terminal, what they printed and notes: this computer's in the app
+itself, the rest in tTerm Web, as one list. Windows comes later.
 
 ## How it is made
 
@@ -29,8 +31,9 @@ engine/   Rust: the shells (pty.rs), the terminals and their pages
           (terminals.rs, socket.rs), the requests of the page (api.rs),
           the shell's markers (shell.rs), blocks and where they are kept
           (blocks.rs, store.rs), Tab (complete.rs), the question before
-          a dangerous command (danger.rs), notes (notes.rs). A port of
-          tterm-web's core where the page needs it to be the same.
+          a dangerous command (danger.rs), notes (notes.rs), search
+          (search.rs). A port of tterm-web's core where the page needs it
+          to be the same.
           With the cloud feature (the app's): signing in with the browser
           (account.rs, loopback.rs), the page's requests to tTerm Web
           (cloud_api.rs, upstream.rs), its cloud terminals over the socket
@@ -98,6 +101,16 @@ app's folder, readable by you alone: its text, folder and branch, its code,
 and what it printed, the beginning and the end of it if it was long. They
 stay 30 days, as on the web by default, and the feed of a terminal that has
 ended, or of one from before the app was last quit, is still there.
+
+**Search finds them here** (from 0.3.1), as tTerm Web's core finds its own:
+the words in any order and any case, a word inside another too, in the
+command or in what it printed, kept as plain text beside it (the start and
+the end of a long output); the commands of a terminal from before 0.3.1 get
+theirs in the background. Signed in, the question goes to tTerm Web as well,
+and the page gets one list: a command on a machine once, the latest first.
+Without a connection, this computer's alone. A photo set in tTerm Web shows
+in the window too: the page fetches it through the app, which carries
+pictures as pictures.
 
 **Notes made before signing in stay on this computer too,** in the same
 file, until you delete them, or sign in: then they go to Personal in tTerm

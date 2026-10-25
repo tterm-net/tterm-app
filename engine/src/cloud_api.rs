@@ -101,6 +101,8 @@ pub async fn route(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], 
                 Some(proxy(&account, &method, path, body, flags).await)
             }
         }
+        // Search (from 0.3.1): tTerm's answer and this computer's, as one.
+        ("GET", ["api", "search"]) => Some(search(engine, &account, path, flags).await),
         // This computer's machine: tTerm's page of it while it answers.
         ("GET", ["api", "machines", id]) if account.offline() && Uuid::parse_str(id).map(|m| engine.is_here(m)).unwrap_or(false) => None,
         ("DELETE", ["api", "machines", id]) if Uuid::parse_str(id).map(|m| engine.is_here(m)).unwrap_or(false) => Some(Response::error(403, STAYS)),
@@ -122,10 +124,34 @@ pub async fn local_terminal(engine: &Arc<Engine>, id: &str) -> bool {
 /// The request, to tTerm, and its answer, as the page gets it.
 async fn proxy(account: &Arc<Account>, method: &str, path: &str, body: &[u8], flags: Flags) -> Response {
     let body = (!(method == "GET" || method == "HEAD") || !body.is_empty()).then_some(body);
-    match account.call(method, path, body, flags.background).await {
+    match account.call_as(method, path, body, flags.body_type, flags.background).await {
         Ok(answer) => Response { status: answer.status, content_type: content_type(&answer.content_type), body: answer.body },
         Err(Trouble::Offline) => Response::error(503, OFFLINE),
         Err(Trouble::SignedOut) => signed_out(),
+    }
+}
+
+/// How long search waits for tTerm's half, at most: then this computer's
+/// half goes alone, and tTerm is not taken for gone over a slow search.
+const CLOUD_SEARCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Search, signed in: tTerm finds what is there, this computer what runs in
+/// the app (search.rs), both at once; without tTerm, or with tTerm slow,
+/// this computer's alone.
+async fn search(engine: &Arc<Engine>, account: &Arc<Account>, path: &str, flags: Flags) -> Response {
+    let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let near = crate::api::query_text(query, "near");
+    let q = crate::api::query_text(query, "q");
+    let near = Some(near.as_str()).filter(|n| !n.is_empty());
+    let cloud = tokio::time::timeout(CLOUD_SEARCH_WAIT, account.call("GET", path, None, flags.background));
+    let (local, cloud) = tokio::join!(crate::search::search(engine, &q, near, false), cloud);
+    match cloud {
+        Ok(Ok(answer)) if answer.status == 200 => match answer.json() {
+            Some(found) => Response::json(200, crate::search::merge(&local, &found)),
+            None => Response::json(200, local),
+        },
+        Ok(Err(Trouble::SignedOut)) => signed_out(),
+        _ => Response::json(200, local),
     }
 }
 
@@ -135,12 +161,15 @@ fn signed_out() -> Response {
     Response::json(401, json!({"error": SIGNED_OUT, "signedOut": true}))
 }
 
-/// The types tTerm's answers come in, as the page reads them.
+/// The types tTerm's answers come in, as the page reads them: a photo is a
+/// JPEG (from 0.3.1).
 fn content_type(given: &str) -> &'static str {
     if given.starts_with("application/json") {
         "application/json"
     } else if given.starts_with("text/plain") {
         "text/plain"
+    } else if given.starts_with("image/jpeg") {
+        "image/jpeg"
     } else {
         "application/octet-stream"
     }

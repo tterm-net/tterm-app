@@ -403,7 +403,8 @@ async fn a_file_of_0_1_takes_notes() {
     }
     let e = started(&dir).await;
     let version: i64 = e.terminals.store.run(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()).await.unwrap();
-    assert_eq!(version, 2);
+    // Notes (2, from 0.2.0), the text of blocks for search (3, from 0.3.1).
+    assert_eq!(version, 3);
     let old = e.ended_json(&uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap()).await.unwrap();
     assert_eq!((old["name"].as_str(), old["reason"].as_str()), (Some("old"), Some("Closed.")), "the terminals of 0.1 stay");
     let pid = e.settings.lock().unwrap().project_id.to_string();

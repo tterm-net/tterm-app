@@ -102,6 +102,11 @@ impl Cloud {
     /// the Cookie header, if any; `background`, for what the page asks by
     /// itself.
     pub async fn send(&self, method: &str, path: &str, body: Option<&[u8]>, cookie: Option<&str>, background: bool) -> Result<Answer, Unreachable> {
+        self.send_as(method, path, body, "application/json", cookie, background).await
+    }
+
+    /// The same, with a body of another type than JSON (a photo).
+    pub async fn send_as(&self, method: &str, path: &str, body: Option<&[u8]>, body_type: &str, cookie: Option<&str>, background: bool) -> Result<Answer, Unreachable> {
         let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| Unreachable(format!("no such method: {method}")))?;
         let mut request = self
             .http
@@ -112,7 +117,7 @@ impl Cloud {
             request = request.header("origin", &self.base);
         }
         if let Some(body) = body {
-            request = request.header("content-type", "application/json").body(body.to_vec());
+            request = request.header("content-type", body_type).body(body.to_vec());
         }
         if let Some(cookie) = cookie {
             request = request.header("cookie", cookie);

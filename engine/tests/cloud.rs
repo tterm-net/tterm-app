@@ -93,6 +93,8 @@ struct Fake {
     slow: HashMap<String, u64>,
     /// So many saves of a note are refused (422) before they are taken.
     refuse_saves: usize,
+    /// The photo, as it came: its type and its bytes (from 0.3.1).
+    photo: Option<(String, Vec<u8>)>,
 }
 
 impl Fake {
@@ -220,11 +222,31 @@ async fn serve(mut stream: TcpStream, st: Arc<Mutex<Fake>>, base: String, drops:
         return socket(stream, st, gone).await;
     }
     loop {
+        // The network gone first: a request on a connection that went with
+        // it is not answered.
         let read = tokio::select! {
-            r = read_request(&mut stream) => r,
+            biased;
             _ = gone.changed() => return,
+            r = read_request(&mut stream) => r,
         };
         let Some((method, path, headers, body)) = read else { return };
+        // A photo, given back as tTerm does: a JPEG, in a session.
+        if method == "GET" && path.starts_with("/api/photos/") {
+            let photo = {
+                let mut st = st.lock().unwrap();
+                st.requests.push((method.clone(), path.clone(), headers.clone()));
+                let session = cookie_of(&headers, &st.cookie.clone());
+                session.filter(|s| st.sessions.contains_key(s)).and(st.photo.clone())
+            };
+            let reply = match photo {
+                Some((_, bytes)) => [format!("HTTP/1.1 200 OK\r\ncontent-type: image/jpeg\r\ncontent-length: {}\r\n\r\n", bytes.len()).into_bytes(), bytes].concat(),
+                None => b"HTTP/1.1 404 X\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}".to_vec(),
+            };
+            if stream.write_all(&reply).await.is_err() {
+                return;
+            }
+            continue;
+        }
         let (status, answer) = answer(&st, &base, &method, &path, &headers, &body);
         // An answer made, and slow to arrive: as over a slow network.
         let slow = st.lock().unwrap().slow.get(&path).copied();
@@ -272,6 +294,21 @@ async fn read_request(stream: &mut TcpStream) -> Option<(String, String, HashMap
 fn answer(st: &Arc<Mutex<Fake>>, base: &str, method: &str, path: &str, headers: &HashMap<String, String>, body: &[u8]) -> (u16, Value) {
     let mut st = st.lock().unwrap();
     st.requests.push((method.to_string(), path.to_string(), headers.clone()));
+    if method == "GET" && path.starts_with("/api/search?") {
+        // tTerm's own finds: a command on its server, and a note.
+        return (200, json!({"words": ["deploy"], "output": [], "recent": [], "more": {"notes": true},
+            "commands": [{"terminalId": "11111111-1111-1111-1111-111111111111", "seq": 7, "command": "deploy api",
+                "machineId": "s1", "machine": "web-01", "machineKind": "server", "startedAt": 1, "runs": 3, "lines": [], "hit": -1}],
+            "notes": [{"noteId": "n-cloud", "title": "Deploy", "lines": [], "hit": -1}]}));
+    }
+    if (method, path) == ("PUT", "/api/me/photo") {
+        let kind = headers.get("content-type").cloned().unwrap_or_default();
+        if kind != "image/jpeg" {
+            return (415, json!({"error": "The photo comes as a JPEG."}));
+        }
+        st.photo = Some((kind, body.to_vec()));
+        return (200, json!({"photo": "/api/photos/u1?v=1"}));
+    }
     let body: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let text = |k: &str| body.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     match (method, path) {
@@ -718,7 +755,7 @@ async fn requests_go_to_tterm_in_the_apps_session() {
         assert_eq!(h.get("origin"), Some(&cloud.base));
     }
     // What the page asks by itself says so to tTerm.
-    let r = tterm_engine::api::handle_with(&a.engine, "GET", "/api/state", &[], tterm_engine::api::Flags { background: true }).await;
+    let r = tterm_engine::api::handle_with(&a.engine, "GET", "/api/state", &[], tterm_engine::api::Flags { background: true, ..Default::default() }).await;
     assert_eq!(r.status, 200);
     {
         let st = cloud.st.lock().unwrap();
@@ -1329,4 +1366,100 @@ async fn a_sign_in_while_the_keychain_answers_late_stays() {
     let s = state(&a.engine).await;
     assert_eq!(s["app"], true, "{s}");
     assert_eq!(s["me"]["email"], "anna@example.com");
+}
+
+// ------------------------------------------- photos and search, from 0.3.1
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_photo_goes_to_tterm_as_a_picture_and_comes_back_as_one() {
+    use tterm_engine::api::{body_type, handle_with, Flags};
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    sign_in(&cloud, &a).await;
+    let photo = b"\xff\xd8\xff\xe0 a photo of 256 pixels \xff\xd9".to_vec();
+    let flags = Flags { body_type: body_type(Some("image/jpeg")), ..Default::default() };
+    let r = handle_with(&a.engine, "PUT", "/api/me/photo", &photo, flags).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let answer: Value = serde_json::from_slice(&r.body).unwrap();
+    let address = answer["photo"].as_str().unwrap().to_string();
+    assert_eq!(cloud.st.lock().unwrap().photo, Some(("image/jpeg".to_string(), photo.clone())), "as it came");
+    let r = handle_with(&a.engine, "GET", &address, &[], Flags::default()).await;
+    assert_eq!((r.status, r.content_type), (200, "image/jpeg"));
+    assert_eq!(r.body, photo, "the picture itself");
+    // Whatever else the page sends goes as JSON, as before.
+    assert_eq!(body_type(None), "application/json");
+    assert_eq!(body_type(Some("text/html")), "application/json");
+    assert_eq!(body_type(Some("Image/JPEG; q=1")), "image/jpeg");
+    let (status, _) = request(&a.engine, "POST", "/api/folders", json!({"projectId": "p1", "name": "Runbooks"})).await;
+    assert_eq!(status, 201);
+    let folders = cloud.st.lock().unwrap().requests.iter().filter(|(m, p, _)| m == "POST" && p == "/api/folders").map(|(_, _, h)| h.get("content-type").cloned()).collect::<Vec<_>>();
+    assert_eq!(folders.last().cloned().flatten().as_deref(), Some("application/json"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_finds_this_computers_commands_and_tterms_as_one() {
+    use tterm_engine::store::Finished;
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    let store = &a.engine.terminals.store;
+    let now = tterm_engine::terminals::now_ms();
+    let here_terminal = "22222222-2222-2222-2222-222222222222";
+    store.opened(here_terminal, "1", now);
+    store.save_block(here_terminal, Finished { seq_start: 5, seq_end: 9, command: "deploy web".into(), started_ms: now - 1000, finished_ms: now - 900,
+        exit_code: Some(0), cwd: "/srv".into(), output: b"deployed web\r\n".to_vec(), cols: 80, ..Default::default() });
+    // Before signing in: this computer's alone, and its notes.
+    let pid = a.engine.settings.lock().unwrap().project_id.to_string();
+    let (_, folder) = request(&a.engine, "POST", "/api/folders", json!({"projectId": pid, "name": "Runbooks"})).await;
+    let (_, note) = request(&a.engine, "POST", "/api/notes", json!({"folderId": folder["id"], "title": "Deploy steps"})).await;
+    let (status, found) = request(&a.engine, "GET", "/api/search?q=Deploy&near=", Value::Null).await;
+    assert_eq!(status, 200, "{found}");
+    let own = a.engine.settings.lock().unwrap().machine_id.to_string();
+    assert_eq!(found["commands"].as_array().unwrap().len(), 1, "{found}");
+    assert_eq!((found["commands"][0]["command"].as_str(), found["commands"][0]["machineId"].as_str()), (Some("deploy web"), Some(own.as_str())));
+    assert_eq!(found["output"][0]["line"], "deployed web");
+    assert_eq!(found["notes"][0]["noteId"], note["id"]);
+    let (_, recent) = request(&a.engine, "GET", &format!("/api/search?q=&near={own}"), Value::Null).await;
+    assert_eq!(recent["recent"][0]["command"], "deploy web", "{recent}");
+    assert_eq!(cloud.count("GET", "/api/search?q=Deploy&near="), 0, "nothing asked of tTerm before signing in");
+
+    // Signed in: tTerm's and this computer's, as one; the notes are tTerm's.
+    sign_in(&cloud, &a).await;
+    state(&a.engine).await;
+    let (status, found) = request(&a.engine, "GET", "/api/search?q=deploy&near=", Value::Null).await;
+    assert_eq!(status, 200, "{found}");
+    let commands: Vec<(&str, &str)> = found["commands"].as_array().unwrap().iter().map(|b| (b["command"].as_str().unwrap(), b["machineId"].as_str().unwrap())).collect();
+    let here = a.engine.place().machine_id.to_string();
+    assert_eq!(commands, [("deploy web", here.as_str()), ("deploy api", "s1")], "the latest first");
+    assert_eq!(found["notes"], json!([{"noteId": "n-cloud", "title": "Deploy", "lines": [], "hit": -1}]));
+    assert_eq!(found["more"]["notes"], true);
+    assert_eq!(cloud.count("GET", "/api/search?q=deploy&near="), 1);
+
+    // Without tTerm: this computer's alone.
+    cloud.stop();
+    let (status, found) = request(&a.engine, "GET", "/api/search?q=deploy+web&near=", Value::Null).await;
+    assert_eq!(status, 200, "{found}");
+    let commands: Vec<&str> = found["commands"].as_array().unwrap().iter().map(|b| b["command"].as_str().unwrap()).collect();
+    assert_eq!(commands, ["deploy web"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_tterm_does_not_hold_back_this_computers_search() {
+    use tterm_engine::store::Finished;
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    sign_in(&cloud, &a).await;
+    state(&a.engine).await;
+    let store = &a.engine.terminals.store;
+    let now = tterm_engine::terminals::now_ms();
+    store.opened("33333333-3333-3333-3333-333333333333", "1", now);
+    store.save_block("33333333-3333-3333-3333-333333333333", Finished { seq_start: 5, seq_end: 9, command: "deploy web".into(), started_ms: now, finished_ms: now,
+        output: b"ok\r\n".to_vec(), cols: 80, ..Default::default() });
+    cloud.st.lock().unwrap().slow.insert("/api/search?q=deploy&near=".into(), 8000);
+    let started = std::time::Instant::now();
+    let (status, found) = request(&a.engine, "GET", "/api/search?q=deploy&near=", Value::Null).await;
+    assert_eq!(status, 200, "{found}");
+    assert!(started.elapsed() < Duration::from_secs(7), "{:?}", started.elapsed());
+    let commands: Vec<&str> = found["commands"].as_array().unwrap().iter().map(|b| b["command"].as_str().unwrap()).collect();
+    assert_eq!(commands, ["deploy web"], "this computer's, without waiting for tTerm");
+    assert!(!a.engine.cloud.as_ref().unwrap().offline(), "a slow search is no lost connection");
 }

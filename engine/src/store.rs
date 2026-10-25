@@ -11,17 +11,19 @@
 //! A command's output is kept compressed, its beginning and end if it was
 //! long (see blocks.rs), for 30 days, as tTerm Web keeps it by default.
 //! The notes made on this computer (notes.rs) live in the same file, in
-//! tables of their own, and stay until they are deleted.
+//! tables of their own, and stay until they are deleted. From 0.3.1 a block
+//! keeps its output as plain text too, for search (search.rs).
 //! What expired is taken out of the file itself, not only out of sight:
 //! deleted rows are overwritten, the space they took goes back to the
-//! disk, and the write-ahead log is emptied after each sweep. Commands
-//! carry secrets at times (`export TOKEN=…`).
+//! disk, and the write-ahead log is emptied after each sweep (if a search
+//! was reading just then, after the next one). Commands carry secrets at
+//! times (`export TOKEN=…`).
 
 use crate::blocks::{self, Stored, FEED_MAX, HISTORY_MAX, KEEP_DAYS};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -29,6 +31,10 @@ use tokio::sync::Notify;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 /// How long a read waits for the writes before it, at most.
 const READ_WAIT: Duration = Duration::from_secs(2);
+/// How long SQLite waits for the file when another connection holds it.
+const BUSY_WAIT: Duration = Duration::from_secs(5);
+/// Of that, the sweep's emptying of the log, which waits for any search.
+const SWEEP_WAIT: Duration = Duration::from_millis(100);
 
 pub const FILE: &str = "tterm.db";
 
@@ -70,6 +76,22 @@ pub struct Store {
     /// What went wrong with the file when the app started, in words for the
     /// person: the app says it when its window opens.
     pub trouble: Option<String>,
+    /// Search's own connection to the file (from 0.3.1): it reads beside the
+    /// writes (WAL), so a long search holds up nothing else.
+    searcher: Mutex<Option<Connection>>,
+    /// The latest search asked for: one before it is not wanted any more.
+    searches: AtomicU64,
+    /// The search running, and how to stop it.
+    searching: Mutex<Option<(u64, rusqlite::InterruptHandle)>>,
+}
+
+/// Search's connection: the same file, for reading only.
+fn open_searcher(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(BUSY_WAIT)?;
+    conn.execute_batch("PRAGMA query_only = ON;")?;
+    crate::search::register(&conn)?;
+    Ok(conn)
 }
 
 fn now_ms() -> i64 {
@@ -117,9 +139,19 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         // Notes, from 0.2.0.
         conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = 2; COMMIT;", crate::notes::TABLES))?;
     }
-    // The ids the notes are kept under (identity). Not by version: a file
-    // of a build of 0.2.0 made before it gets it too.
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
+    if version < 3 {
+        // What a command printed, as text to search (from 0.3.1): made with
+        // each block, and for those from before in the background
+        // (fill_texts).
+        conn.execute_batch("BEGIN; ALTER TABLE blocks ADD COLUMN output_text TEXT; PRAGMA user_version = 3; COMMIT;")?;
+    }
+    // Not by version: a file of a build made before them gets them too. The
+    // ids the notes are kept under (identity, a build of 0.2.0); the order
+    // search reads the blocks in, the latest first (a build of 0.3.1).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE INDEX IF NOT EXISTS blocks_started ON blocks (started_at);",
+    )?;
     Ok(())
 }
 
@@ -127,7 +159,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 const INCREMENTAL: i64 = 2;
 
 fn prepare(conn: &Connection) -> rusqlite::Result<()> {
-    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.busy_timeout(BUSY_WAIT)?;
     // Space freed by old blocks goes back to the disk. Set before anything
     // writes the file's first page (WAL does): later SQLite keeps the old
     // setting until a VACUUM, which a file made otherwise gets once here.
@@ -139,6 +171,7 @@ fn prepare(conn: &Connection) -> rusqlite::Result<()> {
     let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
     // Deleted rows are overwritten, not only let go.
     conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON;")?;
+    crate::search::register(conn)?;
     migrate(conn)
 }
 
@@ -238,7 +271,7 @@ impl Store {
                 })
                 .expect("the store's thread");
         }
-        Arc::new(Store { conn, jobs: Mutex::new(tx), pending, idle, path, trouble })
+        Arc::new(Store { conn, jobs: Mutex::new(tx), pending, idle, path, trouble, searcher: Mutex::new(None), searches: AtomicU64::new(0), searching: Mutex::new(None) })
     }
 
     /// The ids of the person and of Personal that the notes are kept under.
@@ -292,6 +325,54 @@ impl Store {
             return None;
         }
         rx.await.ok()
+    }
+
+    /// Runs a search, `job`, on search's own connection, beside the writes:
+    /// what it reads is what was written, once what was on its way is. A newer search stops this one: the
+    /// statement running is interrupted, and `job` is told between its own
+    /// (its second argument says whether it is still wanted). None for a
+    /// search not wanted any more, or without a store. In memory only, the
+    /// one connection there is, in turn with the writes.
+    pub async fn search<T: Send + 'static>(self: &Arc<Self>, job: impl FnOnce(&Connection, &dyn Fn() -> bool) -> rusqlite::Result<T> + Send + 'static) -> Option<rusqlite::Result<T>> {
+        let Some(path) = self.path.clone() else {
+            return self.run(move |c| job(c, &|| true)).await;
+        };
+        let asked = self.searches.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some((_, running)) = self.searching.lock().unwrap().take() {
+            running.interrupt();
+        }
+        // What is on its way to the file first, as for any read: a command
+        // that just ended is found.
+        self.flush(READ_WAIT).await;
+        let me = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut searcher = me.searcher.lock().unwrap_or_else(|e| e.into_inner());
+            let wanted = || me.searches.load(Ordering::SeqCst) == asked;
+            if !wanted() {
+                return None;
+            }
+            if searcher.is_none() {
+                match open_searcher(&path) {
+                    Ok(c) => *searcher = Some(c),
+                    Err(e) => {
+                        eprintln!("tterm: search could not open the store: {e}");
+                        return None;
+                    }
+                }
+            }
+            let conn = searcher.as_ref()?;
+            *me.searching.lock().unwrap() = Some((asked, conn.get_interrupt_handle()));
+            // Asked again since: not started at all.
+            let found = if wanted() { Some(job(conn, &wanted)) } else { None };
+            let mut running = me.searching.lock().unwrap();
+            if running.as_ref().map(|(n, _)| *n == asked).unwrap_or(false) {
+                *running = None;
+            }
+            found
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Waits until what was sent to be written is written, at most `wait`;
@@ -374,10 +455,11 @@ impl Store {
         let id = id.to_string();
         self.write(move |c| {
             let output = blocks::compress(&block.output);
+            let text = crate::search::plain(&block.output);
             c.execute(
                 "INSERT INTO blocks (terminal_id, seq_start, seq_end, command, started_at, finished_at, exit_code,
-                                     cwd, branch, output, output_cut, cols, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                     cwd, branch, output, output_cut, cols, expires_at, output_text)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     id,
                     block.seq_start as i64,
@@ -392,10 +474,69 @@ impl Store {
                     block.cut,
                     block.cols as i64,
                     block.finished_ms + KEEP_DAYS * DAY_MS,
+                    text,
                 ],
             )?;
             Ok(())
         });
+    }
+
+    /// The text to search for blocks kept before 0.3.1, the newest first, a
+    /// few at a time with a pause between: the store goes on serving
+    /// meanwhile, and the unpacking is not on its thread. How many got it.
+    pub async fn fill_texts(&self) -> usize {
+        const BATCH: i64 = 50;
+        let mut done = 0;
+        loop {
+            let batch = self
+                .run(|c| -> rusqlite::Result<Vec<(i64, Option<Vec<u8>>)>> {
+                    let mut st = c.prepare("SELECT id, output FROM blocks WHERE output_text IS NULL ORDER BY id DESC LIMIT ?1")?;
+                    let rows = st.query_map(params![BATCH], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    rows.collect()
+                })
+                .await;
+            let batch = match batch {
+                Some(Ok(b)) if !b.is_empty() => b,
+                Some(Err(e)) => {
+                    eprintln!("tterm: could not read the blocks to make their text: {e}");
+                    return done;
+                }
+                _ => return done,
+            };
+            let texts = tokio::task::spawn_blocking(move || {
+                batch
+                    .into_iter()
+                    .map(|(id, z)| {
+                        let text = match z {
+                            Some(z) if !z.is_empty() => crate::search::plain(&blocks::decompress(&z)),
+                            _ => String::new(),
+                        };
+                        (id, text)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+            let Ok(texts) = texts else { return done };
+            let n = texts.len();
+            let written = self
+                .run(move |c| -> rusqlite::Result<()> {
+                    let tx = c.unchecked_transaction()?;
+                    {
+                        let mut st = tx.prepare("UPDATE blocks SET output_text = ?2 WHERE id = ?1")?;
+                        for (id, text) in &texts {
+                            st.execute(params![id, text])?;
+                        }
+                    }
+                    tx.commit()
+                })
+                .await;
+            if !matches!(written, Some(Ok(()))) {
+                eprintln!("tterm: could not keep the text of earlier blocks: {written:?}");
+                return done;
+            }
+            done += n;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     /// Lets go of what expired: blocks after 30 days, and terminals ended
@@ -415,9 +556,13 @@ impl Store {
             while pages.next()?.is_some() {}
             drop(pages);
             drop(vacuum);
-            // The log keeps copies of the pages it wrote: emptied too.
-            c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
-            Ok(())
+            // The log keeps copies of the pages it wrote: emptied too. Not
+            // while a search reads (on its own connection): emptying waits
+            // for it, and every write would wait with it. Then the next time.
+            c.busy_timeout(SWEEP_WAIT)?;
+            let emptied = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+            c.busy_timeout(BUSY_WAIT)?;
+            emptied
         });
     }
 
@@ -605,6 +750,110 @@ mod tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
 
+    /// From 0.3.1: search reads beside the writes, and a newer search stops
+    /// the one before, running or waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn search_reads_beside_the_writes_and_gives_way_to_a_newer_one() {
+        let d = dir();
+        let s = Store::open(&d);
+        s.opened("t", "1", 1);
+        s.save_block("t", block(5, "echo a", now_ms()));
+        assert!(s.flush(Duration::from_secs(5)).await);
+        const LONG: &str = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2000000000) SELECT count(*) FROM n";
+        let long = {
+            let s = s.clone();
+            tokio::spawn(async move { s.search(|c, _| c.query_row(LONG, [], |r| r.get::<_, i64>(0))).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Meanwhile the store writes and reads as ever.
+        let started = std::time::Instant::now();
+        s.save_block("t", block(9, "echo b", now_ms()));
+        let feed = s.feed("t", None, 60).await.unwrap();
+        assert_eq!(feed["blocks"].as_array().unwrap().len(), 2);
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        // A newer one: the long one is stopped where it is.
+        let started = std::time::Instant::now();
+        let newer = s.search(|c, _| c.query_row("SELECT count(*) FROM blocks", [], |r| r.get::<_, i64>(0))).await;
+        assert_eq!(newer.unwrap().unwrap(), 2);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(matches!(long.await.unwrap(), Some(Err(_))), "the long one was stopped");
+        // Between its statements a search cannot be stopped: one asked for
+        // meanwhile waits, and once a newer one is asked for, does not run.
+        let busy = {
+            let s = s.clone();
+            tokio::spawn(async move {
+                s.search(|_, wanted| {
+                    std::thread::sleep(Duration::from_millis(800));
+                    Ok(wanted())
+                })
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let waiting = {
+            let s = s.clone();
+            tokio::spawn(async move { s.search(|_, _| Ok(true)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let latest = s.search(|_, _| Ok(true)).await;
+        assert!(matches!(latest, Some(Ok(true))), "the latest runs");
+        assert!(matches!(busy.await.unwrap(), Some(Ok(false))), "the busy one ran, and learnt it was not wanted");
+        assert!(waiting.await.unwrap().is_none(), "the one waiting did not run");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sweep_does_not_hold_up_the_writes_for_a_search() {
+        let d = dir();
+        let s = Store::open(&d);
+        s.opened("t", "1", 1);
+        for i in 0..20 {
+            s.save_block("t", block(10 * i + 5, "echo a", now_ms()));
+        }
+        assert!(s.flush(Duration::from_secs(5)).await);
+        // A search that reads a while, the log as it is.
+        let reading = {
+            let s = s.clone();
+            tokio::spawn(async move {
+                s.search(|c, _| {
+                    let mut st = c.prepare("SELECT id FROM blocks")?;
+                    let mut rows = st.query([])?;
+                    rows.next()?;
+                    std::thread::sleep(Duration::from_secs(3));
+                    Ok(())
+                })
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        s.sweep();
+        s.save_block("t", block(500, "echo b", now_ms()));
+        assert!(s.flush(Duration::from_secs(5)).await);
+        assert!(started.elapsed() < Duration::from_millis(1500), "the writes waited for the search: {:?}", started.elapsed());
+        assert!(matches!(reading.await.unwrap(), Some(Ok(()))), "the search was not stopped");
+        // The log is emptied the next time.
+        s.sweep();
+        assert!(s.flush(Duration::from_secs(5)).await);
+        assert_eq!(std::fs::metadata(d.join(format!("{FILE}-wal"))).map(|m| m.len()).unwrap_or(0), 0);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_file_made_without_the_index_of_search_gets_it() {
+        let d = dir();
+        let s = Store::open(&d);
+        s.run(|c| c.execute_batch("DROP INDEX blocks_started")).await.unwrap().unwrap();
+        drop(s);
+        let again = Store::open(&d);
+        let has: i64 = again
+            .read(|c| c.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'blocks_started'", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(has, 1, "a file of the first build of 0.3.1 is at version 3 already");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     #[tokio::test]
     async fn what_expired_goes() {
         let d = dir();
@@ -681,8 +930,16 @@ mod tests {
         s.opened("t", "1", 1);
         assert!(s.known("t").await);
         assert_eq!(aside(&d).len(), 1);
+        // Left as the app leaves it when it quits: all in the file, nothing
+        // on its way to it. The store's thread closes the file some time
+        // after the store is gone, and in WAL mode that close writes the
+        // file once more: over the damage written below, which made it a
+        // database again on a busy computer (nothing kept the second time).
+        let mode = s.run(|c| c.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get::<_, String>(0))).await;
+        assert_eq!(mode.unwrap().unwrap(), "delete");
         drop(s);
-        // Damaged again: the copy kept the first time stays as it was.
+        // Damaged again: the copy kept the first time stays as it was. (The
+        // pause gives the second copy a name of its own.)
         tokio::time::sleep(Duration::from_millis(5)).await;
         std::fs::write(d.join(FILE), b"and this one is not a database either, damaged a second time").unwrap();
         let again = Store::open(&d);

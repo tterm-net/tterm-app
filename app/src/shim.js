@@ -74,24 +74,45 @@
       body = await request.arrayBuffer();
     }
     // What the page asks by itself, now and then: signed in, tTerm Web
-    // keeps no session on for it (from 0.3.0).
+    // keeps no session on for it (from 0.3.0). What its body is: a photo
+    // goes as a JPEG (from 0.3.1).
     let background = false;
+    let bodyType = null;
     try {
-      background = new Headers((init && init.headers) ||
-        (request && request.headers) || undefined)
-        .get("x-tterm-background") === "1";
+      const headers = new Headers((init && init.headers) ||
+        (request && request.headers) || undefined);
+      background = headers.get("x-tterm-background") === "1";
+      bodyType = headers.get("content-type");
     } catch {
       // Headers it cannot read: asked as anything else.
     }
+    if (!bodyType && typeof Blob !== "undefined" && body instanceof Blob && body.type) {
+      bodyType = body.type;
+    }
+    // A request the page gave up (a search typed over, from 0.3.1) ends
+    // there as in a browser; the engine drops a search overtaken itself.
+    const signal = (init && init.signal) || (request && request.signal) || null;
+    const aborted = () => new DOMException("The request was given up.", "AbortError");
+    if (signal && signal.aborted) throw aborted();
     let raw;
+    let gaveUp = null;
     try {
-      raw = asBytes(await invoke("api", await bodyBytes(body), {
+      const answer = invoke("api", await bodyBytes(body), {
         headers: { "x-tterm-method": method,
           "x-tterm-path": url.pathname + url.search,
-          ...(background ? { "x-tterm-background": "1" } : {}) },
-      }));
+          ...(background ? { "x-tterm-background": "1" } : {}),
+          ...(bodyType ? { "x-tterm-type": bodyType } : {}) },
+      });
+      raw = asBytes(await (signal ? Promise.race([answer, new Promise((_, reject) => {
+        gaveUp = () => reject(aborted());
+        signal.addEventListener("abort", gaveUp, { once: true });
+      })]) : answer));
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") throw error;
       throw new TypeError(`tTerm's engine did not answer: ${error}`);
+    } finally {
+      // Not left on a signal the page asks with again.
+      if (gaveUp) signal.removeEventListener("abort", gaveUp);
     }
     // Two bytes of status, one of the type's length, the type, the body.
     const status = (raw[0] << 8) | raw[1];

@@ -82,7 +82,10 @@ async fn api(request: Request<'_>, app: State<'_, App>) -> Result<Response, Stri
     if !(path.starts_with("/api/") || path == "/health") {
         return Err("not a request of the page".into());
     }
-    let flags = api::Flags { background: header(&request, "x-tterm-background").as_deref() == Some("1") };
+    let flags = api::Flags {
+        background: header(&request, "x-tterm-background").as_deref() == Some("1"),
+        body_type: api::body_type(header(&request, "x-tterm-type").as_deref()),
+    };
     let answer = api::handle_with(&app.engine, &method, &path, &raw_body(&request), flags).await;
     let mut out = Vec::with_capacity(3 + answer.content_type.len() + answer.body.len());
     out.extend_from_slice(&answer.status.to_be_bytes());

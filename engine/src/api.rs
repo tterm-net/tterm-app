@@ -21,11 +21,32 @@ pub struct Response {
 }
 
 /// What a request of the page says besides its path and body.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Flags {
     /// Asked by the page by itself, now and then (`x-tterm-background`):
     /// tTerm Web keeps no session on for it.
     pub background: bool,
+    /// What its body is (`x-tterm-type`, from 0.3.1), as it goes on to
+    /// tTerm: see body_type.
+    pub body_type: &'static str,
+}
+
+impl Default for Flags {
+    fn default() -> Flags {
+        Flags { background: false, body_type: JSON }
+    }
+}
+
+const JSON: &str = "application/json";
+
+/// The body's type, as the page said it, for tTerm: a photo is a JPEG (from
+/// 0.3.1, Account's photo); everything else the page sends is JSON.
+pub fn body_type(given: Option<&str>) -> &'static str {
+    let given = given.unwrap_or("").split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    match given.as_str() {
+        "image/jpeg" => "image/jpeg",
+        _ => JSON,
+    }
 }
 
 /// A line for Tab, at most (characters).
@@ -63,6 +84,39 @@ fn uuid_of(text: &str) -> Option<Uuid> {
 /// One value of the query, as the page wrote it.
 fn query_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     query.split('&').filter_map(|pair| pair.split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| v)
+}
+
+/// One value of the query as text, decoded as the page's URLSearchParams
+/// wrote it ("deploy+web%2A" is "deploy web*"); empty when absent.
+pub fn query_text(query: &str, name: &str) -> String {
+    let Some(raw) = query_value(query, name) else { return String::new() };
+    let hex = |b: Option<&u8>| b.and_then(|b| (*b as char).to_digit(16)).map(|d| d as u8);
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => match (hex(bytes.get(i + 1)), hex(bytes.get(i + 2))) {
+                (Some(high), Some(low)) => {
+                    out.push(high << 4 | low);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A whole number from the query: None when absent, Err when it is not one.
@@ -110,6 +164,12 @@ async fn here(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8]) -> Re
 
         // ---------------------------------------------- the person, the page
         ("GET", ["api", "state"]) => Response::json(200, engine.state_json().await),
+        // Search over this computer's commands, their output and its notes
+        // (from 0.3.1; signed in, tTerm's answer comes too, cloud_api.rs).
+        ("GET", ["api", "search"]) => {
+            let near = query_text(query, "near");
+            Response::json(200, crate::search::search(engine, &query_text(query, "q"), Some(near.as_str()).filter(|n| !n.is_empty()), true).await)
+        }
         ("PATCH", ["api", "me"]) => patch_me(engine, body),
         ("GET", ["api", "account"]) => Response::json(200, json!({
             "plan": {"id": "free", "name": "Free", "limits": {"machines": 1, "terminals": crate::MOST_TERMINALS}},
