@@ -189,7 +189,7 @@ fn cloexec(fd: &OwnedFd) -> io::Result<()> {
 /// not closed: std's own pipe for a failed exec lives there (and is marked
 /// already). Runs in the child between fork and exec, so only calls that
 /// are safe there.
-unsafe fn close_on_exec_from(low: i32) {
+pub(crate) unsafe fn close_on_exec_from(low: i32) {
     #[cfg(target_os = "linux")]
     {
         // close_range(2), since Linux 5.11; the loop below otherwise.
@@ -215,10 +215,38 @@ fn nonblocking(fd: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
+/// How a shell's output is read on after the shell ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drain {
+    /// Until a pause, and DRAIN_MAX from the end at most, however slowly it
+    /// is taken: something the shell left in the background may hold its
+    /// terminal open and keep printing, and sshd does not wait for it
+    /// either. The app's own terminals.
+    Bounded,
+    /// The same, but the time spent waiting for whoever takes the output is
+    /// not counted: what the shell printed before it ended is read whole,
+    /// however long tTerm Web's link took to come back for it, as
+    /// tterm-agent did. tTerm Web's terminals (hosted.rs).
+    Patient,
+}
+
 /// Starts `argv` in a new pseudo-terminal of `cols` × `rows`, in `cwd`, with
 /// exactly `env`. `echo` false starts the terminal with echo off, for a key
 /// typed into it first.
 pub fn spawn(argv: &[String], env: &[(String, String)], cwd: &std::path::Path, cols: u16, rows: u16, echo: bool) -> io::Result<Started> {
+    spawn_with(argv, env, cwd, cols, rows, echo, Drain::Bounded)
+}
+
+/// `spawn`, with the output read on after the end as `drain` says.
+pub fn spawn_with(
+    argv: &[String],
+    env: &[(String, String)],
+    cwd: &std::path::Path,
+    cols: u16,
+    rows: u16,
+    echo: bool,
+    drain: Drain,
+) -> io::Result<Started> {
     if argv.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "nothing to run"));
     }
@@ -311,7 +339,9 @@ pub fn spawn(argv: &[String], env: &[(String, String)], cwd: &std::path::Path, c
         let master = master.clone();
         let stopping = stopping.clone();
         let end = end.clone();
-        thread::Builder::new().name(format!("tterm-read-{pid}")).spawn(move || read_loop(&master, &out_tx, &stopping, &end))?;
+        thread::Builder::new()
+            .name(format!("tterm-read-{pid}"))
+            .spawn(move || read_loop(&master, &out_tx, &stopping, &end, drain))?;
     }
 
     let (keys_tx, keys_rx) = std_mpsc::channel::<Vec<u8>>();
@@ -361,13 +391,16 @@ fn ready(fd: std::os::fd::RawFd, write: bool, wait: Duration) -> io::Result<bool
     }
 }
 
-fn read_loop(master: &OwnedFd, out: &mpsc::Sender<Vec<u8>>, stopping: &AtomicBool, end: &Mutex<End>) {
+fn read_loop(master: &OwnedFd, out: &mpsc::Sender<Vec<u8>>, stopping: &AtomicBool, end: &Mutex<End>, drain: Drain) {
     let mut buf = vec![0u8; READ_CHUNK];
+    // How long, since the shell ended, this reader waited for whoever takes
+    // the output: not counted as draining with Drain::Patient.
+    let mut held = Duration::ZERO;
     while !stopping.load(Ordering::SeqCst) {
         let ended_at = end.lock().unwrap().at;
         let mut wait = POLL;
         if let Some(at) = ended_at {
-            let since = at.elapsed();
+            let since = at.elapsed().saturating_sub(held);
             if since >= DRAIN_MAX {
                 return;
             }
@@ -376,7 +409,7 @@ fn read_loop(master: &OwnedFd, out: &mpsc::Sender<Vec<u8>>, stopping: &AtomicBoo
         match ready(master.as_raw_fd(), false, wait) {
             Ok(false) => {
                 if let Some(at) = ended_at {
-                    if at.elapsed() >= DRAIN_GAP {
+                    if at.elapsed().saturating_sub(held) >= DRAIN_GAP {
                         return;
                     }
                 }
@@ -387,8 +420,14 @@ fn read_loop(master: &OwnedFd, out: &mpsc::Sender<Vec<u8>>, stopping: &AtomicBoo
         }
         let n = unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         if n > 0 {
+            let before = Instant::now();
             if out.blocking_send(buf[..n as usize].to_vec()).is_err() {
                 return;
+            }
+            if drain == Drain::Patient {
+                if let Some(at) = end.lock().unwrap().at {
+                    held += Instant::now().saturating_duration_since(before.max(at));
+                }
             }
         } else if n == 0 {
             return;

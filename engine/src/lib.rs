@@ -18,6 +18,11 @@
 //! with the `cloud` feature: the page's requests then go to tTerm Web in the
 //! cloud (cloud_api.rs, upstream.rs), and so do its cloud terminals over the
 //! socket (upstream_socket.rs); this computer's own stay here.
+//!
+//! The engine also keeps a link to tTerm Web of its own (link.rs), through
+//! which tTerm Web opens terminals on this computer (hosted.rs), as
+//! tterm-agent did: the agent without a window (agent/) is this engine with
+//! that link, through the computer's proxy if it has one (proxy.rs).
 
 #[cfg(feature = "cloud")]
 pub mod account;
@@ -27,12 +32,15 @@ pub mod blocks;
 pub mod cloud_api;
 pub mod complete;
 pub mod danger;
+pub mod hosted;
+pub mod link;
 #[cfg(feature = "cloud")]
 pub mod loopback;
 pub mod machine;
 pub mod modes;
 pub mod names;
 pub mod notes;
+pub mod proxy;
 pub mod pty;
 pub mod settings;
 pub mod shell;

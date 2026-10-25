@@ -11,7 +11,7 @@ repository.workspace = true
 # tTerm Web in the cloud, for the app (from 0.3.0): signing in with the
 # browser, the page's requests and its socket to app.tterm.net. The agent
 # has no need of it, and builds without it.
-cloud = ["dep:reqwest", "dep:ring", "dep:rustls", "dep:rustls-native-certs", "dep:webpki-roots", "dep:tokio-tungstenite", "dep:futures-util"]
+cloud = ["dep:reqwest", "dep:ring"]
 
 [dependencies]
 base64 = "0.22"
@@ -24,19 +24,22 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "process", "io-util", "net"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-# The network, with the crates the agent's link uses: TLS by rustls on ring,
-# roots of Mozilla and of the system, WebSocket by tokio-tungstenite.
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+# The network: the link to tTerm Web's hub for the agent and, later, the
+# app (link.rs), and with `cloud` the app's own way to tTerm Web. TLS by
+# rustls on ring, roots of Mozilla and of the system, one setting for both
+# (link::tls_config); WebSocket by tokio-tungstenite.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"], optional = true }
 ring = { version = "0.17", optional = true }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
-rustls-native-certs = { version = "0.8", optional = true }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "__rustls-tls"], optional = true }
-webpki-roots = { version = "1", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "__rustls-tls"] }
+webpki-roots = "1"
 
 [dev-dependencies]
 libc = "0.2"
-# The checks' tTerm Web in the cloud, for the cloud feature (tests/cloud.rs).
+# The checks' tTerm Web in the cloud, for the cloud feature (tests/cloud.rs),
+# and the hub of the link's checks (tests/link.rs).
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "process", "io-util", "test-util"] }

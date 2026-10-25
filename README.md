@@ -34,7 +34,10 @@ engine/   Rust: the shells (pty.rs), the terminals and their pages
           With the cloud feature (the app's): signing in with the browser
           (account.rs, loopback.rs), the page's requests to tTerm Web
           (cloud_api.rs, upstream.rs), its cloud terminals over the socket
-          (upstream_socket.rs).
+          (upstream_socket.rs). The link to tTerm Web (link.rs, proxy.rs)
+          and the terminals tTerm Web opens through it (hosted.rs).
+agent/    tterm-agent: the engine without a window, connecting a computer
+          to tTerm Web (see below).
 engine/shell/
           the scripts that make bash and zsh mark their prompts and
           commands: tterm-web's own, byte for byte.
@@ -113,6 +116,54 @@ killed three seconds later. Quitting the app asks first when shells would end,
 and names the commands running: from the menu, the window, the Dock, or at
 log out. Nothing of the app's own is left open in a shell.
 
+## The agent
+
+`tterm-agent` connects a computer to tTerm Web, so that its terminals open
+there: a Mac, or a Linux machine at home with no screen. It is this engine
+without the window, one file of a few megabytes with nothing to install
+around it, and it takes the place of agent.py from
+[tterm-agent](https://github.com/tterm-net/tterm-agent) for tTerm Web (the
+Telegram bot keeps agent.py). Its numbers go on from agent.py's: 0.14.0 is
+the first.
+
+**It dials out.** A laptop has no address to reach it at, sits behind NAT
+and sleeps, so the agent opens the connection itself, over TLS (the roots
+built in, and the system's own), and keeps it: a sign of life every 20
+seconds, a sleep noticed by the clocks, a dead link dropped and dialled
+again, every 3 seconds while there is no network. No port is opened on the
+computer. It never runs as root. Behind a company's proxy it goes through
+it, as agent.py did: `https_proxy` and `no_proxy`, or on a Mac the proxy in
+System Settings (http:// proxies, with CONNECT).
+
+**Terminals outlive a dropped link.** The laptop sleeps, the Wi-Fi blinks:
+the shells go on, the last megabyte of what each printed is kept, and tTerm
+Web takes each terminal back from the byte it has, for an hour while the
+computer is awake without the link.
+
+**It is a pipe.** It starts the shells tTerm Web asks for and passes their
+bytes both ways, and runs the short `sh` scripts tTerm Web sends (Tab, the
+folders and branches over the input line, the passport, the scripts of the
+markers). The markers, the blocks and the history live in tTerm Web, as for
+a server.
+
+**Settings.** tTerm Web's installer (Add a machine, then Computer) keeps
+them in `~/.tterm-web/env`, for you only: `TTERM_HUB`, `TTERM_TOKEN`,
+`TTERM_KEY`, the computer's own key, made on it and sent only to that tTerm
+Web, and maybe `TTERM_NAME`. A computer removed in tTerm Web hears it, ends
+its terminals, forgets the key and stays stopped. By hand, with the token
+from the same dialog:
+
+```sh
+TTERM_TOKEN=... tterm-agent --hub wss://connect.tterm.net/agent
+```
+
+Its log lines are agent.py's: `connected as «name»`, `link alive: …`,
+`no network …`, `access revoked: …`.
+
+The files come from GitHub Actions (`.github/workflows/agent.yml`): macOS
+(Intel and Apple silicon in one), Linux on Intel and AMD, Linux on ARM,
+both linked statically.
+
 ## Building
 
 macOS builds come from GitHub Actions (`.github/workflows/build.yml`): a disk
@@ -123,6 +174,8 @@ hand you need Rust, Node 22 and, on Linux, WebKitGTK 4.1:
 sh scripts/web.sh                       # the page, at WEB_COMMIT
 cargo test -p tterm-engine --features cloud
                                         # the engine, with real shells
+cargo test -p tterm-agent               # the agent
+cargo build --release -p tterm-agent    # the agent: target/release/tterm-agent
 cd app && npx @tauri-apps/cli@2 build   # the app
 ```
 

@@ -1,13 +1,14 @@
 //! The way to tTerm Web in the cloud (from 0.3.0): its requests, and its
 //! socket, for the page of a person who signed in.
 //!
-//! TLS as the agent's link has it: rustls on ring, TLS 1.2 and 1.3, the
-//! roots of Mozilla and those of this computer (on a Mac its keychains,
-//! which have a company's own certificates). Plain HTTP only to this very
-//! computer, for the checks.
+//! TLS is the agent's link's own, the engine's one setting
+//! (link::tls_config): rustls on ring, TLS 1.2 and 1.3, the roots of Mozilla
+//! and those of this computer (on a Mac its keychains, which have a
+//! company's own certificates). Plain HTTP only to this very computer, for
+//! the checks.
 
 use serde_json::Value;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -29,27 +30,9 @@ pub const BACKGROUND: &str = "x-tterm-background";
 /// The page's socket on tTerm.
 pub type CloudSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// TLS for every connection to tTerm.
+/// TLS for every connection to tTerm: the link's (link::tls_config).
 pub fn tls_config() -> Arc<rustls::ClientConfig> {
-    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            let mut roots = rustls::RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            // Those of the system that cannot be read are left out: the
-            // roots of Mozilla are there all the same.
-            for cert in rustls_native_certs::load_native_certs().certs {
-                let _ = roots.add(cert);
-            }
-            let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let config = rustls::ClientConfig::builder_with_provider(provider)
-                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-                .expect("TLS 1.2 and 1.3 with ring")
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-            Arc::new(config)
-        })
-        .clone()
+    crate::link::tls_config()
 }
 
 /// tTerm could not be reached: no network, the server restarting, a

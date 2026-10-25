@@ -1,0 +1,108 @@
+name: Agent
+
+# tterm-agent: the engine without its window, for tTerm Web. One file for
+# each system: macOS (Intel and Apple silicon in one), and Linux on Intel or
+# AMD and on ARM, linked statically, so that it runs on any Linux of that
+# processor. The app's own build is in build.yml.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Agent for Linux (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    env:
+      # The C in it (SQLite, ring) built for musl too.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v7
+      - name: musl, and zsh for the shells the checks start
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y musl-tools zsh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: The link to tTerm Web, its terminals, the proxy
+        run: |
+          cargo test --locked -p tterm-engine --lib
+          cargo test --locked -p tterm-engine --test link
+      - name: The agent
+        run: cargo test --locked -p tterm-agent
+      - name: Build
+        run: cargo build --locked --release -p tterm-agent --target ${{ matrix.target }}
+      - name: What was built
+        run: |
+          cp target/${{ matrix.target }}/release/tterm-agent tterm-agent-linux-${{ matrix.arch }}
+          file tterm-agent-linux-${{ matrix.arch }}
+          ls -la tterm-agent-linux-${{ matrix.arch }}
+          ./tterm-agent-linux-${{ matrix.arch }} --version
+          sha256sum tterm-agent-linux-${{ matrix.arch }}
+      - name: It runs, and stops when told
+        run: sh agent/runs.sh ./tterm-agent-linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tterm-agent-linux-${{ matrix.arch }}
+          path: tterm-agent-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 30
+
+  macos:
+    name: Agent for macOS (Intel and Apple silicon)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: The link to tTerm Web, its terminals, the proxy, on macOS
+        run: |
+          cargo test --locked -p tterm-engine --lib
+          cargo test --locked -p tterm-engine --test link
+      - name: The agent
+        run: cargo test --locked -p tterm-agent
+      - name: Build both, one file
+        run: |
+          cargo build --locked --release -p tterm-agent --target aarch64-apple-darwin
+          cargo build --locked --release -p tterm-agent --target x86_64-apple-darwin
+          lipo -create -output tterm-agent-macos \
+            target/aarch64-apple-darwin/release/tterm-agent \
+            target/x86_64-apple-darwin/release/tterm-agent
+          # Signed for this computer only (no Apple Developer ID): a file
+          # downloaded by curl is not checked by Gatekeeper, and Apple
+          # silicon runs only signed code.
+          codesign --force --sign - tterm-agent-macos
+      - name: What was built
+        run: |
+          lipo -info tterm-agent-macos
+          codesign --verify --verbose tterm-agent-macos
+          ls -la tterm-agent-macos
+          ./tterm-agent-macos --version
+          arch -x86_64 ./tterm-agent-macos --version || echo "(no Rosetta on this runner: the Intel half checked by lipo only)"
+          shasum -a 256 tterm-agent-macos
+      - name: It runs, and stops when told
+        run: sh agent/runs.sh ./tterm-agent-macos
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tterm-agent-macos
+          path: tterm-agent-macos
+          if-no-files-found: error
+          retention-days: 30
