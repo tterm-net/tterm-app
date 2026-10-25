@@ -539,19 +539,31 @@ async fn signs_of_life_come_through_a_flood() {
     conn.hb_back = false;
     conn.open(17, "cat /dev/zero | tr '\\0' f").await;
     let started = Instant::now();
-    let mut signs = 0;
+    let (mut signs, mut frames, mut bytes, mut owed) = (0, 0, 0, 0);
     while started.elapsed() < Duration::from_secs(4) {
         match tokio::time::timeout(WAIT, conn.ws.next()).await.unwrap() {
             Some(Ok(Message::Text(text))) if text.as_str() == r#"{"t":"hb"}"# => {
                 signs += 1;
                 conn.send(json!({"t": "hb"})).await;
             }
-            Some(Ok(Message::Binary(_))) => tokio::time::sleep(Duration::from_millis(5)).await,
+            Some(Ok(Message::Binary(data))) => {
+                // The hub takes about 4 MB a second, by the bytes and not
+                // by the frames, which are small on a Mac: far slower than
+                // the shell prints, and a Mac's buffers on the way, which
+                // grow by themselves, still go through in about a second.
+                frames += 1;
+                bytes += data.len();
+                owed += data.len();
+                if owed >= 20_000 {
+                    owed -= 20_000;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
             Some(Ok(_)) => {}
             other => panic!("the link went: {other:?}; {}", agent.log_text()),
         }
     }
-    assert!(signs >= 5, "{signs} signs of life in 4 s");
+    assert!(signs >= 5, "{signs} signs of life in 4 s; {frames} frames, {bytes} bytes of output taken");
     assert!(!agent.logged("hub silent"), "{}", agent.log_text());
     conn.send(json!({"t": "close", "ch": 17})).await;
 }
@@ -562,7 +574,9 @@ async fn scripts() {
     let _agent = Agent::start(&hub.url(), timing());
     let (mut conn, _) = hub.welcomed().await;
     let b64 = base64::engine::general_purpose::STANDARD;
-    conn.send(json!({"t": "run", "id": 7, "script": "echo out; echo err >&2; echo \"$TERM|$TTERM_AGENT_DIR|$HOME\"; exit 4"})).await;
+    // What the script was given, not what its shell makes up: bash, the
+    // sh of a Mac, sets TERM=dumb for itself when there is none.
+    conn.send(json!({"t": "run", "id": 7, "script": "echo out; echo err >&2; echo \"$(printenv TERM)|$(printenv TTERM_AGENT_DIR)|$HOME\"; exit 4"})).await;
     let ran = conn.json().await;
     assert_eq!(ran["t"], "ran");
     assert_eq!(ran["id"], 7);
