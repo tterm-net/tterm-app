@@ -592,11 +592,14 @@ async fn scripts() {
     let stat = String::from_utf8(b64.decode(ran["out"].as_str().unwrap()).unwrap()).unwrap();
     assert!(stat.trim().contains('s'), "a session leader: {stat:?}");
 
-    // Nothing of the agent's is open in it: 0, 1, 2, and ls's own look.
+    // Nothing of the agent's is open in it: 0, 1, 2, and what ls opens to
+    // look, the folder (and on a Mac, whose ls walks with fts, the folder
+    // it started in as well).
     conn.send(json!({"t": "run", "id": "fds", "script": "ls /dev/fd/"})).await;
     let ran = conn.json().await;
     let fds = String::from_utf8(b64.decode(ran["out"].as_str().unwrap()).unwrap()).unwrap();
-    assert!(fds.split_whitespace().count() <= 4, "open in a script: {fds:?}");
+    let ls_own = if cfg!(target_os = "macos") { 2 } else { 1 };
+    assert!(fds.split_whitespace().count() <= 3 + ls_own, "open in a script: {fds:?}");
 
     conn.send(json!({"t": "run", "id": "slow", "script": "sleep 5", "timeout": 0.3})).await;
     let ran = conn.json().await;
