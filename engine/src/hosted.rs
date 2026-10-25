@@ -20,7 +20,7 @@ use crate::pty::{self, Pty};
 use base64::Engine as _;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
@@ -42,6 +42,9 @@ pub const FRAME_OUT: usize = 64 * 1024;
 pub const MAX_SHELLS: usize = 16;
 /// A shell that has not ended this long after its hangup is killed.
 pub const HANGUP_GRACE: Duration = Duration::from_secs(3);
+/// What tTerm Web hears for a terminal asked for while the agent starts
+/// again as a newer version of itself (shut_if_idle).
+pub const UPDATING: &str = "the agent on this computer is updating itself: open the terminal again in a few seconds";
 
 /// tTerm Web's scripts: how many at once on one connection, how long by
 /// default and at most, how much of what they print goes back.
@@ -270,6 +273,20 @@ pub struct Hosted {
     /// tTerm Web's installer, run in one of them, would stop the agent it
     /// runs through, and refuses.
     agent_dir: Option<String>,
+    /// Terminals being opened right now, and whether new ones are refused:
+    /// the agent is about to start again as a newer version (tterm-agent's
+    /// update.rs), which would end them.
+    opening: AtomicUsize,
+    shut: AtomicBool,
+}
+
+/// One terminal being opened, for as long as `open` runs.
+struct Opening<'a>(&'a AtomicUsize);
+
+impl Drop for Opening<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 enum Next {
@@ -280,7 +297,15 @@ enum Next {
 
 impl Hosted {
     pub fn new(timing: Timing, log: Log, agent_dir: Option<String>) -> Arc<Hosted> {
-        Arc::new(Hosted { shells: Mutex::new(HashMap::new()), closing: Mutex::new(Vec::new()), timing, log, agent_dir })
+        Arc::new(Hosted {
+            shells: Mutex::new(HashMap::new()),
+            closing: Mutex::new(Vec::new()),
+            timing,
+            log,
+            agent_dir,
+            opening: AtomicUsize::new(0),
+            shut: AtomicBool::new(false),
+        })
     }
 
     fn map(&self) -> MutexGuard<'_, HashMap<u32, Arc<Shell>>> {
@@ -297,6 +322,35 @@ impl Hosted {
         let mut chs: Vec<u32> = self.map().keys().copied().collect();
         chs.sort_unstable();
         chs
+    }
+
+    /// No terminal opens from now on, if none is kept or being opened: the
+    /// agent is about to start again as a newer version, and would end them.
+    /// Whether it is so; `open` refuses until `reopen`. Decided without a
+    /// lock held while a shell starts: `open` counts itself in before it
+    /// looks, this shuts before it counts, so one of the two sees the other.
+    pub fn shut_if_idle(&self) -> bool {
+        // Not even for a moment while a terminal is open: one asked for in
+        // that moment would be refused for nothing.
+        if !self.idle() {
+            return false;
+        }
+        self.shut.store(true, Ordering::SeqCst);
+        if self.idle() {
+            return true;
+        }
+        self.shut.store(false, Ordering::SeqCst);
+        false
+    }
+
+    /// No terminal kept, none being opened.
+    pub fn idle(&self) -> bool {
+        self.opening.load(Ordering::SeqCst) == 0 && self.map().is_empty()
+    }
+
+    /// Terminals open again: the agent did not start again after all.
+    pub fn reopen(&self) {
+        self.shut.store(false, Ordering::SeqCst);
     }
 
     /// Shells open, not counting those that ended.
@@ -322,6 +376,12 @@ impl Hosted {
     /// tTerm Web opens a terminal: its command, run by the login shell with
     /// -c, as sshd runs one, in a pseudo-terminal of the page's size.
     pub async fn open(self: &Arc<Self>, ch: u32, msg: &Value, out: &Out) {
+        self.opening.fetch_add(1, Ordering::SeqCst);
+        let _opening = Opening(&self.opening);
+        if self.shut.load(Ordering::SeqCst) {
+            out.json(json!({"t": "exit", "code": null, "error": UPDATING, "ch": ch})).await;
+            return;
+        }
         if let Some(old) = self.get(ch) {
             let (linked, over) = {
                 let st = old.lock();
@@ -802,5 +862,50 @@ pub async fn run_script(script: &str, timeout: Duration, env: &[(String, String)
         }
         Ok((Err(e), out, _)) => (None, out, e.to_string().into_bytes()),
         Err(_) => (None, Vec::new(), b"the script did not finish in time".to_vec()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exit tTerm Web hears for terminal `ch`.
+    async fn exit_of(rx: &mut mpsc::Receiver<Frame>, ch: u32) -> Value {
+        loop {
+            match rx.recv().await {
+                Some(Frame::Text(text)) => {
+                    let msg: Value = serde_json::from_str(&text).unwrap();
+                    if msg["t"] == "exit" && msg["ch"] == ch {
+                        return msg;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("no exit for terminal {ch}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_terminal_opens_while_the_agent_updates_itself() {
+        let hosted = Hosted::new(Timing::default(), Arc::new(|_: &str| {}), None);
+        let (tx, mut rx) = mpsc::channel(64);
+        let (ctl, _ctl) = mpsc::channel(8);
+        let out = Out::new(tx, ctl);
+        let shell = json!({"cmd": "sleep 30"});
+        hosted.open(1, &shell, &out).await;
+        assert!(!hosted.shut_if_idle(), "a terminal is open");
+        hosted.open(2, &shell, &out).await;
+        assert_eq!(hosted.channels(), vec![1, 2], "and others still open");
+        hosted.close(1);
+        hosted.close(2);
+        assert!(hosted.shut_if_idle());
+        hosted.open(3, &shell, &out).await;
+        assert!(hosted.channels().is_empty());
+        assert_eq!(exit_of(&mut rx, 3).await["error"], UPDATING);
+        // It did not start again after all.
+        hosted.reopen();
+        hosted.open(4, &shell, &out).await;
+        assert_eq!(hosted.channels(), vec![4]);
+        hosted.end_all().await;
     }
 }

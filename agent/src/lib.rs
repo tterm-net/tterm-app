@@ -17,14 +17,22 @@
 //! scripts of the markers). Anything it can do, so can anyone at this
 //! keyboard. What it does not do: open an inbound port; run as root; store
 //! passwords or keys other than this computer's own; send anything but what
-//! the terminals print and the answers to those scripts.
+//! the terminals print and the answers to those scripts. It updates itself
+//! to a version only when tTerm's release key signed it, and only while no
+//! terminal is open (update.rs).
 
+pub mod update;
+
+use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
 use tterm_engine::hosted::Hosted;
 use tterm_engine::link::{self, Config, Log, Outcome, Timing};
+use update::Trial;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -58,6 +66,11 @@ pub struct Settings {
     pub name: String,
     /// The settings file it was started with (--env-file), if any.
     pub env_file: Option<PathBuf>,
+    /// The environment it was started with, before the settings file was
+    /// read into it: a new version starts with it again (update.rs).
+    pub launch_env: Vec<(OsString, OsString)>,
+    /// A new version on trial (update.rs).
+    pub trial: bool,
 }
 
 /// To run, or to exit at once with this code.
@@ -190,6 +203,7 @@ fn env(name: &str) -> Option<String> {
 /// the file first, and what it holds becomes the defaults, over whatever the
 /// environment it was started from says; flags over both.
 pub fn settings(args: Vec<String>) -> Start {
+    let launch_env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     let usage_error = |why: &str| {
         eprintln!("{}\ntterm-agent: error: {why}", USAGE.lines().next().unwrap_or(""));
         Start::Exit(2)
@@ -259,6 +273,8 @@ pub fn settings(args: Vec<String>) -> Start {
         key: key.or_else(|| env("TTERM_KEY")).unwrap_or_default(),
         name: name.or_else(|| env("TTERM_NAME")).unwrap_or_else(tterm_engine::machine::machine_name),
         env_file,
+        launch_env,
+        trial: false,
     };
     // Read: no program started from here is to see them.
     std::env::remove_var("TTERM_TOKEN");
@@ -269,6 +285,260 @@ pub fn settings(args: Vec<String>) -> Start {
         return Start::Exit(1);
     }
     Start::Run(settings)
+}
+
+/// The agent itself, where it is: for its updates (update.rs).
+fn here() -> Option<PathBuf> {
+    std::env::current_exe().and_then(std::fs::canonicalize).ok()
+}
+
+/// The start of the agent: `settings`, and before them a new version on
+/// trial counts this start (update.rs), so that one that stops again and
+/// again, or cannot start with these settings, goes back to the version
+/// before.
+pub fn start(args: Vec<String>) -> Start {
+    let launch_env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    // Not a start to count: a question, or root, which the agent refuses.
+    let asking = args.iter().any(|a| matches!(a.as_str(), "--version" | "-h" | "--help")) || nix::unistd::geteuid().is_root();
+    let exe = here();
+    let trial = match &exe {
+        Some(exe) if !asking => update::trial_start(exe, VERSION),
+        _ => Trial::No,
+    };
+    if let (Trial::Over, Some(exe)) = (&trial, &exe) {
+        log(&format!("version {VERSION} did not stay up here: back to the version before"));
+        go_back(exe, &launch_env, VERSION);
+    }
+    match settings(args) {
+        Start::Exit(code) if code != 0 && trial == Trial::On => {
+            if let Some(exe) = &exe {
+                log(&format!("version {VERSION} cannot start here: back to the version before"));
+                go_back(exe, &launch_env, VERSION);
+            }
+            Start::Exit(code)
+        }
+        Start::Run(mut settings) => {
+            settings.trial = trial == Trial::On;
+            Start::Run(settings)
+        }
+        other => other,
+    }
+}
+
+/// What the agent does once its updates stopped it (update.rs).
+enum Next {
+    /// Starts again as this version, now in its place.
+    Update(String),
+    /// This version, on trial, did not connect: the one before comes back.
+    GoBack,
+}
+
+type NextSlot = Arc<Mutex<Option<Next>>>;
+
+/// A new version on trial first shows it stays up; then, if this agent
+/// updates itself, newer versions (update.rs).
+#[allow(clippy::too_many_arguments)]
+async fn updates(exe: PathBuf, trial: bool, keep: Option<([u8; 32], &'static str)>, connected: Arc<AtomicBool>, hosted: Arc<Hosted>, stop: watch::Sender<bool>, next: NextSlot) {
+    if trial && !on_trial(&exe, &connected, &stop, &next).await {
+        return;
+    }
+    if let Some((key, platform)) = keep {
+        keep_updated(exe, key, platform, hosted, stop, next).await;
+    }
+}
+
+/// Whether this agent updates itself, with what key and for what system.
+fn updates_on(settings: &Settings, exe: &Path) -> Option<([u8; 32], &'static str)> {
+    if !update::enabled(exe, settings.env_file.as_deref(), env("TTERM_UPDATE").as_deref()) {
+        return None;
+    }
+    let platform = update::platform()?;
+    let Some(key) = update::public_key() else {
+        log("updates: this build has no release key, so it does not update itself");
+        return None;
+    };
+    Some((key, platform))
+}
+
+/// A new version on trial: connected, and up TRIAL_UP since its start
+/// (awake), it stays; not connected after TRIAL_CONNECT, the agent stops to
+/// go back to the version before. Whether it stays.
+async fn on_trial(exe: &Path, connected: &AtomicBool, stop: &watch::Sender<bool>, next: &NextSlot) -> bool {
+    let started = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(update::TRIAL_STEP).await;
+        let up = started.elapsed();
+        let linked = connected.load(Ordering::SeqCst);
+        if linked && up >= update::TRIAL_UP {
+            update::trial_passed(exe);
+            log(&format!("version {VERSION} works here: it stays"));
+            return true;
+        }
+        if !linked && up >= update::TRIAL_CONNECT {
+            log(&format!(
+                "version {VERSION} has not connected to tTerm Web in {} minutes: back to the version before",
+                update::TRIAL_CONNECT.as_secs() / 60
+            ));
+            *next.lock().unwrap_or_else(|e| e.into_inner()) = Some(Next::GoBack);
+            let _ = stop.send(true);
+            return false;
+        }
+    }
+}
+
+async fn keep_updated(exe: PathBuf, key: [u8; 32], platform: &'static str, hosted: Arc<Hosted>, stop: watch::Sender<bool>, next: NextSlot) {
+    tokio::time::sleep(update::FIRST_LOOK).await;
+    loop {
+        // A version that did not come up here: only one newer than that.
+        let newer_than = update::skipped(&exe, VERSION).unwrap_or_else(|| VERSION.to_string());
+        let wait = match update::look(&newer_than, &key, platform, &proxy_env()).await {
+            Ok(Some(found)) => match put_in(&exe, &found, platform, &hosted, &stop).await {
+                In::Done => {
+                    *next.lock().unwrap_or_else(|e| e.into_inner()) = Some(Next::Update(found.version));
+                    let _ = stop.send(true);
+                    return;
+                }
+                In::Waited => std::time::Duration::ZERO,
+                In::Failed => update::LOOK_EVERY,
+            },
+            Ok(None) => update::LOOK_EVERY,
+            Err(why) => {
+                log(&format!("could not look for a new version: {why}"));
+                update::LOOK_EVERY
+            }
+        };
+        tokio::time::sleep(wait).await;
+    }
+}
+
+enum In {
+    Done,
+    /// Terminals stayed open: look again, the release may be gone.
+    Waited,
+    Failed,
+}
+
+/// Puts version `found` in the agent's place once no terminal is open here
+/// (their shells live in this process, and would end with it), waiting up to
+/// LOOK_EVERY for that: a release taken back meanwhile is then not put in.
+async fn put_in(exe: &Path, found: &update::Found, platform: &str, hosted: &Hosted, stop: &watch::Sender<bool>) -> In {
+    let until = tokio::time::Instant::now() + update::LOOK_EVERY;
+    let mut file: Option<Vec<u8>> = None;
+    let mut said = false;
+    loop {
+        if hosted.idle() {
+            if file.is_none() {
+                match update::get_file(found, platform, &proxy_env()).await {
+                    Ok(f) => file = Some(f),
+                    Err(why) => {
+                        log(&format!("could not get version {}: {why}", found.version));
+                        return In::Failed;
+                    }
+                }
+            }
+            if hosted.shut_if_idle() {
+                if *stop.borrow() {
+                    return In::Failed; // stopping anyway
+                }
+                let (at, version, bytes) = (exe.to_path_buf(), found.version.clone(), file.take().unwrap_or_default());
+                let done = tokio::task::spawn_blocking(move || {
+                    update::begin_trial(&at, &version).map_err(update::NotReplaced::Io)?;
+                    update::replace(&at, &bytes, &version).inspect_err(|_| update::trial_passed(&at))
+                })
+                .await;
+                return match done {
+                    Ok(Ok(())) => {
+                        log(&format!("updated to {}: starting again as it", found.version));
+                        In::Done
+                    }
+                    Ok(Err(why)) => {
+                        hosted.reopen();
+                        if let update::NotReplaced::DoesNotStart(_) = why {
+                            update::skip(exe, &found.version);
+                        }
+                        log(&format!("could not update to {}: {why}", found.version));
+                        In::Failed
+                    }
+                    Err(_) => {
+                        hosted.reopen();
+                        In::Failed
+                    }
+                };
+            }
+        }
+        if !said {
+            log(&format!("version {} is out: it goes in once no terminal is open here", found.version));
+            said = true;
+        }
+        if tokio::time::Instant::now() >= until {
+            return In::Waited;
+        }
+        tokio::time::sleep(update::WAIT_STEP).await;
+    }
+}
+
+/// Starts the agent again as `version`, now in its place, in this same
+/// process, as it was started: autostart sees nothing. Returns only if it
+/// could not; the version before then goes back.
+fn start_again(exe: &Path, env: &[(OsString, OsString)], version: &str) -> i32 {
+    let error = exec(exe, env);
+    log(&format!("could not start version {version}: {error}"));
+    go_back(exe, env, version);
+    1
+}
+
+/// The version before goes back in the place of `version`, not to be taken
+/// again, and starts in this process. Returns only if it could not.
+fn go_back(exe: &Path, env: &[(OsString, OsString)], version: &str) {
+    if let Err(e) = update::roll_back(exe, version) {
+        log(&format!("could not put the version before back: {e}"));
+        update::trial_passed(exe);
+        return;
+    }
+    let error = exec(exe, env);
+    log(&format!("could not start the version before: {error}"));
+}
+
+/// This process becomes `exe`, with the arguments this one was started with
+/// and the environment `env`. By execve itself: execvp, failing to run a
+/// file, would try it as a shell script instead. What went wrong, if it
+/// returns.
+fn exec(exe: &Path, env: &[(OsString, OsString)]) -> String {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = |bytes: &[u8]| CString::new(bytes).map_err(|_| "a NUL in its arguments or environment".to_string());
+    let made = || -> Result<(CString, Vec<CString>, Vec<CString>), String> {
+        let path = c(exe.as_os_str().as_bytes())?;
+        let mut argv = vec![path.clone()];
+        for arg in std::env::args_os().skip(1) {
+            argv.push(c(arg.as_bytes())?);
+        }
+        let mut envp = Vec::new();
+        for (name, value) in env {
+            let mut pair = name.as_bytes().to_vec();
+            pair.push(b'=');
+            pair.extend_from_slice(value.as_bytes());
+            envp.push(c(&pair)?);
+        }
+        Ok((path, argv, envp))
+    };
+    let (path, argv, envp) = match made() {
+        Ok(made) => made,
+        Err(why) => return why,
+    };
+    let mut tries = 0;
+    loop {
+        match nix::unistd::execve(&path, &argv, &envp) {
+            // Still open for writing in a process started a moment ago,
+            // until it runs its own program (Linux).
+            Err(nix::errno::Errno::ETXTBSY) if tries < 5 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => return e.desc().to_string(),
+            Ok(never) => match never {},
+        }
+    }
 }
 
 /// Whether a signal is ignored: a hangup the agent was started to ignore
@@ -288,16 +558,21 @@ pub fn run(settings: Settings, timing: Timing) -> i32 {
     // signal the agent was started to ignore stays ignored, as for agent.py:
     // a hangup under nohup, an interrupt for a command started in the
     // background by a script.
-    let listened: Vec<tokio::signal::unix::SignalKind> = [
+    let listened: Vec<(libc::c_int, tokio::signal::unix::SignalKind)> = [
         (libc::SIGTERM, tokio::signal::unix::SignalKind::terminate()),
         (libc::SIGINT, tokio::signal::unix::SignalKind::interrupt()),
         (libc::SIGHUP, tokio::signal::unix::SignalKind::hangup()),
     ]
     .into_iter()
     .filter(|(sig, _)| !ignored(*sig))
-    .map(|(_, kind)| kind)
     .collect();
     log(&format!("version {VERSION}, hub {}", settings.hub));
+    // Where it runs from: to start again once a newer version is in its
+    // place, or the one before is back (update.rs).
+    let exe = here();
+    let next: NextSlot = Arc::default();
+    // Stopped by a signal: whatever else was under way, it stops.
+    let signalled = Arc::new(AtomicBool::new(false));
     let runtime = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("tterm-agent").enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -305,19 +580,22 @@ pub fn run(settings: Settings, timing: Timing) -> i32 {
             return 1;
         }
     };
-    let code = runtime.block_on(async move {
+    let (next_in, signalled_in, exe_in) = (next.clone(), signalled.clone(), exe.clone());
+    let launch_env = settings.launch_env.clone();
+    let (code, go_on) = runtime.block_on(async move {
         use tokio::signal::unix::signal;
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         // A stop by the system (launchd, systemd), Ctrl+C, or the window
         // the agent runs in being closed: tTerm Web hears that its
         // terminals end. A second one does not wait for that.
-        for kind in listened {
-            match signal(kind) {
+        for (_, kind) in &listened {
+            match signal(*kind) {
                 Ok(mut s) => {
                     let stop_tx = stop_tx.clone();
+                    let signalled = signalled_in.clone();
                     tokio::spawn(async move {
                         while s.recv().await.is_some() {
-                            if *stop_tx.borrow() {
+                            if signalled.swap(true, Ordering::SeqCst) {
                                 log("stopped");
                                 std::process::exit(1);
                             }
@@ -329,9 +607,23 @@ pub fn run(settings: Settings, timing: Timing) -> i32 {
             }
         }
 
-        let to_log: Log = Arc::new(|msg: &str| log(msg));
+        // Connected once: a new version on trial is on its way to staying.
+        let connected = Arc::new(AtomicBool::new(false));
+        let to_log: Log = {
+            let connected = connected.clone();
+            Arc::new(move |msg: &str| {
+                if msg.starts_with("connected as ") {
+                    connected.store(true, Ordering::SeqCst);
+                }
+                log(msg)
+            })
+        };
         let hosted = Hosted::new(timing, to_log.clone(), agent_dir());
         let keeper = hosted.spawn_keeper();
+        let updater = exe_in.clone().map(|exe| {
+            let keep = updates_on(&settings, &exe);
+            tokio::spawn(updates(exe, settings.trial, keep, connected, hosted.clone(), stop_tx.clone(), next_in.clone()))
+        });
         let config = Config {
             hub: settings.hub.clone(),
             token: settings.token.clone(),
@@ -343,16 +635,38 @@ pub fn run(settings: Settings, timing: Timing) -> i32 {
         };
         let outcome = link::run(&config, hosted.clone(), to_log, stop_rx).await;
         keeper.abort();
+        if let Some(updater) = updater {
+            updater.abort();
+        }
         // tTerm Web's terminals live as long as the agent does, through any
         // number of connections, and end with it.
         hosted.end_all().await;
         match outcome {
             Outcome::Stopped => {
-                log("stopped");
-                0
+                let mut go_on = next_in.lock().unwrap_or_else(|e| e.into_inner()).is_some() && !signalled_in.load(Ordering::SeqCst);
+                if go_on {
+                    // From here a stop by the system ends the agent at once:
+                    // nothing reads the signals after this. One that came a
+                    // moment before is read meanwhile.
+                    for (sig, _) in &listened {
+                        unsafe {
+                            libc::signal(*sig, libc::SIG_DFL);
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    go_on = !signalled_in.load(Ordering::SeqCst);
+                }
+                if !go_on {
+                    log("stopped");
+                }
+                (0, go_on)
             }
             Outcome::Revoked { error, forget } => {
                 log(&format!("access revoked: {}. Stopping.", error.trim_end_matches('.')));
+                // Not a new version's doing: no trial to go on with.
+                if let Some(exe) = &exe_in {
+                    update::trial_passed(exe);
+                }
                 if forget && !settings.key.is_empty() {
                     if let Some(path) = &settings.env_file {
                         forget_key(path);
@@ -361,12 +675,20 @@ pub fn run(settings: Settings, timing: Timing) -> i32 {
                 if let Some(remove) = uninstaller() {
                     log(&format!("Remove the agent completely: {remove}"));
                 }
-                0
+                (0, false)
             }
         }
     });
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
-    code
+    let next = next.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match (go_on && !signalled.load(Ordering::SeqCst), next, exe) {
+        (true, Some(Next::Update(version)), Some(exe)) => start_again(&exe, &launch_env, &version),
+        (true, Some(Next::GoBack), Some(exe)) => {
+            go_back(&exe, &launch_env, VERSION);
+            1
+        }
+        _ => code,
+    }
 }
 
 #[cfg(test)]

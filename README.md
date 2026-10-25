@@ -173,9 +173,30 @@ TTERM_TOKEN=... tterm-agent --hub wss://connect.tterm.net/agent
 Its log lines are agent.py's: `connected as «name»`, `link alive: …`,
 `no network …`, `access revoked: …`.
 
+**It updates itself,** when an installer put it in place: a few minutes
+after it starts and every six hours after, it looks at tTerm's releases
+here, and takes a newer version only when `tterm-agent.json`, the list of
+the files with their sizes and checksums, carries a signature that checks
+against the key built into it (`agent/release-key.pub`, never to change:
+agents out there know only that one), and the file against that list. The
+private half of the key is only in this repository's secrets, for the
+release build. GitHub is reached as tTerm Web is, with the same TLS and
+through the same proxy. A new version goes in only while no terminal is
+open on the computer, so as not to end anyone's work, and only once it has
+said its version when asked; the agent then starts again as it in the same
+process, and keeps the one before as `tterm-agent.old`. The new version is
+on trial until it has connected and stayed up ten minutes: one that stops
+three times, cannot start with its settings, or does not connect in fifteen
+minutes goes, the one before comes back, and that version is not taken
+again (`tterm-agent.skip`). A release made a pre-release or deleted is no
+longer taken, by agents waiting for their terminals to close too. GitHub
+can hold a new version back, never make one up. `TTERM_UPDATE=off` in its
+settings turns this off; an agent started by hand never updates itself.
+
 The files come from GitHub Actions (`.github/workflows/agent.yml`): macOS
 (Intel and Apple silicon in one), Linux on Intel and AMD, Linux on ARM,
-both linked statically.
+both linked statically. A tag `agent-vX.Y.Z` makes a release of them,
+with the signed `tterm-agent.json` and `SHA256SUMS`.
 
 ## Building
 

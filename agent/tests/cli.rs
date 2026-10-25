@@ -128,3 +128,62 @@ fn signals_it_was_started_to_ignore() {
 fn nix_is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
+
+/// The agent as an installer puts it: the file, its settings next to it, in
+/// a folder of its own. `before` is the version before, a script saying how
+/// it was started.
+fn installed(name: &str, settings: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let d = dir(name);
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let exe = d.join("tterm-agent");
+    std::fs::copy(env!("CARGO_BIN_EXE_tterm-agent"), &exe).unwrap();
+    let before = d.join("tterm-agent.old");
+    std::fs::write(&before, "#!/bin/sh\necho \"the version before, with $*, token ${TTERM_TOKEN:-none}\"\n").unwrap();
+    std::fs::set_permissions(&before, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env = d.join("env");
+    std::fs::write(&env, settings).unwrap();
+    std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o600)).unwrap();
+    (exe, env)
+}
+
+#[test]
+fn a_new_version_that_does_not_come_up_goes_back() {
+    if nix_is_root() {
+        return; // it does not start as root
+    }
+    let version = env!("CARGO_PKG_VERSION");
+    // Started three times on trial without staying up: the fourth goes back.
+    let (exe, env) = installed("trial-over", "TTERM_HUB=ws://127.0.0.1:9/agent\nTTERM_TOKEN=t\n");
+    let d = exe.parent().unwrap().to_path_buf();
+    std::fs::write(d.join("tterm-agent.trial"), format!("{version} 3\n")).unwrap();
+    let out = Command::new(&exe).env_clear().env("PATH", "/usr/bin:/bin").env("TTERM_TOKEN", "from-systemd").arg("--env-file").arg(&env).output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains(&format!("[tterm-agent] version {version} did not stay up here: back to the version before")), "{said}");
+    // The version before, in this same process, as this one was started.
+    assert!(said.contains(&format!("the version before, with --env-file {}, token from-systemd", env.display())), "{said}");
+    assert!(std::fs::read_to_string(&exe).unwrap().starts_with("#!/bin/sh"), "back in its place");
+    assert_eq!(std::fs::read_to_string(d.join("tterm-agent.skip")).unwrap(), format!("{version}\n"), "not taken again");
+    assert!(!d.join("tterm-agent.trial").exists() && !d.join("tterm-agent.old").exists());
+    let _ = std::fs::remove_dir_all(&d);
+
+    // On trial, and it cannot start with these settings: back at once.
+    let (exe, env) = installed("trial-cannot", "TTERM_HUB=ws://127.0.0.1:9/agent\n");
+    let d = exe.parent().unwrap().to_path_buf();
+    std::fs::write(d.join("tterm-agent.trial"), format!("{version} 0\n")).unwrap();
+    let out = Command::new(&exe).env_clear().env("PATH", "/usr/bin:/bin").arg("--env-file").arg(&env).output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("No token given"));
+    assert!(said.contains(&format!("[tterm-agent] version {version} cannot start here: back to the version before")), "{said}");
+    assert!(said.contains("the version before, with --env-file"), "{said}");
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A trial left from another version is not this one's: it starts as it is.
+    let (exe, env) = installed("trial-other", "TTERM_HUB=ws://127.0.0.1:9/agent\n");
+    let d = exe.parent().unwrap().to_path_buf();
+    std::fs::write(d.join("tterm-agent.trial"), "0.0.1 3\n").unwrap();
+    let out = Command::new(&exe).env_clear().env("PATH", "/usr/bin:/bin").arg("--env-file").arg(&env).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "no token, and nowhere to go back to");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("the version before"));
+    assert!(!d.join("tterm-agent.trial").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}

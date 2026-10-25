@@ -1,11 +1,12 @@
 //! tterm-agent: connects this computer to tTerm Web. See lib.rs.
 
-use tterm_agent::{run, settings, Start};
+use tterm_agent::{run, start, Start};
 use tterm_engine::link::Timing;
 
 fn main() {
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().to_string()).collect();
-    let settings = match settings(args) {
+    // The settings, and a new version on trial counts this start (update.rs).
+    let settings = match start(args) {
         Start::Exit(code) => std::process::exit(code),
         Start::Run(settings) => settings,
     };

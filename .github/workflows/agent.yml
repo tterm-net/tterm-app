@@ -4,10 +4,15 @@ name: Agent
 # each system: macOS (Intel and Apple silicon in one), and Linux on Intel or
 # AMD and on ARM, linked statically, so that it runs on any Linux of that
 # processor. The app's own build is in build.yml.
+#
+# The actions are pinned to their commits: what this builds, a tag makes
+# a signed release of, and installed agents take it within hours.
 
 on:
   push:
     branches: [main]
+    # A release: the tag is the agent's version, agent-v0.14.1.
+    tags: ["agent-v*"]
   pull_request:
   workflow_dispatch:
 
@@ -33,17 +38,21 @@ jobs:
       CC_x86_64_unknown_linux_musl: musl-gcc
       CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: musl, and zsh for the shells the checks start
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y musl-tools zsh
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       - name: The link to tTerm Web, its terminals, the proxy
+        # The engine's checks the agent runs on; the app's are build.yml's.
         run: |
-          cargo test --locked -p tterm-engine --lib
+          cargo test --locked -p tterm-engine --lib -- link:: proxy:: machine:: hosted::
           cargo test --locked -p tterm-engine --test link
       - name: The agent
         run: cargo test --locked -p tterm-agent
@@ -58,7 +67,7 @@ jobs:
           sha256sum tterm-agent-linux-${{ matrix.arch }}
       - name: It runs, and stops when told
         run: sh agent/runs.sh ./tterm-agent-linux-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tterm-agent-linux-${{ matrix.arch }}
           path: tterm-agent-linux-${{ matrix.arch }}
@@ -69,13 +78,16 @@ jobs:
     name: Agent for macOS (Intel and Apple silicon)
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: The link to tTerm Web, its terminals, the proxy, on macOS
         run: |
-          cargo test --locked -p tterm-engine --lib
+          cargo test --locked -p tterm-engine --lib -- link:: proxy:: machine:: hosted::
           cargo test --locked -p tterm-engine --test link
       - name: The agent
         run: cargo test --locked -p tterm-agent
@@ -100,9 +112,78 @@ jobs:
           shasum -a 256 tterm-agent-macos
       - name: It runs, and stops when told
         run: sh agent/runs.sh ./tterm-agent-macos
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tterm-agent-macos
           path: tterm-agent-macos
           if-no-files-found: error
           retention-days: 30
+
+  # A tag agent-vX.Y.Z: the three files above become a release, with the
+  # list of them and their checksums, tterm-agent.json, signed by the release
+  # key (its private half only in this repository's secrets,
+  # AGENT_SIGNING_KEY). Agents take a version only with that signature
+  # checking against the public half built into them (agent/release-key.pub).
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/agent-v')
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The tag is the agent's version
+        run: |
+          v="${GITHUB_REF_NAME#agent-v}"
+          grep -qxF "version = \"$v\"" agent/Cargo.toml || { echo "agent/Cargo.toml does not say $v"; exit 1; }
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: files
+          merge-multiple: true
+      - name: The list of the files, signed
+        env:
+          AGENT_SIGNING_KEY: ${{ secrets.AGENT_SIGNING_KEY }}
+        run: |
+          set -eu
+          v="${GITHUB_REF_NAME#agent-v}"
+          cd files
+          chmod 755 tterm-agent-*
+          # What the agents will ask it before it takes their place.
+          [ "$(./tterm-agent-linux-x86_64 --version)" = "$v" ] || { echo "the file says another version than $v"; exit 1; }
+          python3 - "$v" <<'PY'
+          import hashlib, json, sys
+          names = {"macos": "tterm-agent-macos", "linux-x86_64": "tterm-agent-linux-x86_64",
+                   "linux-arm64": "tterm-agent-linux-arm64"}
+          files = {}
+          for platform, name in names.items():
+              data = open(name, "rb").read()
+              files[platform] = {"name": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+          with open("tterm-agent.json", "w") as f:
+              json.dump({"version": sys.argv[1], "files": files}, f, indent=1, sort_keys=True)
+              f.write("\n")
+          PY
+          sha256sum tterm-agent-macos tterm-agent-linux-x86_64 tterm-agent-linux-arm64 > SHA256SUMS
+          [ -n "$AGENT_SIGNING_KEY" ] || { echo "no AGENT_SIGNING_KEY in the secrets"; exit 1; }
+          umask 077
+          # The key goes to openssl through a pipe, never to a file.
+          printf '%s\n' "$AGENT_SIGNING_KEY" | openssl pkeyutl -sign -inkey /dev/stdin -rawin -in tterm-agent.json -out "$RUNNER_TEMP/sig.bin"
+          base64 -w0 "$RUNNER_TEMP/sig.bin" > tterm-agent.json.sig
+          # Checked with the public key the agents carry, as they will.
+          python3 -c 'import sys; open(sys.argv[1], "wb").write(bytes.fromhex("302a300506032b6570032100" + open(sys.argv[2]).read().strip()))' \
+            "$RUNNER_TEMP/pub.der" ../agent/release-key.pub
+          openssl pkeyutl -verify -pubin -keyform DER -inkey "$RUNNER_TEMP/pub.der" -rawin \
+            -in tterm-agent.json -sigfile "$RUNNER_TEMP/sig.bin"
+          cat tterm-agent.json
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${GITHUB_REF_NAME#agent-v}"
+          # Not the repository's Latest: that one is the app's to have.
+          gh release create "$GITHUB_REF_NAME" --latest=false --title "tterm-agent $v" \
+            --notes "tterm-agent $v for tTerm Web: macOS (Intel and Apple silicon in one file), Linux on Intel or AMD and on ARM. Installed by Add a machine, then Computer; it updates itself, taking a version only when the signature of tterm-agent.json checks." \
+            files/tterm-agent-macos files/tterm-agent-linux-x86_64 files/tterm-agent-linux-arm64 \
+            files/tterm-agent.json files/tterm-agent.json.sig files/SHA256SUMS
