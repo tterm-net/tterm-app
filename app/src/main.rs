@@ -5,9 +5,12 @@
 //! small script (shim.js) sends the page's requests and its socket to the
 //! commands below, and they go to the engine (the tterm-engine crate), which
 //! answers for this computer the way tTerm Web's core answers for a machine.
+//! Signed in (from 0.3.0), the engine takes the rest to tTerm Web: the app
+//! keeps the key of its device in the keychain (keychain.rs).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod keychain;
 #[cfg(target_os = "macos")]
 mod mac;
 
@@ -23,7 +26,7 @@ use tauri_plugin_opener::OpenerExt;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tterm_engine::socket::PageSocket;
 use tterm_engine::terminals::Outgoing;
-use tterm_engine::{api, Engine};
+use tterm_engine::{api, upstream, Engine};
 
 const SHIM: &str = include_str!("shim.js");
 /// What one answer to the page's socket carries at most.
@@ -79,7 +82,8 @@ async fn api(request: Request<'_>, app: State<'_, App>) -> Result<Response, Stri
     if !(path.starts_with("/api/") || path == "/health") {
         return Err("not a request of the page".into());
     }
-    let answer = api::handle(&app.engine, &method, &path, &raw_body(&request)).await;
+    let flags = api::Flags { background: header(&request, "x-tterm-background").as_deref() == Some("1") };
+    let answer = api::handle_with(&app.engine, &method, &path, &raw_body(&request), flags).await;
     let mut out = Vec::with_capacity(3 + answer.content_type.len() + answer.body.len());
     out.extend_from_slice(&answer.status.to_be_bytes());
     out.push(answer.content_type.len() as u8);
@@ -390,6 +394,30 @@ fn ours(url: &tauri::Url) -> bool {
     }
 }
 
+/// tTerm Web: app.tterm.net. A debug build, for the checks, takes another
+/// on this very computer from TTERM_CLOUD.
+fn cloud_address() -> String {
+    if cfg!(debug_assertions) {
+        if let Ok(other) = std::env::var("TTERM_CLOUD") {
+            if other.starts_with("https://") || other.starts_with("http://127.0.0.1:") || other.starts_with("http://localhost:") {
+                return other.trim_end_matches('/').to_string();
+            }
+        }
+    }
+    upstream::CLOUD.to_string()
+}
+
+/// The agent's settings, with this computer's own key: `~/.tterm-web/env`.
+/// A debug build takes another file from TTERM_WEB_ENV, for the checks.
+fn agent_env() -> std::path::PathBuf {
+    if cfg!(debug_assertions) {
+        if let Some(other) = std::env::var_os("TTERM_WEB_ENV") {
+            return other.into();
+        }
+    }
+    tterm_engine::pty::home_dir().join(".tterm-web").join("env")
+}
+
 fn main() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -397,7 +425,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![api, ws_open, ws_send, ws_recv, ws_close, open_external])
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
-            let engine = Engine::new(&dir)?;
+            let cloud = cloud_address();
+            let host = Arc::new(keychain::AppHost::new(app.handle().clone(), &cloud, dir.clone()));
+            let engine = Engine::with_cloud(&dir, &cloud, host, &agent_env())?;
             let shared: App = Arc::new(Shared {
                 engine: engine.clone(),
                 sockets: Mutex::new(HashMap::new()),

@@ -73,11 +73,22 @@
         method !== "GET" && method !== "HEAD") {
       body = await request.arrayBuffer();
     }
+    // What the page asks by itself, now and then: signed in, tTerm Web
+    // keeps no session on for it (from 0.3.0).
+    let background = false;
+    try {
+      background = new Headers((init && init.headers) ||
+        (request && request.headers) || undefined)
+        .get("x-tterm-background") === "1";
+    } catch {
+      // Headers it cannot read: asked as anything else.
+    }
     let raw;
     try {
       raw = asBytes(await invoke("api", await bodyBytes(body), {
         headers: { "x-tterm-method": method,
-          "x-tterm-path": url.pathname + url.search },
+          "x-tterm-path": url.pathname + url.search,
+          ...(background ? { "x-tterm-background": "1" } : {}) },
       }));
     } catch (error) {
       throw new TypeError(`tTerm's engine did not answer: ${error}`);

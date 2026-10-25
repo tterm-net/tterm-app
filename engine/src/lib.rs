@@ -12,14 +12,23 @@
 //! words with Tab (complete.rs). Notes, in folders of Personal, are kept on
 //! this computer too (notes.rs), the way the core keeps them.
 //!
-//! No one signs in yet: the engine tells the page so (`"local": true` in
-//! the state, from tTerm Web 0.1.4), and the page then shows this computer
-//! only.
+//! Before anyone signs in, the engine tells the page so (`"local": true` in
+//! the state, from tTerm Web 0.1.4), and the page shows this computer only.
+//! From 0.3.0 the app signs in with the browser (account.rs, loopback.rs),
+//! with the `cloud` feature: the page's requests then go to tTerm Web in the
+//! cloud (cloud_api.rs, upstream.rs), and so do its cloud terminals over the
+//! socket (upstream_socket.rs); this computer's own stay here.
 
+#[cfg(feature = "cloud")]
+pub mod account;
 pub mod api;
 pub mod blocks;
+#[cfg(feature = "cloud")]
+pub mod cloud_api;
 pub mod complete;
 pub mod danger;
+#[cfg(feature = "cloud")]
+pub mod loopback;
 pub mod machine;
 pub mod modes;
 pub mod names;
@@ -30,6 +39,10 @@ pub mod shell;
 pub mod socket;
 pub mod store;
 pub mod terminals;
+#[cfg(feature = "cloud")]
+pub mod upstream;
+#[cfg(feature = "cloud")]
+pub mod upstream_socket;
 
 use serde_json::{json, Value};
 use settings::Settings;
@@ -70,6 +83,9 @@ pub struct Engine {
     pub since_ms: i64,
     /// Set while the notes cannot be read (state_json).
     notes_trouble: Mutex<Option<String>>,
+    /// tTerm Web in the cloud, once someone signs in (from 0.3.0).
+    #[cfg(feature = "cloud")]
+    pub cloud: Option<Arc<account::Account>>,
 }
 
 /// What every request for notes says while they cannot be read.
@@ -81,6 +97,20 @@ impl Engine {
     /// The engine, with its settings and its store in `data_dir` (made on
     /// the first run, for the person alone).
     pub fn new(data_dir: &Path) -> std::io::Result<Arc<Self>> {
+        Ok(Arc::new(Self::made(data_dir)?))
+    }
+
+    /// The engine of the app, which signs in to tTerm Web at `cloud` (from
+    /// 0.3.0): `host` keeps its key and opens the browser, `env_file` is the
+    /// agent's settings, where this computer's own key is.
+    #[cfg(feature = "cloud")]
+    pub fn with_cloud(data_dir: &Path, cloud: &str, host: Arc<dyn account::Host>, env_file: &Path) -> std::io::Result<Arc<Self>> {
+        let mut engine = Self::made(data_dir)?;
+        engine.cloud = Some(account::Account::new(upstream::Cloud::new(cloud), host, data_dir, env_file));
+        Ok(Arc::new(engine))
+    }
+
+    fn made(data_dir: &Path) -> std::io::Result<Self> {
         private_dir(data_dir)?;
         let mut settings = Settings::load(data_dir)?;
         let store = Store::open(data_dir);
@@ -99,7 +129,7 @@ impl Engine {
             }
         }
         store.close_left_open(LEFT_OPEN);
-        Ok(Arc::new(Engine {
+        Ok(Engine {
             data_dir: data_dir.to_path_buf(),
             settings: Mutex::new(settings),
             machine_name: machine::machine_name(),
@@ -109,7 +139,9 @@ impl Engine {
             terminals: Terminals::new(store),
             since_ms: terminals::now_ms(),
             notes_trouble: Mutex::new(None),
-        }))
+            #[cfg(feature = "cloud")]
+            cloud: None,
+        })
     }
 
     /// What runs alongside, on the async runtime: the passport is read once,
@@ -139,6 +171,14 @@ impl Engine {
                 me.terminals.sweep();
             }
         });
+        #[cfg(feature = "cloud")]
+        if let Some(account) = self.cloud.clone() {
+            let me = self.clone();
+            tokio::spawn(async move {
+                account.start(&me).await;
+                me.align_terminals();
+            });
+        }
     }
 
     pub fn save_settings(&self, change: impl FnOnce(&mut Settings)) -> std::io::Result<Settings> {
@@ -164,9 +204,38 @@ impl Engine {
         self.settings.lock().unwrap().name.clone().unwrap_or_else(|| self.account_name.clone())
     }
 
+    /// Which machine this computer is: the one it is in tTerm Web once
+    /// signed in (from 0.3.0), its own until then.
     pub fn place(&self) -> Place {
+        #[cfg(feature = "cloud")]
+        if let Some(here) = self.cloud.as_ref().and_then(|a| a.here()) {
+            return Place { machine_id: here.id, machine: here.name, code: here.code };
+        }
         let s = self.settings.lock().unwrap();
         Place { machine_id: s.machine_id, machine: self.machine_name.clone(), code: s.project_code.clone() }
+    }
+
+    /// The terminals of this computer follow it to the machine it is now.
+    pub fn align_terminals(&self) {
+        self.terminals.move_to(&self.place());
+    }
+
+    /// Whether `id` is this computer: its own machine, or the one it is in
+    /// tTerm Web.
+    pub fn is_here(&self, id: Uuid) -> bool {
+        // The settings let go of before place() takes them again.
+        let own = self.settings.lock().unwrap().machine_id;
+        id == own || id == self.place().machine_id
+    }
+
+    /// The system, as the passport says it ("macOS 15.5"), once read.
+    pub fn passport_os(&self) -> String {
+        self.passport.lock().unwrap().get("os").and_then(Value::as_str).unwrap_or("").to_string()
+    }
+
+    /// Whether the passport was read (it is, once, soon after the start).
+    pub fn passport_read(&self) -> bool {
+        self.passport.lock().unwrap().get("checked_at").is_some()
     }
 
     /// The folder of the shell scripts.
@@ -316,13 +385,21 @@ impl Engine {
             None => *trouble = Some(notes_unread("the store stopped")),
         }
         drop(trouble);
-        json!({
+        self.align_terminals();
+        #[allow(unused_mut)]
+        let mut state = json!({
             "version": format!("app {VERSION}"),
             "me": self.me_json(),
             "projects": [project],
             "terminals": self.terminals.live().iter().map(|t| t.describe()).collect::<Vec<_>>(),
             "local": true,
-        })
+        });
+        // The welcome of the app's first start, until Later or Sign in.
+        #[cfg(feature = "cloud")]
+        if self.cloud.is_some() && !self.settings.lock().unwrap().welcome_seen {
+            state["welcome"] = json!(true);
+        }
+        state
     }
 
     /// Why notes are not taken now, if they are not.

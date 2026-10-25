@@ -1207,6 +1207,25 @@ impl Terminals {
         }
     }
 
+    /// This computer is another machine now (from 0.3.0): the one it is in
+    /// tTerm once signed in, its own again once signed out. Its terminals
+    /// follow, and their pages learn it.
+    pub fn move_to(&self, place: &Place) {
+        for t in self.live.lock().unwrap().values() {
+            let changed = {
+                let mut st = t.lock();
+                let changed = st.place.machine_id != place.machine_id || st.place.machine != place.machine || st.place.code != place.code;
+                if changed {
+                    st.place = place.clone();
+                }
+                changed
+            };
+            if changed {
+                t.changed();
+            }
+        }
+    }
+
     pub fn rename(&self, id: &Uuid, name: &str) -> Result<Arc<Terminal>, (u16, String)> {
         let Some(t) = self.get(id) else { return Err((404, "no such terminal".into())) };
         if t.state() == State::Ended {

@@ -35,6 +35,10 @@ pub struct Settings {
     /// When the app first ran here, in milliseconds.
     #[serde(default)]
     pub added_at: i64,
+    /// The welcome of the first start was left with Later or Sign in (from
+    /// 0.3.0): it does not come again.
+    #[serde(default)]
+    pub welcome_seen: bool,
 }
 
 fn default_theme() -> String {
@@ -66,6 +70,7 @@ impl Settings {
             project_code: default_code(),
             project_color: default_color(),
             added_at: crate::terminals::now_ms(),
+            welcome_seen: false,
         }
     }
 

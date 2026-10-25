@@ -874,6 +874,95 @@ fn py_str_repr(s: &str) -> String {
     out
 }
 
+// --------------------------------------------- to the cloud (from 0.3.0)
+
+/// A note on its way to Personal in tTerm, as it is here.
+#[derive(Debug, Clone)]
+pub struct Leaving {
+    pub id: String,
+    pub title: String,
+    /// Its blocks without who ticked and when: tTerm notes the person who
+    /// takes them, as for any new item ticked.
+    pub blocks: Vec<Value>,
+}
+
+/// A folder of them, by its name.
+#[derive(Debug, Clone)]
+pub struct LeavingFolder {
+    pub id: String,
+    pub name: String,
+    pub notes: Vec<Leaving>,
+}
+
+/// What goes to tTerm when the person signs in: every folder of this
+/// computer's project, with its notes, the oldest first.
+pub fn to_move(c: &Connection, project_id: &str) -> Result<Vec<LeavingFolder>, Refused> {
+    let mut folders: Vec<LeavingFolder> = Vec::new();
+    {
+        let mut st = c.prepare("SELECT id, name FROM note_folders WHERE project_id = ?1 ORDER BY created_at, id")?;
+        let rows = st.query_map(params![project_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (id, name) = row?;
+            folders.push(LeavingFolder { id, name, notes: Vec::new() });
+        }
+    }
+    for folder in folders.iter_mut() {
+        let mut st = c.prepare("SELECT id, title, body FROM notes WHERE folder_id = ?1 ORDER BY created_at, rowid")?;
+        let rows = st.query_map(params![folder.id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        for row in rows {
+            let (id, title, body) = row?;
+            let blocks = load(&body)?
+                .into_iter()
+                .map(|b| {
+                    let mut kept = json!({"id": b["id"], "type": b["type"], "text": b.get("text").cloned().unwrap_or(json!(""))});
+                    if b["type"] == "todo" {
+                        kept["done"] = json!(b.get("done") == Some(&Value::Bool(true)));
+                    }
+                    kept
+                })
+                .collect();
+            folder.notes.push(Leaving { id, title, blocks });
+        }
+    }
+    Ok(folders)
+}
+
+/// Which note in tTerm a note of this computer became, while it goes
+/// there: kept before it gets its text, so that a move broken off is
+/// finished, not made twice.
+fn moving_table(c: &Connection) -> rusqlite::Result<()> {
+    c.execute_batch("CREATE TABLE IF NOT EXISTS notes_moving (note_id TEXT PRIMARY KEY, cloud_id TEXT NOT NULL);")
+}
+
+/// The note in tTerm this one became, if its move was begun.
+pub fn moving_of(c: &Connection, note_id: &str) -> Option<String> {
+    moving_table(c).ok()?;
+    c.query_row("SELECT cloud_id FROM notes_moving WHERE note_id = ?1", params![note_id], |r| r.get(0)).optional().ok().flatten()
+}
+
+/// The move of a note begun: `cloud_id` is its copy in tTerm.
+pub fn moving(c: &Connection, note_id: &str, cloud_id: &str) -> bool {
+    moving_table(c).is_ok() && c.execute("INSERT OR REPLACE INTO notes_moving (note_id, cloud_id) VALUES (?1, ?2)", params![note_id, cloud_id]).is_ok()
+}
+
+/// The note is in tTerm now: gone from here, with its versions.
+pub fn moved(c: &Connection, note_id: &str) {
+    if let Err(e) = c.execute("DELETE FROM notes WHERE id = ?1", params![note_id]) {
+        eprintln!("tterm: notes: a note that went to tTerm stays here too: {e}");
+        return;
+    }
+    if moving_table(c).is_ok() {
+        let _ = c.execute("DELETE FROM notes_moving WHERE note_id = ?1", params![note_id]);
+    }
+}
+
+/// The folder went to tTerm with its notes: gone from here, if empty.
+pub fn folder_moved(c: &Connection, folder_id: &str) {
+    if let Err(e) = c.execute("DELETE FROM note_folders WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM notes WHERE folder_id = ?1)", params![folder_id]) {
+        eprintln!("tterm: notes: a folder that went to tTerm stays here too: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

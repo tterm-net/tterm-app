@@ -2,9 +2,11 @@
 //! answers them (`tterm/api/page.py`): the same paths, the same JSON, the
 //! same refusals where the page reads them.
 //!
-//! What only an account can do (sign-in, more projects, servers) is refused
-//! with a sentence the page shows: it comes with signing in, in a later
-//! version of the app. Notes are kept on this computer (notes.rs).
+//! Before signing in, what only an account can do (more projects, servers)
+//! is refused with a sentence the page shows. Notes are kept on this
+//! computer (notes.rs). Signed in (from 0.3.0, the `cloud` feature), the
+//! page's requests go to tTerm Web, but for this computer's terminals
+//! (cloud_api.rs).
 
 use crate::notes::{self, Refused};
 use crate::{names, settings, Engine};
@@ -18,19 +20,27 @@ pub struct Response {
     pub body: Vec<u8>,
 }
 
+/// What a request of the page says besides its path and body.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Flags {
+    /// Asked by the page by itself, now and then (`x-tterm-background`):
+    /// tTerm Web keeps no session on for it.
+    pub background: bool,
+}
+
 /// A line for Tab, at most (characters).
 const MAX_LINE: usize = 64 * 1024;
 
 impl Response {
-    fn json(status: u16, value: Value) -> Self {
+    pub fn json(status: u16, value: Value) -> Self {
         Response { status, content_type: "application/json", body: value.to_string().into_bytes() }
     }
 
-    fn error(status: u16, message: &str) -> Self {
+    pub fn error(status: u16, message: &str) -> Self {
         Self::json(status, json!({"error": message}))
     }
 
-    fn empty(status: u16) -> Self {
+    pub fn empty(status: u16) -> Self {
         Response { status, content_type: "text/plain", body: Vec::new() }
     }
 }
@@ -72,6 +82,21 @@ fn open_terminal_of(engine: &Arc<Engine>, id: &str) -> Option<Arc<crate::termina
 /// Answers one request of the page: `path` with its query, as the page
 /// wrote it ("/api/terminals/…/blocks?limit=60").
 pub async fn handle(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8]) -> Response {
+    handle_with(engine, method, path, body, Flags::default()).await
+}
+
+/// The same, with what else the request says.
+pub async fn handle_with(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], flags: Flags) -> Response {
+    #[cfg(feature = "cloud")]
+    if let Some(answer) = crate::cloud_api::route(engine, method, path, body, flags).await {
+        return answer;
+    }
+    let _ = flags;
+    here(engine, method, path, body).await
+}
+
+/// Answered here, for this computer.
+async fn here(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8]) -> Response {
     let (path, query) = path.split_once('?').unwrap_or((path, ""));
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     let method = method.to_ascii_uppercase();
@@ -96,13 +121,14 @@ pub async fn handle(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8])
         // ------------------------------------------------------ machines
         ("POST", ["api", "installs"]) => Response::error(403, LATER_MACHINES),
         ("GET", ["api", "installs", _]) => Response::error(404, "no such install"),
-        ("GET", ["api", "machines", id]) => {
-            if uuid_of(id) == Some(engine.settings.lock().unwrap().machine_id) {
-                Response::json(200, engine.machine_details())
-            } else {
-                Response::error(404, "no such machine")
+        ("GET", ["api", "machines", id]) => match uuid_of(id) {
+            Some(id) if engine.is_here(id) => {
+                let mut details = engine.machine_details();
+                details["id"] = json!(id.to_string());
+                Response::json(200, details)
             }
-        }
+            _ => Response::error(404, "no such machine"),
+        },
         ("DELETE", ["api", "machines", _]) => Response::error(403, "This is the computer tTerm runs on: it stays in the app."),
         ("POST", ["api", "machines", _, "move"]) => Response::error(403, LATER_ACCOUNT),
 
@@ -504,7 +530,7 @@ fn edit_project(engine: &Arc<Engine>, id: &str, body: &[u8]) -> Response {
 async fn open_terminal(engine: &Arc<Engine>, body: &[u8]) -> Response {
     let Some(request) = body_json(body) else { return Response::error(422, "That is not JSON.") };
     let machine = request.get("machineId").and_then(Value::as_str).and_then(uuid_of);
-    if machine != Some(engine.settings.lock().unwrap().machine_id) {
+    if !machine.map(|m| engine.is_here(m)).unwrap_or(false) {
         return Response::error(404, "No such machine.");
     }
     let cols = request.get("cols").and_then(Value::as_i64).unwrap_or(80);

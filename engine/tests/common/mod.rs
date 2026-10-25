@@ -19,6 +19,24 @@ pub fn heavy() -> std::sync::MutexGuard<'static, ()> {
     HEAVY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Room for more open files than a Mac gives a process by default (256):
+/// the checks of the sign-in port hold well over a hundred connections at
+/// once, next to the other checks running meanwhile.
+pub fn room_for_files() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: the calls get a valid pointer, and change only this
+        // process's limit.
+        unsafe {
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 && limit.rlim_cur < 4096 {
+                limit.rlim_cur = limit.rlim_max.min(4096);
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            }
+        }
+    });
+}
+
 /// With a space in it, as "Application Support" has on a Mac: the shell
 /// scripts' folder is in it.
 pub fn data_dir() -> std::path::PathBuf {

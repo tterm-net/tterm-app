@@ -18,6 +18,10 @@
 //! would do damage nothing brings back is first answered with "confirm"; the
 //! page asks, and sends it again with "confirmed". A command the shell
 //! cannot take now (another one is running) is answered with "refused".
+//!
+//! Signed in (from 0.3.0), a channel attached to a terminal this app does
+//! not have is one of tTerm's in the cloud: it goes there, through the
+//! page's relay (upstream_socket.rs), with all that follows on it.
 
 use crate::danger;
 use crate::terminals::{clean_command, Outgoing, Watcher, INPUT};
@@ -41,6 +45,12 @@ pub struct PageSocket {
     /// None once the page went: an attach still on its way then starts
     /// nothing (as `_closed` in ws.py).
     watchers: Mutex<Option<HashMap<u32, Watcher>>>,
+    /// The page's cloud terminals, once it has one.
+    #[cfg(feature = "cloud")]
+    relay: std::sync::Mutex<Option<Arc<crate::upstream_socket::Relay>>>,
+    /// The page went: no relay is made for it any more.
+    #[cfg(feature = "cloud")]
+    gone: std::sync::atomic::AtomicBool,
 }
 
 impl PageSocket {
@@ -48,7 +58,18 @@ impl PageSocket {
     /// receiver, in order.
     pub fn new(engine: Arc<Engine>) -> (Arc<PageSocket>, mpsc::Receiver<Outgoing>) {
         let (out, rx) = mpsc::channel(OUTBOX);
-        (Arc::new(PageSocket { engine, out, watchers: Mutex::new(Some(HashMap::new())) }), rx)
+        (
+            Arc::new(PageSocket {
+                engine,
+                out,
+                watchers: Mutex::new(Some(HashMap::new())),
+                #[cfg(feature = "cloud")]
+                relay: std::sync::Mutex::new(None),
+                #[cfg(feature = "cloud")]
+                gone: std::sync::atomic::AtomicBool::new(false),
+            }),
+            rx,
+        )
     }
 
     async fn json(&self, message: Value) {
@@ -63,7 +84,18 @@ impl PageSocket {
         let ch = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
         if let Some(w) = self.watchers.lock().await.as_ref().and_then(|all| all.get(&ch)) {
             w.write(&frame[5..]);
+            return;
         }
+        #[cfg(feature = "cloud")]
+        if let Some(relay) = self.relay_of(ch) {
+            relay.binary(frame);
+        }
+    }
+
+    /// The relay, if `ch` is one of its channels.
+    #[cfg(feature = "cloud")]
+    fn relay_of(&self, ch: u32) -> Option<Arc<crate::upstream_socket::Relay>> {
+        self.relay.lock().unwrap().clone().filter(|r| r.has(ch))
     }
 
     /// A message in JSON.
@@ -83,7 +115,13 @@ impl PageSocket {
         }
         let mut guard = self.watchers.lock().await;
         let Some(watchers) = guard.as_mut() else { return };
-        let Some(w) = watchers.get(&ch) else { return };
+        let Some(w) = watchers.get(&ch) else {
+            #[cfg(feature = "cloud")]
+            if let Some(relay) = self.relay_of(ch) {
+                relay.text(ch, text, &msg);
+            }
+            return;
+        };
         match op {
             "resize" => resize(w, &msg),
             "focus" => w.focus(),
@@ -131,6 +169,10 @@ impl PageSocket {
         if let Some(old) = watchers.remove(&ch) {
             old.stop();
         }
+        #[cfg(feature = "cloud")]
+        if let Some(relay) = self.relay_of(ch) {
+            relay.forget(ch);
+        }
         let id = msg.get("id").and_then(Value::as_str).and_then(|id| Uuid::parse_str(id).ok());
         let Some(terminal) = id.and_then(|id| self.engine.terminals.get(&id)) else {
             drop(guard);
@@ -139,6 +181,11 @@ impl PageSocket {
                 Some(id) => self.engine.ended_json(&id).await,
                 None => None,
             };
+            // Neither running nor kept here: tTerm's, once signed in.
+            #[cfg(feature = "cloud")]
+            if ended.is_none() && self.cloud_attach(ch, msg) {
+                return;
+            }
             self.json(json!({"op": "gone", "ch": ch, "terminal": ended})).await;
             return;
         };
@@ -160,12 +207,37 @@ impl PageSocket {
         watchers.insert(ch, watcher);
     }
 
+    /// A channel to a terminal on tTerm, through the page's relay; false
+    /// when the app is not signed in.
+    #[cfg(feature = "cloud")]
+    fn cloud_attach(&self, ch: u32, msg: &Value) -> bool {
+        let Some(account) = self.engine.cloud.clone().filter(|a| a.signed_in()) else { return false };
+        let relay = {
+            let mut relay = self.relay.lock().unwrap();
+            // Looked at under the relay's lock, which close() takes after
+            // saying the page went: an attach on its way when the page went
+            // makes no relay that nothing would ever close.
+            if self.gone.load(std::sync::atomic::Ordering::SeqCst) {
+                return true;
+            }
+            relay.get_or_insert_with(|| crate::upstream_socket::Relay::new(account, self.out.clone())).clone()
+        };
+        relay.attach(ch, msg);
+        true
+    }
+
     /// The page went: its watchers stop, the terminals go on, and nothing
     /// it still sends starts anything.
     pub async fn close(&self) {
+        #[cfg(feature = "cloud")]
+        self.gone.store(true, std::sync::atomic::Ordering::SeqCst);
         let gone = self.watchers.lock().await.take();
         for (_, w) in gone.into_iter().flatten() {
             w.stop();
+        }
+        #[cfg(feature = "cloud")]
+        if let Some(relay) = self.relay.lock().unwrap().take() {
+            relay.close();
         }
     }
 }

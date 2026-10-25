@@ -22,7 +22,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y zsh vim
       - uses: dtolnay/rust-toolchain@stable
       - name: Tests
-        run: cargo test -p tterm-engine
+        run: cargo test -p tterm-engine --features cloud
 
   macos:
     name: App for macOS (Intel and Apple silicon)
@@ -35,7 +35,7 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Engine tests on macOS, with its bash and zsh
-        run: cargo test -p tterm-engine
+        run: cargo test -p tterm-engine --features cloud
       - uses: actions/setup-node@v7
         with:
           node-version: 22
