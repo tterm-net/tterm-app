@@ -52,7 +52,7 @@ jobs:
       - name: The link to tTerm Web, its terminals, the proxy
         # The engine's checks the agent runs on; the app's are build.yml's.
         run: |
-          cargo test --locked -p tterm-engine --lib -- link:: proxy:: machine:: hosted::
+          cargo test --locked -p tterm-engine --lib -- link:: proxy:: machine:: hosted:: pty::
           cargo test --locked -p tterm-engine --test link
       - name: The agent
         run: cargo test --locked -p tterm-agent
@@ -87,7 +87,7 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: The link to tTerm Web, its terminals, the proxy, on macOS
         run: |
-          cargo test --locked -p tterm-engine --lib -- link:: proxy:: machine:: hosted::
+          cargo test --locked -p tterm-engine --lib -- link:: proxy:: machine:: hosted:: pty::
           cargo test --locked -p tterm-engine --test link
       - name: The agent
         run: cargo test --locked -p tterm-agent

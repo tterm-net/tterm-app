@@ -2,7 +2,7 @@
 name = "tterm-agent"
 description = "tTerm's agent: connects a computer to tTerm Web, the engine of the app without its window."
 # The agent's own numbers, going on from agent.py 0.13.0; not the app's.
-version = "0.14.0"
+version = "0.14.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

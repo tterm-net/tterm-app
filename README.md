@@ -157,7 +157,10 @@ computer is awake without the link.
 bytes both ways, and runs the short `sh` scripts tTerm Web sends (Tab, the
 folders and branches over the input line, the passport, the scripts of the
 markers). The markers, the blocks and the history live in tTerm Web, as for
-a server.
+a server. Its shells are as a login over SSH gives them, in a clean
+environment; on a Linux where systemd runs the agent, that has the
+person's `XDG_RUNTIME_DIR` and session bus too (from 0.14.1), so that
+`systemctl --user` and `journalctl --user` work in them.
 
 **Settings.** tTerm Web's installer (Add a machine, then Computer) keeps
 them in `~/.tterm-web/env`, for you only: `TTERM_HUB`, `TTERM_TOKEN`,

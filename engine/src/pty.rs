@@ -102,17 +102,26 @@ pub fn plain_path() -> String {
     dirs.join(":")
 }
 
+/// What a login over SSH has from the system, passed on as it is when this
+/// side has it too: the locale, the temporary folder, the SSH agent; and on
+/// a Linux where systemd started this (the agent as a user service), the
+/// person's runtime folder and session bus, which pam_systemd gives a
+/// login, and by which systemctl --user, journalctl --user and podman find
+/// their way.
+const PASSED_ON: [&str; 7] = ["LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"];
+
 /// A clean environment for the shells and scripts, made the way sshd makes
-/// one: who, where, a plain PATH and the locale. Without a locale the shell
-/// would read every non-ASCII letter as separate bytes, so a UTF-8 one is
-/// set when none is given.
+/// one: who, where, a plain PATH, the locale and the rest of PASSED_ON.
+/// Without a locale the shell would read every non-ASCII letter as separate
+/// bytes, so a UTF-8 one is set when none is given.
 pub fn clean_env(terminal: bool) -> Vec<(String, String)> {
+    clean_env_from(terminal, |key| std::env::var(key).ok())
+}
+
+/// clean_env, with what this side has in its environment given by `get`.
+fn clean_env_from(terminal: bool, get: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
     let user = nix::unistd::User::from_uid(nix::unistd::getuid()).ok().flatten();
-    let name = user
-        .as_ref()
-        .map(|u| u.name.clone())
-        .or_else(|| std::env::var("USER").ok())
-        .unwrap_or_default();
+    let name = user.as_ref().map(|u| u.name.clone()).or_else(|| get("USER")).unwrap_or_default();
     let mut env = vec![
         ("HOME".to_string(), home_dir().to_string_lossy().to_string()),
         ("USER".to_string(), name.clone()),
@@ -121,8 +130,8 @@ pub fn clean_env(terminal: bool) -> Vec<(String, String)> {
         ("PATH".to_string(), plain_path()),
     ];
     let mut locale = false;
-    for key in ["LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "SSH_AUTH_SOCK"] {
-        if let Ok(value) = std::env::var(key) {
+    for key in PASSED_ON {
+        if let Some(value) = get(key) {
             if !value.is_empty() {
                 if key.starts_with("L") {
                     locale = true;
@@ -591,5 +600,47 @@ pub fn process_name(pid: i32) -> Option<String> {
 impl Drop for Pty {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the environment of this side holds, as `get` gives it.
+    fn given<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string())
+    }
+
+    fn value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    /// A login over SSH has the runtime folder and the session bus from
+    /// pam_systemd. A terminal here has them when this side does (systemd
+    /// started the agent), so that systemctl --user works in it as over SSH;
+    /// and nothing else of this side's own environment.
+    #[test]
+    fn the_persons_systemd_as_over_ssh() {
+        let env = clean_env_from(
+            true,
+            given(&[
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+                ("LANG", "pt_PT.UTF-8"),
+                ("WARP_HONOR_PS1", "1"),
+            ]),
+        );
+        assert_eq!(value(&env, "XDG_RUNTIME_DIR"), Some("/run/user/1000"));
+        assert_eq!(value(&env, "DBUS_SESSION_BUS_ADDRESS"), Some("unix:path=/run/user/1000/bus"));
+        assert_eq!(value(&env, "LANG"), Some("pt_PT.UTF-8"));
+        assert_eq!(value(&env, "WARP_HONOR_PS1"), None, "the terminal it was started in stays out");
+
+        // Started otherwise (launchd on a Mac, start.sh): none of them.
+        let env = clean_env_from(false, given(&[("XDG_RUNTIME_DIR", "")]));
+        assert_eq!(value(&env, "XDG_RUNTIME_DIR"), None);
+        assert_eq!(value(&env, "DBUS_SESSION_BUS_ADDRESS"), None);
+        assert!(value(&env, "LANG").is_some_and(|l| l.ends_with("UTF-8")), "{env:?}");
+        assert_eq!(value(&env, "TERM"), None);
     }
 }

@@ -14,7 +14,7 @@ use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tterm_engine::hosted::{self, Hosted};
-use tterm_engine::link::{self, Config, Log, Outcome, Timing};
+use tterm_engine::link::{self, Config, Log, Outcome, State, Timing};
 
 const WAIT: Duration = Duration::from_secs(15);
 
@@ -40,12 +40,14 @@ fn timing() -> Timing {
     }
 }
 
-/// The agent's side: the link running, its terminals, what it logged.
+/// The agent's side: the link running, its terminals, what it logged, and
+/// what it says it is doing (the app shows that).
 struct Agent {
     hosted: Arc<Hosted>,
     lines: Arc<Mutex<Vec<String>>>,
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<Outcome>,
+    state: watch::Receiver<State>,
 }
 
 impl Agent {
@@ -79,11 +81,20 @@ impl Agent {
             proxy_env,
         };
         let (stop, rx) = watch::channel(false);
+        let (shown, state) = watch::channel(State::Stopped);
         let task = {
             let hosted = hosted.clone();
-            tokio::spawn(async move { link::run(&config, hosted, log, rx).await })
+            tokio::spawn(async move { link::run_showing(&config, hosted, log, rx, &shown).await })
         };
-        Agent { hosted, lines, stop, task }
+        Agent { hosted, lines, stop, task, state }
+    }
+
+    async fn until_state(&self, want: State) {
+        let end = Instant::now() + WAIT;
+        while *self.state.borrow() != want {
+            assert!(Instant::now() < end, "never {want:?}, still {:?}; the log:\n{}", *self.state.borrow(), self.log_text());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     fn logged(&self, part: &str) -> bool {
@@ -696,6 +707,34 @@ async fn no_network_is_tried_often_and_said_once() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     agent.stop.send(true).unwrap();
     assert_eq!(agent.task.await.unwrap(), Outcome::Stopped);
+}
+
+/// What the link says it is doing, for the app's Settings and its bar
+/// without a connection: connecting, connected by the name tTerm Web gives,
+/// connecting again after a drop, removed; no network, stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_state_for_whoever_shows_it() {
+    let hub = Hub::new().await;
+    let agent = Agent::start(&hub.url(), timing());
+    let mut conn = hub.accept().await;
+    conn.json().await;
+    agent.until_state(State::Connecting).await;
+    conn.send(json!({"t": "welcome", "name": "named-by-web"})).await;
+    agent.until_state(State::Connected { name: "named-by-web".into() }).await;
+    drop(conn);
+    agent.until_state(State::Connecting).await;
+    let (conn, _) = hub.welcomed().await;
+    agent.until_state(State::Connected { name: "test-mac".into() }).await;
+    let mut conn = conn;
+    conn.send(json!({"t": "error", "error": "removed", "revoked": true, "forget": true})).await;
+    assert_eq!(agent.task.await.unwrap(), Outcome::Revoked { error: "removed".into(), forget: true });
+    assert_eq!(*agent.state.borrow(), State::Revoked { error: "removed".into(), forget: true });
+
+    let agent = Agent::start("ws://no-such-host.invalid/agent", timing());
+    agent.until_state(State::NoNetwork).await;
+    agent.stop.send(true).unwrap();
+    assert_eq!(agent.task.await.unwrap(), Outcome::Stopped);
+    assert_eq!(*agent.state.borrow(), State::Stopped);
 }
 
 /// A hub that stops answering: after the silence the agent drops the

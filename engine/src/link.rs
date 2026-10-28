@@ -169,6 +169,35 @@ pub enum Outcome {
     Revoked { error: String, forget: bool },
 }
 
+/// What the link is doing now, for whoever shows it (run_showing): the app,
+/// in its Settings and in its bar without a connection. The agent has its
+/// log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum State {
+    /// Dialling tTerm Web, or waiting to try again.
+    Connecting,
+    /// Connected: tTerm Web calls this computer `name`.
+    Connected { name: String },
+    /// No way out from this computer at all (no route, no name lookup):
+    /// tried again every few seconds.
+    NoNetwork,
+    /// tTerm Web says this computer was removed; `forget`: its key is dead.
+    Revoked { error: String, forget: bool },
+    /// Stopped on purpose.
+    Stopped,
+}
+
+/// Says `now` in `state`, waking whoever watches it only when it changed.
+fn show(state: &watch::Sender<State>, now: State) {
+    state.send_if_modified(|was| {
+        if *was == now {
+            return false;
+        }
+        *was = now;
+        true
+    });
+}
+
 enum Fail {
     Revoked { error: String, forget: bool },
     /// Anything else; `no_network` when the try never left this computer.
@@ -192,7 +221,24 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Keeps the link, through any number of connections, until it is stopped
 /// or tTerm Web says this computer was removed. tTerm Web's terminals are
 /// `hosted`'s and live across connections; the caller ends them after.
-pub async fn run(config: &Config, hosted: Arc<Hosted>, log: Log, mut stop: watch::Receiver<bool>) -> Outcome {
+pub async fn run(config: &Config, hosted: Arc<Hosted>, log: Log, stop: watch::Receiver<bool>) -> Outcome {
+    let (state, _) = watch::channel(State::Connecting);
+    run_showing(config, hosted, log, stop, &state).await
+}
+
+/// run, saying all along in `state` what the link is doing.
+pub async fn run_showing(config: &Config, hosted: Arc<Hosted>, log: Log, stop: watch::Receiver<bool>, state: &watch::Sender<State>) -> Outcome {
+    show(state, State::Connecting);
+    let outcome = keep(config, hosted, log, stop, state).await;
+    let last = match &outcome {
+        Outcome::Stopped => State::Stopped,
+        Outcome::Revoked { error, forget } => State::Revoked { error: error.clone(), forget: *forget },
+    };
+    show(state, last);
+    outcome
+}
+
+async fn keep(config: &Config, hosted: Arc<Hosted>, log: Log, mut stop: watch::Receiver<bool>, state: &watch::Sender<State>) -> Outcome {
     let t = config.timing;
     let mut backoff = t.backoff_start;
     // Since when there has been no network, by the monotonic clock: said
@@ -206,12 +252,13 @@ pub async fn run(config: &Config, hosted: Arc<Hosted>, log: Log, mut stop: watch
         // By the wall clock, which runs on while the machine sleeps: a
         // connection that was up before a sleep was a working one too.
         let started = SystemTime::now();
-        match connect_once(config, &hosted, &log, &mut stop).await {
+        match connect_once(config, &hosted, &log, &mut stop, state).await {
             Ok(Ended::Stopped) => return Outcome::Stopped,
             Ok(Ended::Clean) => {
                 // Reconnect straight away, no pause needed.
                 offline_since = None;
                 backoff = t.backoff_start;
+                show(state, State::Connecting);
                 log("connection closed, reconnecting");
                 if pause(t.backoff_start, &mut stop).await {
                     return Outcome::Stopped;
@@ -228,6 +275,7 @@ pub async fn run(config: &Config, hosted: Arc<Hosted>, log: Log, mut stop: watch
                     // Nothing to wait out at the hub: try again in a moment,
                     // and keep the pause as it was for when the network is
                     // back but the hub is not.
+                    show(state, State::NoNetwork);
                     let now = Instant::now();
                     match offline_since {
                         None => {
@@ -251,6 +299,7 @@ pub async fn run(config: &Config, hosted: Arc<Hosted>, log: Log, mut stop: watch
                     continue;
                 }
                 offline_since = None;
+                show(state, State::Connecting);
                 log(&format!("no link ({why}), retrying in {:.0}s", backoff.as_secs_f64()));
                 if pause(backoff, &mut stop).await {
                     return Outcome::Stopped;
@@ -282,7 +331,7 @@ async fn pause(wait: Duration, stop: &mut watch::Receiver<bool>) -> bool {
 }
 
 /// One connection, from the hello until it drops.
-async fn connect_once(config: &Config, hosted: &Arc<Hosted>, log: &Log, stop: &mut watch::Receiver<bool>) -> Result<Ended, Fail> {
+async fn connect_once(config: &Config, hosted: &Arc<Hosted>, log: &Log, stop: &mut watch::Receiver<bool>, state: &watch::Sender<State>) -> Result<Ended, Fail> {
     let t = &config.timing;
     let dialed = tokio::select! {
         r = tokio::time::timeout(t.open_timeout, dial(config)) => r,
@@ -338,6 +387,7 @@ async fn connect_once(config: &Config, hosted: &Arc<Hosted>, log: &Log, stop: &m
         _ => config.name.clone(),
     };
     log(&format!("connected as «{name}»"));
+    show(state, State::Connected { name });
 
     let (sink, mut stream) = ws.split();
     // Everything this connection sends goes through one queue, in order; a
