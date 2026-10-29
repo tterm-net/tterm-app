@@ -22,7 +22,9 @@ the window has the person's servers, projects and notes as tTerm Web has
 them, and this computer is a machine of theirs in Personal, marked as the
 one the window runs on. Search (from 0.3.1), Cmd+K, finds the commands of
 every terminal, what they printed and notes: this computer's in the app
-itself, the rest in tTerm Web, as one list. Windows comes later.
+itself, the rest in tTerm Web, as one list. From 0.4.0 the app opens this
+computer to tTerm Web and your phone itself, in the place of tTerm Web's
+agent, and stays in the menu bar for it. Windows comes later.
 
 ## How it is made
 
@@ -38,7 +40,8 @@ engine/   Rust: the shells (pty.rs), the terminals and their pages
           (account.rs, loopback.rs), the page's requests to tTerm Web
           (cloud_api.rs, upstream.rs), its cloud terminals over the socket
           (upstream_socket.rs). The link to tTerm Web (link.rs, proxy.rs)
-          and the terminals tTerm Web opens through it (hosted.rs).
+          and the terminals tTerm Web opens through it (hosted.rs), run by
+          the app in the agent's place (reach.rs).
 agent/    tterm-agent: the engine without a window, connecting a computer
           to tTerm Web (see below).
 engine/shell/
@@ -46,7 +49,8 @@ engine/shell/
           commands: tterm-web's own, byte for byte.
 app/      Tauri: the window, the menu, the bridge (src/shim.js) that sends
           the page's requests and socket to the engine over Tauri's IPC,
-          the device's key in the keychain (src/keychain.rs).
+          the device's key in the keychain (src/keychain.rs), the icon in
+          the menu bar and the start at login (src/background.rs).
 web-dist/ the page of tTerm Web, put there by scripts/web.sh at the commit
           in WEB_COMMIT. Not in git.
 ```
@@ -128,6 +132,52 @@ terminal hangs it up, as closing a window does; a shell that ignores that is
 killed three seconds later. Quitting the app asks first when shells would end,
 and names the commands running: from the menu, the window, the Dock, or at
 log out. Nothing of the app's own is left open in a shell.
+
+## This computer from tTerm Web
+
+From 0.4.0 the app keeps the agent's link itself (below: the same code,
+`engine/src/reach.rs` runs it), so that tTerm Web and your phone open
+terminals on this computer through the app. Settings, This computer, has
+the switch: **Open from tTerm Web and your phone.** On, the app connects with
+this computer's own key from `~/.tterm-web/env` (read as the agent reads
+it), so that in tTerm Web it is the same computer as with the agent, and
+says how the link is: online and under what name, connecting and what
+stands in the way, no network. It connects only with a key tTerm said, in
+this run, is a computer of your account; a new key in the file is asked
+about first. Off, there this computer is offline, and here nothing
+changes.
+
+The first run signed in sets the switch once tTerm has said which machine
+the key is: on where tTerm Web's agent was set up (you said yes to it then)
+and the app can take its place, that is on a Mac, with the agent's file for
+this tTerm Web and a key of your account; off everywhere else, until you
+turn it on. Turned on, tTerm is asked again, and a key is made if the file
+has none.
+
+While it is on and the app is signed in, on a Mac, closing the window leaves
+tTerm running in the menu bar, whose icon opens the window, says how the
+link is, and quits; and tTerm starts when you log in (a login item of
+launchd, `net.tterm.app`, which opens the app by its bundle identifier,
+wherever it is; taken out when the switch goes off or you sign out, not
+when you quit). Quitting asks first, with the window in front, when
+terminals opened from tTerm Web would end, as it asks for this computer's
+own.
+
+On a Mac the agent stops for good once the app keeps the link with a key
+tTerm took, as there is one link per computer: its autostart goes
+(`launchctl unload` of `net.tterm.web-agent`, and its file), and one
+started without it is stopped by its pid. Its settings stay, with the key;
+its uninstaller is not run, as it takes the key too. Elsewhere the app keeps
+no link with its window closed, so it leaves the agent as it is.
+
+The switch goes off by itself, and Settings says why, when the computer is
+removed in tTerm Web (its terminals there end; on again, tTerm gives the
+computer a new key and it is added to Personal again), when the agent's
+file goes (as its uninstaller takes it), and when the file is another tTerm
+Web's or tTerm says its key is another account's computer. Terminals opened
+from tTerm Web are the app's processes, so macOS asks for access to Desktop
+and Documents for tTerm, not for the agent. tTerm Web names it "tTerm app
+0.4.0" where an agent says its version.
 
 ## The agent
 

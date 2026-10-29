@@ -6,10 +6,13 @@
 //! commands below, and they go to the engine (the tterm-engine crate), which
 //! answers for this computer the way tTerm Web's core answers for a machine.
 //! Signed in (from 0.3.0), the engine takes the rest to tTerm Web: the app
-//! keeps the key of its device in the keychain (keychain.rs).
+//! keeps the key of its device in the keychain (keychain.rs). From 0.4.0 it
+//! opens this computer to tTerm Web too, in the agent's place, and while it
+//! does it stays in the menu bar with its window closed (background.rs).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod background;
 mod keychain;
 #[cfg(target_os = "macos")]
 mod mac;
@@ -213,16 +216,27 @@ fn sweep_sockets(app: &App) {
 
 fn question(engine: &Engine) -> Option<String> {
     let open = engine.terminals.live().len();
-    if open == 0 {
+    // Opened from tTerm Web on this computer, through the app (from 0.4.0).
+    let web = engine.reach.terminals();
+    if open == 0 && web == 0 {
         return None;
     }
-    let shells = if open == 1 { "The shell of 1 terminal".to_string() } else { format!("The shells of {open} terminals") };
-    let busy = engine.terminals.busy();
-    if busy.is_empty() {
-        return Some(format!("{shells} will end."));
+    let mut said = Vec::new();
+    if open > 0 {
+        let shells = if open == 1 { "The shell of 1 terminal".to_string() } else { format!("The shells of {open} terminals") };
+        let busy = engine.terminals.busy();
+        if busy.is_empty() {
+            said.push(format!("{shells} will end."));
+        } else {
+            let running: Vec<String> = busy.iter().map(|(label, name)| format!("{name} in {label}")).collect();
+            said.push(format!("Running now: {}. It will stop, and {} will end.", running.join(", "), shells.to_lowercase()));
+        }
     }
-    let running: Vec<String> = busy.iter().map(|(label, name)| format!("{name} in {label}")).collect();
-    Some(format!("Running now: {}. It will stop, and {} will end.", running.join(", "), shells.to_lowercase()))
+    if web > 0 {
+        let terminals = if web == 1 { "1 terminal".to_string() } else { format!("{web} terminals") };
+        said.push(format!("{terminals} opened from tTerm Web on this computer will end."));
+    }
+    Some(said.join(" "))
 }
 
 /// For a quit from outside the app (see mac.rs): true when it may go at
@@ -252,6 +266,9 @@ fn ask_to_quit(handle: &AppHandle) {
         quit(handle.clone(), app);
         return;
     };
+    // The question in front, with its window: also when the app was in the
+    // menu bar only (a quit from there, a logout).
+    background::show_window(handle);
     let handle2 = handle.clone();
     handle
         .dialog()
@@ -273,8 +290,11 @@ fn quit(handle: AppHandle, app: App) {
     tauri::async_runtime::spawn(async move {
         let engine = app.engine.clone();
         // Hangups for all, and a moment for them; whatever is left goes
-        // with the app, its terminals ended and kept (2.5 s at most).
-        engine.terminals.stop_all("tTerm quit.").await;
+        // with the app, its terminals ended and kept (2.5 s at most). At the
+        // same time tTerm Web hears that this computer's terminals there
+        // end, and they do (6 s at most, after a change of the link that
+        // was under way).
+        tokio::join!(engine.terminals.stop_all("tTerm quit."), engine.reach.stop());
         handle.exit(0);
     });
 }
@@ -357,6 +377,9 @@ fn on_menu(handle: &AppHandle, id: &str) {
     let window = handle.get_webview_window("main");
     match id {
         "quit" => ask_to_quit(handle),
+        // The icon in the menu bar (background.rs).
+        "bar-open" => background::show_window(handle),
+        "bar-quit" => ask_to_quit(handle),
         "reload" => {
             // The page again; and the app's page, should the window ever
             // be elsewhere.
@@ -439,6 +462,11 @@ fn main() {
                 asking: AtomicBool::new(false),
             });
             app.manage(shared.clone());
+            app.manage(background::Bar::default());
+            // On a Mac the app keeps this computer's link with its window
+            // closed, and so takes the agent's place (the engine's reach.rs).
+            engine.reach.set_background(background::supported());
+            background::follow(app.handle(), engine.clone());
             tauri::async_runtime::spawn(async move {
                 engine.start_background();
             });
@@ -462,8 +490,12 @@ fn main() {
 
             let handle = app.handle().clone();
             let on_load = shared.clone();
+            // Started at login (background.rs): in the menu bar, no window
+            // until asked for.
+            let hidden = background::supported() && background::started_at_login();
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("tTerm")
+                .visible(!hidden)
                 .inner_size(1280.0, 820.0)
                 .min_inner_size(640.0, 420.0)
                 .background_color(tauri::window::Color(19, 20, 23, 255))
@@ -484,6 +516,9 @@ fn main() {
                     }
                 })
                 .build()?;
+            if hidden {
+                background::hide_window(app.handle());
+            }
             // What went wrong with the app's file at start (a damaged file
             // kept aside, or one it could not open): said once, plainly, so
             // that notes missing, or not taken, are not a mystery.
@@ -499,9 +534,17 @@ fn main() {
             let shared = handle.state::<App>();
             if !shared.quitting.load(Ordering::SeqCst) {
                 api.prevent_close();
-                ask_to_quit(handle);
+                // Opened from tTerm Web: the app stays, in the menu bar.
+                if background::on(handle) {
+                    background::hide_window(handle);
+                } else {
+                    ask_to_quit(handle);
+                }
             }
         }
+        // The app opened again (the Dock, Finder) with its window closed.
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => background::show_window(handle),
         RunEvent::ExitRequested { api, .. } => {
             let shared = handle.state::<App>();
             if !shared.quitting.load(Ordering::SeqCst) {

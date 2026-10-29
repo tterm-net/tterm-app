@@ -65,3 +65,36 @@ fn set_delegate_again() {
         }
     }
 }
+
+/// While this computer is opened from tTerm Web (background.rs), the app
+/// says it does work the person asked for, so that App Nap does not slow
+/// its timers with the window closed, and with them the link's signs of
+/// life (the agent, a launchd job, was never napped). The system may still
+/// sleep when idle. On the main thread.
+pub fn stay_awake(on: bool) {
+    /// NSActivityUserInitiatedAllowingIdleSystemSleep: NSActivityUserInitiated
+    /// (0x00FFFFFF) without NSActivityIdleSystemSleepDisabled (1 << 20).
+    const OPTIONS: u64 = 0x00FF_FFFF & !(1 << 20);
+    static ACTIVITY: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+    let mut activity = ACTIVITY.lock().unwrap();
+    unsafe {
+        let Some(class) = AnyClass::get(c"NSProcessInfo") else { return };
+        let info: *mut AnyObject = msg_send![class, processInfo];
+        if info.is_null() {
+            return;
+        }
+        if on && *activity == 0 {
+            let Some(string) = AnyClass::get(c"NSString") else { return };
+            let reason: *mut AnyObject = msg_send![string, stringWithUTF8String: c"This computer is opened from tTerm Web".as_ptr()];
+            let token: *mut AnyObject = msg_send![info, beginActivityWithOptions: OPTIONS, reason: reason];
+            if !token.is_null() {
+                *activity = ffi::objc_retain(token.cast()) as usize;
+            }
+        } else if !on && *activity != 0 {
+            let token = *activity as *mut AnyObject;
+            let _: () = msg_send![info, endActivity: token];
+            ffi::objc_release(token.cast());
+            *activity = 0;
+        }
+    }
+}

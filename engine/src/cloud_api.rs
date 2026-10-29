@@ -5,7 +5,8 @@
 //!
 //! What only the app does is answered here, signed in or not: signing in
 //! with the browser (`/api/auth/link`), the welcome of the first start
-//! (`/api/app/welcome`), and Sign out, which forgets the app's key too.
+//! (`/api/app/welcome`), This computer in Settings (`/api/app/this-computer`,
+//! from 0.4.0: reach.rs), and Sign out, which forgets the app's key too.
 //! `/api/state` is tTerm's, with this computer's machine marked `here` and
 //! this app's terminals with the rest (account::merge_state); when tTerm
 //! cannot be reached, it is what tTerm said last, with `"offline": true`,
@@ -13,6 +14,7 @@
 
 use crate::account::{self, Account, Trouble};
 use crate::api::{Flags, Response};
+use crate::reach::NotOn;
 use crate::{names, Engine};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -52,6 +54,21 @@ pub async fn route(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], 
             let saved = engine.save_settings(|s| s.welcome_seen = true);
             return Some(if saved.is_ok() { Response::empty(204) } else { Response::error(500, "Could not save the settings on this computer.") });
         }
+        ("GET", ["api", "app", "this-computer"]) => return Some(Response::json(200, engine.reach.json(engine))),
+        ("PUT", ["api", "app", "this-computer"]) => {
+            let Some(open) = serde_json::from_slice::<Value>(body).ok().and_then(|b| b.get("open").and_then(Value::as_bool)) else {
+                return Some(Response::error(422, "Say open: true or false."));
+            };
+            let done = if open { engine.reach.turn_on(engine).await } else { engine.reach.turn_off(engine).await.map_err(NotOn::Unsaved) };
+            // The answer says what the link does now.
+            engine.reach.settle(engine).await;
+            return Some(match done {
+                Ok(()) => Response::json(200, engine.reach.json(engine)),
+                Err(NotOn::SignedOut) => Response::error(409, "Sign in first: this Mac opens from tTerm Web in your account."),
+                Err(NotOn::Refused(why)) => Response::error(409, &why),
+                Err(NotOn::Unsaved(_)) => Response::error(500, "Could not save the settings on this computer."),
+            });
+        }
         _ => {}
     }
     if !account.signed_in() {
@@ -63,6 +80,7 @@ pub async fn route(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], 
         ("POST", ["api", "auth", "signout"]) => {
             account.sign_out().await;
             engine.align_terminals();
+            engine.reach.look_again();
             Some(Response::json(200, json!({"signedOut": true})))
         }
         ("POST", ["api", "auth", "signout-everywhere"]) => {
@@ -70,6 +88,7 @@ pub async fn route(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], 
             if answer.status == 200 {
                 account.forget_here().await;
                 engine.align_terminals();
+                engine.reach.look_again();
             }
             Some(answer)
         }
@@ -79,6 +98,7 @@ pub async fn route(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], 
             if answer.status == 200 && ours {
                 account.forget_here().await;
                 engine.align_terminals();
+                engine.reach.look_again();
             }
             Some(answer)
         }

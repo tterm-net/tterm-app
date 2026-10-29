@@ -4436,7 +4436,7 @@ dependencies = [
 
 [[package]]
 name = "tterm-app"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "objc2",
  "security-framework",
@@ -4452,7 +4452,7 @@ dependencies = [
 
 [[package]]
 name = "tterm-engine"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "flate2",

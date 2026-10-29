@@ -39,6 +39,10 @@ pub struct Settings {
     /// 0.3.0): it does not come again.
     #[serde(default)]
     pub welcome_seen: bool,
+    /// Open from tTerm Web and your phone (from 0.4.0, reach.rs): None
+    /// until the first run signed in decides it.
+    #[serde(default)]
+    pub open_from_web: Option<bool>,
 }
 
 fn default_theme() -> String {
@@ -71,6 +75,7 @@ impl Settings {
             project_color: default_color(),
             added_at: crate::terminals::now_ms(),
             welcome_seen: false,
+            open_from_web: None,
         }
     }
 

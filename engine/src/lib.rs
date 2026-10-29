@@ -22,7 +22,8 @@
 //! The engine also keeps a link to tTerm Web of its own (link.rs), through
 //! which tTerm Web opens terminals on this computer (hosted.rs), as
 //! tterm-agent did: the agent without a window (agent/) is this engine with
-//! that link, through the computer's proxy if it has one (proxy.rs).
+//! that link, through the computer's proxy if it has one (proxy.rs). From
+//! 0.4.0 the app runs that link itself, in the agent's place (reach.rs).
 
 #[cfg(feature = "cloud")]
 pub mod account;
@@ -42,6 +43,8 @@ pub mod names;
 pub mod notes;
 pub mod proxy;
 pub mod pty;
+#[cfg(feature = "cloud")]
+pub mod reach;
 pub mod search;
 pub mod settings;
 pub mod shell;
@@ -95,6 +98,9 @@ pub struct Engine {
     /// tTerm Web in the cloud, once someone signs in (from 0.3.0).
     #[cfg(feature = "cloud")]
     pub cloud: Option<Arc<account::Account>>,
+    /// This computer opened from tTerm Web through the app (from 0.4.0).
+    #[cfg(feature = "cloud")]
+    pub reach: reach::Reach,
 }
 
 /// What every request for notes says while they cannot be read.
@@ -116,6 +122,7 @@ impl Engine {
     pub fn with_cloud(data_dir: &Path, cloud: &str, host: Arc<dyn account::Host>, env_file: &Path) -> std::io::Result<Arc<Self>> {
         let mut engine = Self::made(data_dir)?;
         engine.cloud = Some(account::Account::new(upstream::Cloud::new(cloud), host, data_dir, env_file));
+        engine.reach = reach::Reach::new(env_file);
         Ok(Arc::new(engine))
     }
 
@@ -150,6 +157,8 @@ impl Engine {
             notes_trouble: Mutex::new(None),
             #[cfg(feature = "cloud")]
             cloud: None,
+            #[cfg(feature = "cloud")]
+            reach: reach::Reach::new(&pty::home_dir().join(".tterm-web").join("env")),
         })
     }
 
@@ -196,7 +205,11 @@ impl Engine {
             tokio::spawn(async move {
                 account.start(&me).await;
                 me.align_terminals();
+                me.reach.look_again();
             });
+            // This computer opened from tTerm Web, whenever it is to be
+            // (from 0.4.0).
+            tokio::spawn(reach::Reach::keep(self.clone()));
         }
     }
 

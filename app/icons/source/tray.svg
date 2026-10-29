@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="65 55 380 380" width="36" height="36">
+  <!-- The icon in the menu bar (from 0.4.0): the two signs of the logo
+       (icon.svg), black on nothing, which macOS colours as the bar needs (a
+       template image). ../tray.rgba is it at 36 by 36, 18 points on a
+       Retina screen, as the app takes it:
+         rsvg-convert -w 36 -h 36 tray.svg -o tray.png
+         python3 -c "from PIL import Image; open('../tray.rgba', 'wb').write(Image.open('tray.png').convert('RGBA').tobytes())" -->
+  <path d="M118 168 L206 256 L118 344" fill="none" stroke="#000" stroke-width="50" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M330 140 L330 316 C330 344 344 356 372 350" fill="none" stroke="#000" stroke-width="50" stroke-linecap="round"/>
+  <path d="M272 212 L392 212" fill="none" stroke="#000" stroke-width="50" stroke-linecap="round"/>
+</svg>

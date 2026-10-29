@@ -228,18 +228,45 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
 
 // -------------------------------------------------- ~/.tterm-web/env
 
-/// What `~/.tterm-web/env` says, read as the agent's installer reads it:
-/// the first line that starts with the name, as it is.
+/// What `~/.tterm-web/env` says, read as the agent reads it (from 0.4.0,
+/// where the app takes the agent's place): NAME=value lines, trimmed, blank
+/// lines and comments skipped, a later line over an earlier one. The
+/// installer writes one line of each.
 #[derive(Debug, Default, PartialEq)]
 pub struct AgentEnv {
     pub hub: Option<String>,
     pub key: Option<String>,
     pub name: Option<String>,
+    /// What the computer joined with; the app's own file has the key here
+    /// too (the link says it in its hello, reach.rs).
+    pub token: Option<String>,
+    /// The agent heard that its computer was removed from tTerm Web, forgot
+    /// the key and stopped for good (`TTERM_REMOVED=1`).
+    pub removed: bool,
     /// The lines as they are, for rewriting.
     lines: Vec<String>,
 }
 
+/// Where an agent connects whose file names no tTerm Web (tterm-agent's
+/// DEFAULT_HUB).
+pub const AGENT_HUB: &str = "wss://connect.tterm.net/agent";
+
+/// The name of a NAME=value line, as the agent takes it.
+fn env_name(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    line.split_once('=').map(|(name, _)| name.trim())
+}
+
 impl AgentEnv {
+    /// Where the agent with this file connects: its TTERM_HUB, or tTerm
+    /// Web's own when the file names none, as tterm-agent takes it.
+    pub fn hub_or_default(&self) -> String {
+        self.hub.clone().filter(|h| !h.is_empty()).unwrap_or_else(|| AGENT_HUB.to_string())
+    }
+
     pub fn read(path: &Path) -> std::io::Result<Option<AgentEnv>> {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -248,12 +275,15 @@ impl AgentEnv {
         };
         let mut env = AgentEnv { lines: text.lines().map(str::to_string).collect(), ..Default::default() };
         for line in text.lines() {
-            for (name, slot) in [("TTERM_HUB=", &mut env.hub), ("TTERM_KEY=", &mut env.key), ("TTERM_NAME=", &mut env.name)] {
-                if slot.is_none() {
-                    if let Some(value) = line.strip_prefix(name) {
-                        *slot = Some(value.to_string());
-                    }
-                }
+            let Some(name) = env_name(line) else { continue };
+            let value = line.split_once('=').map(|(_, v)| v.trim().to_string()).unwrap_or_default();
+            match name {
+                "TTERM_HUB" => env.hub = Some(value),
+                "TTERM_KEY" => env.key = Some(value),
+                "TTERM_NAME" => env.name = Some(value),
+                "TTERM_TOKEN" => env.token = Some(value),
+                "TTERM_REMOVED" => env.removed = value == "1",
+                _ => {}
             }
         }
         Ok(Some(env))
@@ -286,7 +316,9 @@ impl AgentEnv {
         let mut lines = vec![format!("TTERM_HUB={hub}"), format!("TTERM_TOKEN={key}"), format!("TTERM_KEY={key}")];
         if let Some(old) = old {
             for line in &old.lines {
-                let ours = ["TTERM_HUB=", "TTERM_TOKEN=", "TTERM_KEY="].iter().any(|n| line.starts_with(n));
+                // A computer removed in tTerm Web is in the file no more
+                // with a new key (the agent stops for that line).
+                let ours = env_name(line).map(|n| ["TTERM_HUB", "TTERM_TOKEN", "TTERM_KEY", "TTERM_REMOVED"].contains(&n)).unwrap_or(false);
                 if !ours && !line.trim().is_empty() {
                     lines.push(line.clone());
                 }
@@ -362,10 +394,29 @@ impl From<Trouble> for Hold {
     }
 }
 
+/// What tTerm said of this computer's key, in this run (reach.rs, from
+/// 0.4.0: the link runs only with a key tTerm took for this account).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Verdict {
+    /// One of this account's machines.
+    Ours,
+    /// No machine of this account's, in tTerm's words: another account's,
+    /// or more than the plan allows.
+    Refused(String),
+    /// tTerm could not say (it answered with an error): asked again later.
+    Failed(String),
+}
+
 #[derive(Default)]
 struct St {
     /// Signed in: what the keychain keeps.
     kept: Option<Kept>,
+    /// The key last shown to tTerm in this run, with the account's epoch,
+    /// and what tTerm said of it.
+    said: Option<(u64, String, Verdict)>,
+    /// The keychain could not be read at the start: whether the app is
+    /// signed in is not known.
+    keychain_failed: bool,
     session: Option<String>,
     details: Details,
     offline: bool,
@@ -400,6 +451,10 @@ pub struct Account {
     serial: AtomicU64,
     /// Whether tTerm answers: the sockets wait for it.
     pub online: watch::Sender<bool>,
+    /// tTerm said this computer's key stopped working (the computer was
+    /// removed in tTerm Web), and a new one was made: reach.rs turns the
+    /// link off for it (from 0.4.0).
+    retired: std::sync::atomic::AtomicBool,
     /// The key was looked up at the start.
     ready: watch::Sender<bool>,
     /// The engine, for what is done when tTerm answers again.
@@ -426,6 +481,7 @@ impl Account {
             link: Mutex::new(None),
             serial: AtomicU64::new(1),
             online: watch::channel(true).0,
+            retired: std::sync::atomic::AtomicBool::new(false),
             ready: watch::channel(false).0,
             engine: OnceLock::new(),
         })
@@ -470,14 +526,36 @@ impl Account {
             }
             Err(why) => {
                 eprintln!("tterm: the device's key could not be read from the keychain: {why}");
+                self.st.lock().unwrap().keychain_failed = true;
                 false
             }
         };
         drop(one);
         self.ready.send_replace(true);
+        self.tell_reach();
         if signed {
             self.catch_up(engine).await;
         }
+    }
+
+    /// The link of this computer looks again (reach.rs): what it waits for
+    /// changed.
+    fn tell_reach(&self) {
+        if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
+            engine.reach.look_again();
+        }
+    }
+
+    /// Whether the keychain was looked in: until then, whether the app is
+    /// signed in is not known.
+    pub fn ready(&self) -> bool {
+        *self.ready.borrow()
+    }
+
+    /// Whether it is known that the app is signed in or not: the keychain
+    /// read, or a sign-in since.
+    pub fn known(&self) -> bool {
+        self.ready() && (self.signed_in() || !self.st.lock().unwrap().keychain_failed)
     }
 
     /// Waits until the key was looked up, at most a minute.
@@ -781,10 +859,12 @@ impl Account {
             st.written = None;
             st.offline = false;
             st.asked_here = false;
+            st.keychain_failed = false;
             st.epoch
         };
         self.keep_details(epoch);
         self.online.send_replace(true);
+        self.tell_reach();
         Ok(())
     }
 
@@ -821,6 +901,7 @@ impl Account {
             if let Err(why) = tokio::task::spawn_blocking(move || host.delete_key()).await.unwrap_or_else(|e| Err(e.to_string())) {
                 eprintln!("tterm: the device's key could not be taken out of the keychain: {why}");
             }
+            self.tell_reach();
         }
     }
 
@@ -840,8 +921,80 @@ impl Account {
         let _one = self.asking_here.lock().await;
         let asked = self.st.lock().unwrap().asked_here;
         if !asked {
-            self.this_computer(engine).await;
+            self.this_computer(engine, false).await;
         }
+    }
+
+    /// Which machine this computer is, asked again (reach.rs, from 0.4.0):
+    /// the key in the agent's file is another now, or tTerm could not say,
+    /// or the person turned Open from tTerm Web on. `make_key`: one is made
+    /// if the file has none (the agent forgot it when its computer was
+    /// removed); a key that stopped working is replaced as always.
+    pub async fn ask_here_again(self: &Arc<Self>, engine: &Arc<crate::Engine>, make_key: bool) {
+        let _one = self.asking_here.lock().await;
+        self.st.lock().unwrap().asked_here = false;
+        self.this_computer(engine, make_key).await;
+    }
+
+    /// Which machine this computer is, unless tTerm said it of the key in
+    /// the file now (reach.rs): also when the account's own question at the
+    /// start found tTerm in trouble and gave up.
+    pub async fn ask_here_unless_said(self: &Arc<Self>, engine: &Arc<crate::Engine>) {
+        let _one = self.asking_here.lock().await;
+        let key = AgentEnv::read(&self.env_file).ok().flatten().and_then(|e| e.key).filter(|k| is_token(k));
+        if let Some(key) = key {
+            if matches!(self.verdict(&key), Some(Verdict::Ours | Verdict::Refused(_))) {
+                return;
+            }
+        }
+        self.st.lock().unwrap().asked_here = false;
+        self.this_computer(engine, false).await;
+    }
+
+    /// Whether tTerm said, since the last time this was asked, that this
+    /// computer's key had stopped working.
+    pub fn take_retired(&self) -> bool {
+        self.retired.swap(false, Ordering::SeqCst)
+    }
+
+    /// What tTerm said in this run of `key`, for this account: None if it
+    /// was not asked about it (or not since signing in).
+    pub fn verdict(&self, key: &str) -> Option<Verdict> {
+        let st = self.st.lock().unwrap();
+        st.kept.as_ref()?;
+        match &st.said {
+            Some((epoch, said, verdict)) if *epoch == st.epoch && said == key => Some(verdict.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether tTerm answered in this run which machine this computer is
+    /// (or why it is none); not while it is to be asked still, by the start
+    /// or when tTerm answers again.
+    pub fn asked_here(&self) -> bool {
+        self.st.lock().unwrap().asked_here
+    }
+
+    /// One more with each sign-in and sign-out.
+    pub fn epoch_now(&self) -> u64 {
+        self.epoch()
+    }
+
+    /// Where agents connect, as tTerm said at the sign-in.
+    pub fn hub(&self) -> Option<String> {
+        self.st.lock().unwrap().kept.as_ref().map(|k| k.hub.clone())
+    }
+
+    /// The agent's settings, with this computer's own key.
+    pub fn env_file(&self) -> &Path {
+        &self.env_file
+    }
+
+    /// Why this computer is no machine of the account's, if tTerm said so.
+    pub fn not_here(&self) -> Option<String> {
+        let st = self.st.lock().unwrap();
+        st.kept.as_ref()?;
+        st.details.not_here.clone()
     }
 
     /// Whether this computer's machine is to be asked for still.
@@ -1050,8 +1203,14 @@ impl Account {
     // ----------------------------------------------------- this computer
 
     /// Which of the person's machines this computer is: by its own key in
-    /// `~/.tterm-web/env`, written there if there is none.
-    pub async fn this_computer(self: &Arc<Self>, engine: &Arc<crate::Engine>) {
+    /// `~/.tterm-web/env`, written there if there is none (or, `make_key`,
+    /// if the file has no key). reach.rs hears what tTerm said.
+    pub async fn this_computer(self: &Arc<Self>, engine: &Arc<crate::Engine>, make_key: bool) {
+        self.ask_this_computer(engine, make_key).await;
+        self.tell_reach();
+    }
+
+    async fn ask_this_computer(self: &Arc<Self>, engine: &Arc<crate::Engine>, make_key: bool) {
         let Some(hub) = self.st.lock().unwrap().kept.as_ref().map(|k| k.hub.clone()) else { return };
         let epoch = self.epoch();
         // The system's name goes with it, once the passport is read (soon
@@ -1063,7 +1222,7 @@ impl Account {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         for attempt in 0..2 {
-            let (key, name) = match self.computer_key(&hub, attempt > 0) {
+            let (key, name) = match self.computer_key(&hub, attempt > 0, make_key) {
                 Ok(found) => found,
                 Err(why) => {
                     eprintln!("tterm: this computer is not shown to tTerm: {why}");
@@ -1090,15 +1249,27 @@ impl Account {
                         project_id: m["projectId"].as_str().unwrap_or("").to_string(),
                         code: m["code"].as_str().unwrap_or("").to_string(),
                     });
+                    self.set_said(epoch, &key, Verdict::Ours);
                     self.set_here(epoch, here, None);
                     return;
                 }
                 // A key of a removed computer, or a command's token: a new
                 // key, once.
-                410 if attempt == 0 => continue,
-                _ => {
-                    let why = answer.error().unwrap_or_else(|| format!("tTerm answered {}", answer.status));
+                410 if attempt == 0 => {
+                    self.retired.store(true, Ordering::SeqCst);
+                    continue;
+                }
+                status => {
+                    let said = answer.error();
+                    let why = said.clone().unwrap_or_else(|| format!("tTerm answered {status}."));
                     eprintln!("tterm: this computer is no machine of the account's: {why}");
+                    // Another account's computer (409), more than the plan
+                    // allows (403), an account without Personal (404), a key
+                    // tTerm cannot take (422), in tTerm's own words: so it
+                    // stays. Otherwise (tTerm in trouble, or a proxy's page
+                    // in its place) asked again later.
+                    let verdict = if matches!(status, 403 | 404 | 409 | 422) && said.is_some() { Verdict::Refused(why.clone()) } else { Verdict::Failed(why.clone()) };
+                    self.set_said(epoch, &key, verdict);
                     self.set_here(epoch, None, Some(why));
                     return;
                 }
@@ -1106,21 +1277,34 @@ impl Account {
         }
     }
 
+    fn set_said(&self, epoch: u64, key: &str, verdict: Verdict) {
+        let mut st = self.st.lock().unwrap();
+        if st.epoch != epoch || st.kept.is_none() {
+            return;
+        }
+        // tTerm could not say this time: what it said before of the same key
+        // stands.
+        let known = matches!(&st.said, Some((e, k, Verdict::Ours | Verdict::Refused(_))) if *e == epoch && k == key);
+        if matches!(verdict, Verdict::Failed(_)) && known {
+            return;
+        }
+        st.said = Some((epoch, key.to_string(), verdict));
+    }
+
     /// The computer's key: the agent's, when its file is for this tTerm;
     /// written there if there is no file, or `fresh` (tTerm refused the one
-    /// there). Err when the file is another tTerm Web's, or has no key.
-    fn computer_key(&self, hub: &str, fresh: bool) -> Result<(String, Option<String>), String> {
+    /// there), or it has none and `make` says to make one. Err when the file
+    /// is another tTerm Web's, or has no key.
+    fn computer_key(&self, hub: &str, fresh: bool, make: bool) -> Result<(String, Option<String>), String> {
         if !good_hub(hub) {
             return Err(format!("tTerm named its agents' address as {hub:?}, which does not go into the agent's file."));
         }
         let shown = self.env_file.display();
         let env = AgentEnv::read(&self.env_file).map_err(|e| format!("{shown} could not be read: {e}"))?;
         match env {
-            Some(env) if env.hub.as_deref() != Some(hub) => Err(format!("This computer's agent connects to another tTerm Web ({}).", env.hub.unwrap_or_default())),
-            Some(env) if !fresh => match env.key.clone().filter(|k| is_token(k)) {
-                Some(key) => Ok((key, env.name.clone())),
-                None => Err(format!("{shown} has no key tTerm can take: the agent's installer makes one.")),
-            },
+            Some(env) if env.hub_or_default() != hub => Err(format!("This computer's agent connects to another tTerm Web ({}).", env.hub_or_default())),
+            Some(env) if !fresh && env.key.as_deref().map(is_token).unwrap_or(false) => Ok((env.key.clone().unwrap_or_default(), env.name.clone())),
+            Some(_) if !fresh && !make => Err(format!("{shown} has no key tTerm can take: the agent's installer makes one.")),
             Some(env) => {
                 let key = AgentEnv::new_key();
                 AgentEnv::write(&self.env_file, hub, &key, Some(&env)).map_err(|e| format!("{shown} could not be written: {e}"))?;
@@ -1259,6 +1443,8 @@ impl Account {
             let mut st = self.st.lock().unwrap();
             st.epoch += 1;
             st.asked_here = false;
+            // Signed out now, for sure.
+            st.keychain_failed = false;
             st.kept.take().is_some()
         };
         self.drop_kept();
@@ -1271,6 +1457,7 @@ impl Account {
             }
         }
         self.online.send_replace(true);
+        self.tell_reach();
     }
 
     // ------------------------------------------------- notes to Personal
@@ -1557,14 +1744,28 @@ mod tests {
     }
 
     #[test]
-    fn the_agents_file_read_as_its_installer_reads_it() {
+    fn the_agents_file_read_as_the_agent_reads_it() {
         let dir = std::env::temp_dir().join(format!("tterm-env-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("env");
-        std::fs::write(&path, "# TTERM_KEY=comment\nTTERM_KEY= first \nTTERM_KEY=second\nTTERM_HUB=wss://h/agent\n").unwrap();
+        std::fs::write(&path, "# TTERM_KEY=comment\nTTERM_KEY= first \nTTERM_HUB=wss://h/agent\n  TTERM_KEY = second \nTTERM_HUB=wss://other/agent\n").unwrap();
         let env = AgentEnv::read(&path).unwrap().unwrap();
-        assert_eq!(env.key.as_deref(), Some(" first "), "the first line, as it is");
-        assert_eq!(env.hub.as_deref(), Some("wss://h/agent"));
+        assert_eq!(env.key.as_deref(), Some("second"), "the last line, trimmed");
+        assert_eq!(env.hub.as_deref(), Some("wss://other/agent"), "where the agent connects");
+        assert!(!env.removed);
+        // Written again: one line of each, the agent's later lines gone too.
+        AgentEnv::write(&path, "wss://h/agent", &"n".repeat(32), Some(&env)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, format!("TTERM_HUB=wss://h/agent\nTTERM_TOKEN={0}\nTTERM_KEY={0}\n# TTERM_KEY=comment\n", "n".repeat(32)));
+        // Removed in tTerm Web: the agent forgot the key and said so.
+        std::fs::write(&path, "TTERM_HUB=wss://h/agent\nTTERM_TOKEN=t\nTTERM_REMOVED=1\n").unwrap();
+        let env = AgentEnv::read(&path).unwrap().unwrap();
+        assert!(env.removed && env.key.is_none());
+        // No tTerm Web named, or an empty one: the agent's own default.
+        std::fs::write(&path, "TTERM_KEY=k\n").unwrap();
+        assert_eq!(AgentEnv::read(&path).unwrap().unwrap().hub_or_default(), AGENT_HUB);
+        std::fs::write(&path, "TTERM_HUB=\nTTERM_KEY=k\n").unwrap();
+        assert_eq!(AgentEnv::read(&path).unwrap().unwrap().hub_or_default(), AGENT_HUB);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -2,7 +2,8 @@
 //! on this computer. It answers as tTerm Web 0.1.6 does where the engine
 //! needs it: the app's sign-in (`/api/auth/app/*`), which computer this is
 //! (`/api/computers/this`), the state, notes, Sign out, and the page's
-//! socket with a terminal of its own. The checks act as the browser where
+//! socket with a terminal of its own; from 0.4.0 the agents' hub too, where
+//! the app's link connects (reach.rs). The checks act as the browser where
 //! the person would: they allow the app, and bring the code back to the
 //! engine's port on 127.0.0.1.
 //!
@@ -40,6 +41,8 @@ struct FakeHost {
     /// the password: to keep a key, and to answer with the one it had.
     save_ms: AtomicU64,
     load_ms: AtomicU64,
+    /// The keychain cannot be read, as when it stays locked.
+    load_fails: std::sync::atomic::AtomicBool,
 }
 
 impl Host for FakeHost {
@@ -50,6 +53,9 @@ impl Host for FakeHost {
     fn load_key(&self) -> Result<Option<String>, String> {
         let had = self.key.lock().unwrap().clone();
         std::thread::sleep(Duration::from_millis(self.load_ms.load(Ordering::SeqCst)));
+        if self.load_fails.load(Ordering::SeqCst) {
+            return Err("The keychain is locked.".into());
+        }
         Ok(had)
     }
     fn save_key(&self, key: &str) -> Result<(), String> {
@@ -95,6 +101,25 @@ struct Fake {
     refuse_saves: usize,
     /// The photo, as it came: its type and its bytes (from 0.3.1).
     photo: Option<(String, Vec<u8>)>,
+    /// The agents' hub (from 0.4.0): the hellos it heard, what it is to
+    /// send to the computer, what the computer said and its terminals
+    /// printed, and the links up now.
+    hellos: Vec<Value>,
+    to_agent: Vec<Value>,
+    from_agent: Vec<Value>,
+    printed: HashMap<u32, Vec<u8>>,
+    links: usize,
+    /// So many hellos are refused, as when the key is in use elsewhere.
+    refuse_hellos: usize,
+    /// The connected computer is removed now: told so, its key retired.
+    remove_now: bool,
+    /// Keys of another account's computers: no machine of this account's
+    /// (409, as machines.this_computer says), and welcome at the hub, as
+    /// that account's "work-mac".
+    foreign: Vec<String>,
+    /// The next request to a path is answered so, and with `{}`, once: tTerm
+    /// in trouble, or a proxy's page in its place.
+    fail_once: HashMap<String, u16>,
 }
 
 impl Fake {
@@ -172,6 +197,24 @@ impl Cloud {
     fn count(&self, method: &str, path: &str) -> usize {
         self.st.lock().unwrap().requests.iter().filter(|(m, p, _)| m == method && p == path).count()
     }
+
+    /// Something for the computer connected to the hub (from 0.4.0).
+    fn to_agent(&self, msg: Value) {
+        self.st.lock().unwrap().to_agent.push(msg);
+    }
+
+    /// What terminal `ch` on the computer printed, as text.
+    fn printed(&self, ch: u32) -> String {
+        String::from_utf8_lossy(self.st.lock().unwrap().printed.get(&ch).map(Vec::as_slice).unwrap_or(&[])).to_string()
+    }
+
+    fn heard(&self, t: &str) -> bool {
+        self.st.lock().unwrap().from_agent.iter().any(|m| m["t"] == t)
+    }
+
+    fn links(&self) -> usize {
+        self.st.lock().unwrap().links
+    }
 }
 
 fn token() -> String {
@@ -219,6 +262,9 @@ async fn serve(mut stream: TcpStream, st: Arc<Mutex<Fake>>, base: String, drops:
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
     if head.to_ascii_lowercase().contains("upgrade: websocket") {
+        if head.starts_with("GET /agent ") {
+            return hub(stream, st, gone).await;
+        }
         return socket(stream, st, gone).await;
     }
     loop {
@@ -294,6 +340,9 @@ async fn read_request(stream: &mut TcpStream) -> Option<(String, String, HashMap
 fn answer(st: &Arc<Mutex<Fake>>, base: &str, method: &str, path: &str, headers: &HashMap<String, String>, body: &[u8]) -> (u16, Value) {
     let mut st = st.lock().unwrap();
     st.requests.push((method.to_string(), path.to_string(), headers.clone()));
+    if let Some(status) = st.fail_once.remove(path) {
+        return (status, json!({}));
+    }
     if method == "GET" && path.starts_with("/api/search?") {
         // tTerm's own finds: a command on its server, and a note.
         return (200, json!({"words": ["deploy"], "output": [], "recent": [], "more": {"notes": true},
@@ -357,6 +406,9 @@ fn answer(st: &Arc<Mutex<Fake>>, base: &str, method: &str, path: &str, headers: 
             let key = text("key");
             if st.removed.contains(&key) {
                 return (410, json!({"error": "This computer's key stopped working when it was removed from tTerm Web: tTerm makes it a new one."}));
+            }
+            if st.foreign.contains(&key) {
+                return (409, json!({"error": "This computer is in tTerm Web under another account."}));
             }
             if let Some(m) = st.machines.iter().find(|m| m["key"] == key.as_str()) {
                 return (200, json!({"machine": {"id": m["id"], "name": m["name"], "projectId": "p1", "code": "P"}, "created": false}));
@@ -477,6 +529,109 @@ async fn socket(stream: TcpStream, st: Arc<Mutex<Fake>>, mut gone: tokio::sync::
                 }
             }
             Message::Close(_) => return,
+            _ => {}
+        }
+    }
+}
+
+/// What tTerm Web says to a computer it removed (agents.REMOVED).
+const REMOVED: &str = "This computer was removed from tTerm Web. To connect it again: Add a machine, then Computer.";
+
+/// The agents' hub, as tterm/core/agents.py speaks it, for the app's link
+/// (from 0.4.0): a computer it knows by its key is welcome; it answers the
+/// signs of life, sends what the checks put in `to_agent`, keeps what its
+/// terminals print, and removes the computer when told to.
+async fn hub(stream: TcpStream, st: Arc<Mutex<Fake>>, mut gone: tokio::sync::watch::Receiver<u64>) {
+    let Ok(ws) = tokio_tungstenite::accept_async(stream).await else { return };
+    let (mut sink, mut source) = ws.split();
+    let hello = match tokio::time::timeout(Duration::from_secs(5), source.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str::<Value>(text.as_str()).unwrap_or(Value::Null),
+        _ => return,
+    };
+    let key = hello["key"].as_str().unwrap_or("").to_string();
+    let answer = {
+        let mut f = st.lock().unwrap();
+        f.hellos.push(hello.clone());
+        if f.refuse_hellos > 0 {
+            f.refuse_hellos -= 1;
+            json!({"t": "error", "error": "This computer is already connected to tTerm Web: its key is in use by another agent. Stop that one first.", "revoked": false})
+        } else if f.removed.contains(&key) {
+            json!({"t": "error", "error": REMOVED, "revoked": true, "forget": true})
+        } else if f.foreign.contains(&key) {
+            f.links += 1;
+            json!({"t": "welcome", "name": "work-mac"})
+        } else if let Some(m) = f.machines.iter_mut().find(|m| m["key"] == key.as_str()) {
+            m["online"] = json!(true);
+            let name = m["name"].clone();
+            f.links += 1;
+            json!({"t": "welcome", "name": name})
+        } else {
+            json!({"t": "error", "error": "This computer is not in tTerm Web, or it was removed.", "revoked": true})
+        }
+    };
+    let welcome = answer["t"] == "welcome";
+    let _ = sink.send(Message::Text(answer.to_string().into())).await;
+    if !welcome {
+        let _ = sink.close().await;
+        return;
+    }
+    let gone_now = |st: &Arc<Mutex<Fake>>| {
+        let mut f = st.lock().unwrap();
+        f.links = f.links.saturating_sub(1);
+        if let Some(m) = f.machines.iter_mut().find(|m| m["key"] == key.as_str()) {
+            m["online"] = json!(false);
+        }
+    };
+    loop {
+        let (out, remove) = {
+            let mut f = st.lock().unwrap();
+            (std::mem::take(&mut f.to_agent), std::mem::take(&mut f.remove_now))
+        };
+        for m in out {
+            let message = match m.get("keys").and_then(Value::as_str) {
+                // Keys for a terminal: 2, the channel, the bytes.
+                Some(keys) => {
+                    let mut b = vec![2u8];
+                    b.extend_from_slice(&(m["ch"].as_u64().unwrap_or(0) as u32).to_be_bytes());
+                    b.extend_from_slice(keys.as_bytes());
+                    Message::Binary(b.into())
+                }
+                None => Message::Text(m.to_string().into()),
+            };
+            let _ = sink.send(message).await;
+        }
+        if remove {
+            st.lock().unwrap().removed.push(key.clone());
+            gone_now(&st);
+            let _ = sink.send(Message::Text(json!({"t": "error", "error": REMOVED, "revoked": true, "forget": true}).to_string().into())).await;
+            let _ = sink.close().await;
+            return;
+        }
+        let message = tokio::select! {
+            m = source.next() => m,
+            _ = tokio::time::sleep(Duration::from_millis(20)) => continue,
+            _ = gone.changed() => {
+                gone_now(&st);
+                return;
+            }
+        };
+        match message {
+            Some(Ok(Message::Text(text))) => {
+                let msg: Value = serde_json::from_str(text.as_str()).unwrap_or(Value::Null);
+                if msg["t"] == "hb" {
+                    let _ = sink.send(Message::Text(json!({"t": "hb"}).to_string().into())).await;
+                } else {
+                    st.lock().unwrap().from_agent.push(msg);
+                }
+            }
+            Some(Ok(Message::Binary(b))) if b.len() >= 5 && b[0] == 1 => {
+                let ch = u32::from_be_bytes([b[1], b[2], b[3], b[4]]);
+                st.lock().unwrap().printed.entry(ch).or_default().extend_from_slice(&b[5..]);
+            }
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                gone_now(&st);
+                return;
+            }
             _ => {}
         }
     }
@@ -1462,4 +1617,578 @@ async fn a_slow_tterm_does_not_hold_back_this_computers_search() {
     let commands: Vec<&str> = found["commands"].as_array().unwrap().iter().map(|b| b["command"].as_str().unwrap()).collect();
     assert_eq!(commands, ["deploy web"], "this computer's, without waiting for tTerm");
     assert!(!a.engine.cloud.as_ref().unwrap().offline(), "a slow search is no lost connection");
+}
+
+// ------------------------------------- this computer from tTerm Web (0.4.0)
+
+/// The link's pauses, short: as the checks of link.rs have them.
+fn fast() -> tterm_engine::link::Timing {
+    tterm_engine::link::Timing {
+        heartbeat: Duration::from_millis(200),
+        silence_limit: Duration::from_secs(5),
+        ping_every: Duration::from_millis(300),
+        ping_timeout: Duration::from_secs(5),
+        alive_every: Duration::from_secs(600),
+        sleep_jump: Duration::from_secs(15),
+        backoff_start: Duration::from_millis(50),
+        backoff_max: Duration::from_millis(400),
+        healthy_for: Duration::from_millis(600),
+        no_network_pause: Duration::from_millis(100),
+        claim_wait: Duration::from_secs(1),
+        keep_for: Duration::from_secs(3),
+        ended_keep: Duration::from_secs(1),
+        sweep_every: Duration::from_millis(100),
+        open_timeout: Duration::from_secs(3),
+        welcome_timeout: Duration::from_secs(3),
+        close_timeout: Duration::from_secs(3),
+    }
+}
+
+async fn reach(e: &Arc<Engine>) -> Value {
+    let (status, r) = request(e, "GET", "/api/app/this-computer", Value::Null).await;
+    assert_eq!(status, 200, "{r}");
+    r
+}
+
+/// This computer in Settings, once it says `want`.
+async fn until_reach(e: &Arc<Engine>, want: &str) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..400 {
+        last = reach(e).await;
+        if last["status"] == want {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("never {want}: {last}");
+}
+
+async fn open_from_web(e: &Arc<Engine>, open: bool) -> (u16, Value) {
+    request(e, "PUT", "/api/app/this-computer", json!({"open": open})).await
+}
+
+fn env_key(a: &App) -> String {
+    let env = std::fs::read_to_string(&a.env).expect("the agent's file");
+    env.lines().find_map(|l| l.strip_prefix("TTERM_KEY=")).expect("a key").to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn this_mac_opens_from_tterm_web_through_the_app() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    // Signed out: nothing to open, and nothing to turn on.
+    assert_eq!(until_reach(&a.engine, "signed-out").await["open"], false);
+    let (status, _) = open_from_web(&a.engine, true).await;
+    assert_eq!(status, 409);
+    sign_in(&cloud, &a).await;
+    // No agent was set up here: off until the person turns it on.
+    let r = until_reach(&a.engine, "off").await;
+    assert_eq!((r["open"].clone(), r["background"].clone()), (json!(false), json!(false)));
+    assert!(cloud.st.lock().unwrap().hellos.is_empty());
+    let (status, r) = open_from_web(&a.engine, true).await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["open"], true);
+    // The answer says what the link does, not what it did before.
+    assert!(r["status"] == "connecting" || r["status"] == "online", "{r}");
+    let r = until_reach(&a.engine, "online").await;
+    let machine = cloud.st.lock().unwrap().machines[0].clone();
+    assert_eq!(r["name"], machine["name"]);
+    assert_eq!(r["background"], true, "the app stays in the menu bar for it");
+    assert_eq!(machine["online"], true);
+    // Its hello: this computer's own key, from ~/.tterm-web/env as the
+    // agent's, and the app's version for tTerm Web to show.
+    let hello = cloud.st.lock().unwrap().hellos[0].clone();
+    let key = env_key(&a);
+    assert_eq!((hello["key"].as_str(), hello["token"].as_str()), (Some(key.as_str()), Some(key.as_str())));
+    assert_eq!(hello["agent"], format!("app {}", tterm_engine::VERSION));
+    assert_eq!(hello["web"], 2);
+    // tTerm Web opens a terminal on this computer: its shell runs here, in
+    // the app; tTerm Web's installer would know it from the agent's folder.
+    let agent_dir = a.env.parent().unwrap().display().to_string();
+    cloud.to_agent(json!({"t": "open", "ch": 1, "cmd": "echo answer:$((6*7)) dir:$TTERM_AGENT_DIR; sleep 60", "cols": 80, "rows": 24}));
+    assert!(until(10, || cloud.printed(1).contains("answer:42")).await, "{}", cloud.printed(1));
+    assert!(cloud.printed(1).contains(&format!("dir:{agent_dir}")), "{}", cloud.printed(1));
+    assert_eq!(reach(&a.engine).await["terminals"], 1);
+    // Off: tTerm Web hears that its terminals end, and this computer goes
+    // offline there.
+    let (status, r) = open_from_web(&a.engine, false).await;
+    assert_eq!((status, r["open"].clone(), r["status"].clone()), (200, json!(false), json!("off")), "{r}");
+    assert!(until(10, || cloud.heard("bye")).await, "the goodbye");
+    assert!(until(10, || cloud.links() == 0).await);
+    assert_eq!(reach(&a.engine).await["terminals"], 0);
+    assert_eq!(cloud.st.lock().unwrap().machines[0]["online"], false);
+    // Kept: off after a new start too, and on again after the one after.
+    let b = app_in(&cloud, a.dir.clone(), a.env.clone(), a.host.clone()).await;
+    b.engine.reach.set_timing(fast());
+    let r = until_reach(&b.engine, "off").await;
+    assert_eq!(r["open"], false);
+    open_from_web(&b.engine, true).await;
+    until_reach(&b.engine, "online").await;
+    assert_eq!(cloud.st.lock().unwrap().machines.len(), 1, "the same computer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn where_the_agent_was_set_up_the_app_takes_its_place() {
+    let cloud = Cloud::start().await;
+    let dir = common::data_dir();
+    let env = dir.join("home").join(".tterm-web").join("env");
+    let agent_dir = env.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(agent_dir.join("tterm-agent"), "#!/bin/sh\n").unwrap();
+    // The agent, running without an autostart, by its pid.
+    let mut agent = std::process::Command::new("sh").args(["-c", &format!("sleep 60; : {}/tterm-agent", agent_dir.display())]).spawn().unwrap();
+    std::fs::write(agent_dir.join("agent.pid"), agent.id().to_string()).unwrap();
+    let a = app_in(&cloud, dir, env.clone(), Arc::new(FakeHost::default())).await;
+    a.engine.reach.set_timing(fast());
+    a.engine.reach.set_background(true);
+    sign_in(&cloud, &a).await;
+    // The person said yes to the agent: the app keeps this computer open,
+    // and the agent stops for good, once tTerm took the key.
+    let r = until_reach(&a.engine, "online").await;
+    assert_eq!(r["open"], true);
+    let key = env_key(&a);
+    assert!(cloud.st.lock().unwrap().computers_this.iter().any(|c| c["key"] == key.as_str()));
+    assert!(until(5, || agent.try_wait().unwrap().is_some()).await, "the agent stopped");
+    assert!(!agent_dir.join("agent.pid").exists());
+    assert!(agent_dir.join("tterm-agent").exists() && env.exists(), "its files stay, with the key");
+    let settings: Value = serde_json::from_slice(&std::fs::read(a.dir.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(settings["openFromWeb"], true, "decided once");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_in_tterm_web_it_goes_off_and_on_again_comes_back() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    open_from_web(&a.engine, true).await;
+    until_reach(&a.engine, "online").await;
+    let first = env_key(&a);
+    // Removed in tTerm Web: the link hears it, and the switch goes off at
+    // once, not at the keeper's next look.
+    cloud.st.lock().unwrap().remove_now = true;
+    let told = std::time::Instant::now();
+    let r = until_reach(&a.engine, "removed").await;
+    assert!(told.elapsed() < Duration::from_millis(2500), "{:?}", told.elapsed());
+    assert_eq!((r["open"].clone(), r["background"].clone()), (json!(false), json!(false)));
+    assert!(r["problem"].as_str().unwrap().contains("removed"), "{r}");
+    assert_eq!(a.engine.reach.kept_now(), Some(false), "the app is not kept for it");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(cloud.st.lock().unwrap().hellos.len(), 1, "not knocking again");
+    // On again: tTerm gives this computer a new key, and it is a new machine.
+    open_from_web(&a.engine, true).await;
+    let r = until_reach(&a.engine, "online").await;
+    assert_eq!(r["open"], true);
+    let second = env_key(&a);
+    assert_ne!(first, second);
+    let st = cloud.st.lock().unwrap();
+    assert_eq!(st.hellos.last().unwrap()["key"], second.as_str());
+    assert_eq!(st.machines.len(), 2);
+    assert!(st.computers_this.iter().any(|c| c["key"] == second.as_str()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_while_the_app_was_not_running_it_is_off() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    open_from_web(&a.engine, true).await;
+    until_reach(&a.engine, "online").await;
+    a.engine.reach.stop().await;
+    // Removed in tTerm Web meanwhile, the app not running.
+    let key = env_key(&a);
+    cloud.st.lock().unwrap().removed.push(key.clone());
+    let b = app_in(&cloud, a.dir.clone(), a.env.clone(), a.host.clone()).await;
+    b.engine.reach.set_timing(fast());
+    let r = until_reach(&b.engine, "removed").await;
+    assert_eq!(r["open"], false);
+    assert_ne!(env_key(&a), key, "tTerm gave it a new key at the start");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_link_waits_for_its_key_and_says_why() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    // In use by another agent: refused, tried again, said in Settings.
+    cloud.st.lock().unwrap().refuse_hellos = 1000;
+    open_from_web(&a.engine, true).await;
+    let mut said = Value::Null;
+    for _ in 0..200 {
+        said = reach(&a.engine).await;
+        if said["problem"].as_str().map(|p| p.contains("already connected")).unwrap_or(false) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(said["status"], "connecting", "{said}");
+    assert!(said["problem"].as_str().unwrap_or("").contains("Stop that one first"), "{said}");
+    cloud.st.lock().unwrap().refuse_hellos = 0;
+    let r = until_reach(&a.engine, "online").await;
+    assert_eq!(r["problem"], Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_out_this_mac_is_offline_in_tterm_web() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    open_from_web(&a.engine, true).await;
+    until_reach(&a.engine, "online").await;
+    cloud.to_agent(json!({"t": "open", "ch": 3, "cmd": "echo up; sleep 60", "cols": 80, "rows": 24}));
+    assert!(until(10, || cloud.printed(3).contains("up")).await);
+    assert_eq!(a.engine.reach.kept_now(), Some(true));
+    let (status, _) = request(&a.engine, "POST", "/api/auth/signout", json!({})).await;
+    assert_eq!(status, 200);
+    until_reach(&a.engine, "signed-out").await;
+    assert!(until(10, || cloud.links() == 0).await);
+    assert_eq!(reach(&a.engine).await["terminals"], 0);
+    assert_eq!(a.engine.reach.kept_now(), Some(false), "signed out, the app does not start at login for it");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quitting_says_goodbye_to_tterm_web() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    open_from_web(&a.engine, true).await;
+    until_reach(&a.engine, "online").await;
+    cloud.to_agent(json!({"t": "open", "ch": 2, "cmd": "echo up; sleep 60", "cols": 80, "rows": 24}));
+    assert!(until(10, || cloud.printed(2).contains("up")).await);
+    let started = std::time::Instant::now();
+    a.engine.reach.stop().await;
+    assert!(started.elapsed() < Duration::from_secs(7), "{:?}", started.elapsed());
+    assert!(cloud.heard("bye"));
+    assert!(until(5, || cloud.links() == 0).await);
+    assert_eq!(reach(&a.engine).await["status"], "off");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(cloud.st.lock().unwrap().hellos.len(), 1, "not again after the quit");
+    // A quit is no switch: the app starts at the next login all the same.
+    assert_eq!(a.engine.reach.kept_now(), Some(true));
+    let settings: Value = serde_json::from_slice(&std::fs::read(a.dir.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(settings["openFromWeb"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_tterm_webs_agent_is_left_alone() {
+    let cloud = Cloud::start().await;
+    let dir = common::data_dir();
+    let env = dir.join("home").join(".tterm-web").join("env");
+    let agent_dir = env.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(&env, format!("TTERM_HUB=wss://connect-dev.example/agent\nTTERM_TOKEN=tok\nTTERM_KEY={}\n", account::random_token(24))).unwrap();
+    std::fs::write(agent_dir.join("tterm-agent"), "#!/bin/sh\n").unwrap();
+    let mut agent = std::process::Command::new("sh").args(["-c", &format!("sleep 60; : {}/tterm-agent", agent_dir.display())]).spawn().unwrap();
+    std::fs::write(agent_dir.join("agent.pid"), agent.id().to_string()).unwrap();
+    let a = app_in(&cloud, dir, env.clone(), Arc::new(FakeHost::default())).await;
+    a.engine.reach.set_timing(fast());
+    a.engine.reach.set_background(true);
+    sign_in(&cloud, &a).await;
+    // Not an agent the app can take: off, and nothing kept for it.
+    let r = until_reach(&a.engine, "off").await;
+    assert_eq!((r["open"].clone(), r["background"].clone()), (json!(false), json!(false)));
+    assert!(until(5, || a.engine.reach.kept_now() == Some(false)).await);
+    // On: the file says no, and why.
+    let (status, r) = open_from_web(&a.engine, true).await;
+    assert_eq!(status, 409, "{r}");
+    assert!(r["error"].as_str().unwrap().contains("another tTerm Web"), "{r}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(agent.try_wait().unwrap().is_none(), "that agent runs on");
+    assert!(agent_dir.join("agent.pid").exists());
+    assert!(cloud.st.lock().unwrap().hellos.is_empty());
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+/// The agent of another account's computer, as tTerm Web's installer of
+/// that account sets it up: its key in the file, and it running.
+fn their_agent(cloud: &Cloud, env: &std::path::Path) -> (String, std::process::Child) {
+    let theirs = account::random_token(32);
+    cloud.st.lock().unwrap().foreign.push(theirs.clone());
+    let dir = env.parent().unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(env, format!("TTERM_HUB={}\nTTERM_TOKEN=tok\nTTERM_KEY={theirs}\n", cloud.hub())).unwrap();
+    std::fs::write(dir.join("tterm-agent"), "#!/bin/sh\n").unwrap();
+    let agent = std::process::Command::new("sh").args(["-c", &format!("sleep 60; : {}/tterm-agent", dir.display())]).spawn().unwrap();
+    std::fs::write(dir.join("agent.pid"), agent.id().to_string()).unwrap();
+    (theirs, agent)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_accounts_key_in_the_file_is_not_taken() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    open_from_web(&a.engine, true).await;
+    until_reach(&a.engine, "online").await;
+    a.engine.reach.stop().await;
+    // Meanwhile this computer was set up for another account.
+    let (theirs, mut agent) = their_agent(&cloud, &a.env);
+    let b = app_in(&cloud, a.dir.clone(), a.env.clone(), a.host.clone()).await;
+    b.engine.reach.set_timing(fast());
+    b.engine.reach.set_background(true);
+    // tTerm says the key is no machine of this account's: off, and why;
+    // never connected with it, their agent left alone.
+    let r = until_reach(&b.engine, "closed").await;
+    assert!(r["problem"].as_str().unwrap().contains("another account"), "{r}");
+    assert_eq!(r["open"], false);
+    assert!(until(5, || b.engine.reach.kept_now() == Some(false)).await);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!cloud.st.lock().unwrap().hellos.iter().any(|h| h["key"] == theirs.as_str()), "not connected as their computer");
+    assert!(agent.try_wait().unwrap().is_none(), "their agent runs on");
+    assert!(a.env.parent().unwrap().join("agent.pid").exists());
+    // On again: tTerm says no again.
+    let (status, r) = open_from_web(&b.engine, true).await;
+    assert_eq!(status, 409, "{r}");
+    assert!(r["error"].as_str().unwrap().contains("another account"), "{r}");
+    assert!(!cloud.st.lock().unwrap().hellos.iter().any(|h| h["key"] == theirs.as_str()));
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_key_in_the_file_is_asked_about_first() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    open_from_web(&a.engine, true).await;
+    until_reach(&a.engine, "online").await;
+    // While the link runs, another account's installer takes the file.
+    let (theirs, mut agent) = their_agent(&cloud, &a.env);
+    let r = until_reach(&a.engine, "closed").await;
+    assert!(r["problem"].as_str().unwrap().contains("another account"), "{r}");
+    assert!(until(5, || cloud.links() == 0).await, "this account's link ended too");
+    assert!(cloud.st.lock().unwrap().computers_this.iter().any(|c| c["key"] == theirs.as_str()), "tTerm was asked");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!cloud.st.lock().unwrap().hellos.iter().any(|h| h["key"] == theirs.as_str()));
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_agents_file_written_again_changes_nothing() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    open_from_web(&a.engine, true).await;
+    until_reach(&a.engine, "online").await;
+    // Written again in place, by hand or by a tool: empty for a moment,
+    // then half, then whole.
+    let text = std::fs::read_to_string(&a.env).unwrap();
+    for part in ["", &text[..10], &text] {
+        std::fs::write(&a.env, part).unwrap();
+        a.engine.reach.look_again();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let r = reach(&a.engine).await;
+    assert_eq!((r["open"].clone(), r["status"].clone()), (json!(true), json!("online")), "{r}");
+    assert_eq!(cloud.st.lock().unwrap().hellos.len(), 1, "the same link all along");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_refused_once_at_the_start_does_not_keep_it_down() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    open_from_web(&a.engine, true).await;
+    until_reach(&a.engine, "online").await;
+    a.engine.reach.stop().await;
+    // The next start: tTerm's database hiccups once, at the session.
+    cloud.end_sessions();
+    cloud.st.lock().unwrap().fail_once.insert("/api/auth/app/session".into(), 500);
+    let b = app_in(&cloud, a.dir.clone(), a.env.clone(), a.host.clone()).await;
+    b.engine.reach.set_timing(fast());
+    until_reach(&b.engine, "online").await;
+    assert!(cloud.st.lock().unwrap().fail_once.is_empty(), "the hiccup happened");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proxys_page_is_no_refusal() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    open_from_web(&a.engine, true).await;
+    until_reach(&a.engine, "online").await;
+    a.engine.reach.stop().await;
+    // The next start: a proxy answers for tTerm once, 403 without tTerm's
+    // words. Asked again, tTerm says yes.
+    cloud.st.lock().unwrap().fail_once.insert("/api/computers/this".into(), 403);
+    let b = app_in(&cloud, a.dir.clone(), a.env.clone(), a.host.clone()).await;
+    b.engine.reach.set_timing(fast());
+    let r = until_reach(&b.engine, "online").await;
+    assert_eq!(r["open"], true);
+    assert!(cloud.st.lock().unwrap().fail_once.is_empty(), "the proxy answered");
+    assert_eq!(b.engine.reach.kept_now(), Some(true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tterm_in_trouble_does_not_stop_a_link_that_runs() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    open_from_web(&a.engine, true).await;
+    until_reach(&a.engine, "online").await;
+    // On again from a page that did not see it on: tTerm cannot say now.
+    cloud.st.lock().unwrap().fail_once.insert("/api/computers/this".into(), 500);
+    let (status, r) = open_from_web(&a.engine, true).await;
+    assert_eq!(status, 200, "{r}");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let r = reach(&a.engine).await;
+    assert_eq!(r["status"], "online", "{r}");
+    assert_eq!(cloud.st.lock().unwrap().hellos.len(), 1, "the same link all along");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_set_up_again_gives_way_again() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    a.engine.reach.set_background(true);
+    sign_in(&cloud, &a).await;
+    open_from_web(&a.engine, true).await;
+    until_reach(&a.engine, "online").await;
+    // tTerm Web's installer run again meanwhile: the agent runs again,
+    // with the same key.
+    let dir = a.env.parent().unwrap().to_path_buf();
+    std::fs::write(dir.join("tterm-agent"), "#!/bin/sh\n").unwrap();
+    let mut agent = std::process::Command::new("sh").args(["-c", &format!("sleep 60; : {}/tterm-agent", dir.display())]).spawn().unwrap();
+    std::fs::write(dir.join("agent.pid"), agent.id().to_string()).unwrap();
+    assert!(until(10, || agent.try_wait().unwrap().is_some()).await, "the agent gave way");
+    assert!(!dir.join("agent.pid").exists());
+    assert_eq!(reach(&a.engine).await["status"], "online");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_and_off_at_once_end_off() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    until_reach(&a.engine, "off").await;
+    cloud.st.lock().unwrap().slow.insert("/api/computers/this".into(), 1500);
+    let e = a.engine.clone();
+    let on = tokio::spawn(async move { open_from_web(&e, true).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Off while on still waits for tTerm: the last word stays.
+    let (status, r) = open_from_web(&a.engine, false).await;
+    assert_eq!((status, r["open"].clone(), r["status"].clone()), (200, json!(false), json!("off")), "{r}");
+    assert_eq!(on.await.unwrap().0, 200);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let r = reach(&a.engine).await;
+    assert_eq!((r["open"].clone(), r["status"].clone()), (json!(false), json!("off")), "{r}");
+    assert!(until(5, || cloud.links() == 0).await);
+    let settings: Value = serde_json::from_slice(&std::fs::read(a.dir.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(settings["openFromWeb"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_out_while_turning_on_leaves_it_as_it_was() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    until_reach(&a.engine, "off").await;
+    cloud.st.lock().unwrap().slow.insert("/api/computers/this".into(), 1500);
+    let e = a.engine.clone();
+    let on = tokio::spawn(async move { open_from_web(&e, true).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (status, _) = request(&a.engine, "POST", "/api/auth/signout", json!({})).await;
+    assert_eq!(status, 200);
+    let (status, r) = on.await.unwrap();
+    assert_eq!(status, 409, "{r}");
+    until_reach(&a.engine, "signed-out").await;
+    let settings: Value = serde_json::from_slice(&std::fs::read(a.dir.join("settings.json")).unwrap()).unwrap();
+    assert_ne!(settings["openFromWeb"], true, "{settings}");
+    assert!(cloud.st.lock().unwrap().hellos.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_removed_agents_computer_is_off_and_on_gets_a_new_key() {
+    let cloud = Cloud::start().await;
+    let dir = common::data_dir();
+    let env = dir.join("home").join(".tterm-web").join("env");
+    let agent_dir = env.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    // The agent heard its computer was removed: it forgot the key, said so,
+    // and stopped.
+    std::fs::write(&env, format!("TTERM_HUB={}\nTTERM_TOKEN=tok\nTTERM_NAME=lab\nTTERM_REMOVED=1\n", cloud.hub())).unwrap();
+    std::fs::write(agent_dir.join("tterm-agent"), "#!/bin/sh\n").unwrap();
+    let a = app_in(&cloud, dir, env.clone(), Arc::new(FakeHost::default())).await;
+    a.engine.reach.set_timing(fast());
+    a.engine.reach.set_background(true);
+    sign_in(&cloud, &a).await;
+    let r = until_reach(&a.engine, "off").await;
+    assert_eq!(r["open"], false);
+    assert!(until(5, || a.engine.reach.kept_now() == Some(false)).await);
+    assert!(cloud.st.lock().unwrap().hellos.is_empty());
+    // On: a new key, a new machine, open.
+    let (status, r) = open_from_web(&a.engine, true).await;
+    assert_eq!(status, 200, "{r}");
+    until_reach(&a.engine, "online").await;
+    let text = std::fs::read_to_string(&env).unwrap();
+    assert!(!text.contains("TTERM_REMOVED") && text.contains("TTERM_NAME=lab"), "{text}");
+    let key = env_key(&a);
+    assert_eq!(cloud.st.lock().unwrap().hellos.last().unwrap()["key"], key.as_str());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_agents_file_gone_turns_it_off() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    open_from_web(&a.engine, true).await;
+    until_reach(&a.engine, "online").await;
+    // tTerm Web's uninstaller, while the app runs.
+    std::fs::remove_file(&a.env).unwrap();
+    let r = until_reach(&a.engine, "closed").await;
+    assert!(r["problem"].as_str().unwrap().contains("is gone"), "{r}");
+    assert_eq!(r["open"], false);
+    assert!(until(5, || cloud.links() == 0).await);
+    // On again, and the uninstaller once more, with the app not running:
+    // off at the next start, and nothing opened.
+    let (status, r) = open_from_web(&a.engine, true).await;
+    assert_eq!(status, 200, "{r}");
+    until_reach(&a.engine, "online").await;
+    a.engine.reach.stop().await;
+    std::fs::remove_file(&a.env).unwrap();
+    let hellos = cloud.st.lock().unwrap().hellos.len();
+    let b = app_in(&cloud, a.dir.clone(), a.env.clone(), a.host.clone()).await;
+    b.engine.reach.set_timing(fast());
+    let r = until_reach(&b.engine, "closed").await;
+    assert!(r["problem"].as_str().unwrap().contains("is gone"), "{r}");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(cloud.st.lock().unwrap().hellos.len(), hellos, "not opened again");
+    assert_eq!(reach(&b.engine).await["open"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keychain_that_cannot_be_read_leaves_the_login_item() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    a.engine.reach.set_timing(fast());
+    sign_in(&cloud, &a).await;
+    open_from_web(&a.engine, true).await;
+    until_reach(&a.engine, "online").await;
+    a.engine.reach.stop().await;
+    // The next start: the keychain stays locked.
+    a.host.load_fails.store(true, Ordering::SeqCst);
+    let b = app_in(&cloud, a.dir.clone(), a.env.clone(), a.host.clone()).await;
+    b.engine.reach.set_timing(fast());
+    until_reach(&b.engine, "signed-out").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(b.engine.reach.kept_now(), None, "not known: the login item stays as it is");
+    assert_eq!(reach(&b.engine).await["open"], true);
 }
