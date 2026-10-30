@@ -11,6 +11,9 @@ use uuid::Uuid;
 pub const THEMES: [&str; 3] = ["system", "light", "dark"];
 pub const TINTS: [&str; 2] = ["badge", "block"];
 pub const COLORS: [&str; 8] = ["violet", "sky", "teal", "pink", "orange", "lime", "indigo", "slate"];
+/// Settings' Updates (from 0.5.0, update.rs): "auto", Update by itself, the
+/// default; "ask", Ask me first.
+pub const UPDATES: [&str; 2] = ["auto", "ask"];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +46,9 @@ pub struct Settings {
     /// until the first run signed in decides it.
     #[serde(default)]
     pub open_from_web: Option<bool>,
+    /// How a new version goes in (from 0.5.0): one of UPDATES.
+    #[serde(default = "default_updates")]
+    pub updates: String,
 }
 
 fn default_theme() -> String {
@@ -60,6 +66,9 @@ fn default_code() -> String {
 fn default_color() -> String {
     "violet".into()
 }
+fn default_updates() -> String {
+    "auto".into()
+}
 
 impl Settings {
     fn fresh() -> Self {
@@ -76,6 +85,7 @@ impl Settings {
             added_at: crate::terminals::now_ms(),
             welcome_seen: false,
             open_from_web: None,
+            updates: default_updates(),
         }
     }
 
@@ -123,6 +133,9 @@ impl Settings {
         }
         if !COLORS.contains(&self.project_color.as_str()) {
             self.project_color = default_color();
+        }
+        if !UPDATES.contains(&self.updates.as_str()) {
+            self.updates = default_updates();
         }
         if !crate::names::valid_code(&self.project_code) {
             self.project_code = default_code();

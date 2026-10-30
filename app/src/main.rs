@@ -9,6 +9,7 @@
 //! keeps the key of its device in the keychain (keychain.rs). From 0.4.0 it
 //! opens this computer to tTerm Web too, in the agent's place, and while it
 //! does it stays in the menu bar with its window closed (background.rs).
+//! From 0.5.0 it updates itself (updates.rs, and the engine's update.rs).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -16,6 +17,7 @@ mod background;
 mod keychain;
 #[cfg(target_os = "macos")]
 mod mac;
+mod updates;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -318,12 +320,17 @@ fn menu(handle: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
             ..Default::default()
         }),
     )?;
+    // Check for Updates…, or Restart to Update once a version is ready
+    // (updates.rs).
+    let update = MenuItem::with_id(handle, "update", updates::CHECK, true, None::<&str>)?;
+    *handle.state::<updates::MenuLine>().0.lock().unwrap() = Some(update.clone());
     let app_menu = Submenu::with_items(
         handle,
         "tTerm",
         true,
         &[
             &about,
+            &update,
             &PredefinedMenuItem::separator(handle)?,
             &PredefinedMenuItem::services(handle, None)?,
             &PredefinedMenuItem::separator(handle)?,
@@ -377,8 +384,10 @@ fn on_menu(handle: &AppHandle, id: &str) {
     let window = handle.get_webview_window("main");
     match id {
         "quit" => ask_to_quit(handle),
+        "update" => updates::menu_item(handle),
         // The icon in the menu bar (background.rs).
         "bar-open" => background::show_window(handle),
+        "bar-update" => updates::restart(handle),
         "bar-quit" => ask_to_quit(handle),
         "reload" => {
             // The page again; and the app's page, should the window ever
@@ -445,6 +454,31 @@ fn agent_env() -> std::path::PathBuf {
 }
 
 fn main() {
+    // Asked by the version before, before it puts this one in place, and
+    // the watcher it runs as itself (the engine's update.rs): no window.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(version) = tterm_engine::update::version_main(&args) {
+        println!("{version}");
+        return;
+    }
+    if let Some(code) = tterm_engine::update::watcher_main(&args) {
+        std::process::exit(code);
+    }
+    // The version before, opened from beside the app where an update put
+    // it for a moment (a bookmark of the Dock follows it): the app in its
+    // place opens instead.
+    #[cfg(target_os = "macos")]
+    if let Some(app) = std::env::current_exe().ok().and_then(|exe| tterm_engine::update::moved_aside(&exe)) {
+        let _ = tterm_engine::update::launch(&app, background::started_at_login(), false);
+        return;
+    }
+    // A new version on trial says so before anything that could end this
+    // start, and the version before watches it (the engine's update.rs). In
+    // the place of data Tauri gives the app (app_data_dir), found the way
+    // Tauri finds it.
+    if let Some(data) = dirs::data_dir() {
+        let _ = tterm_engine::update::claim(&tterm_engine::update::Config::app(&data.join(tterm_engine::update::BUNDLE_ID)));
+    }
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -463,10 +497,12 @@ fn main() {
             });
             app.manage(shared.clone());
             app.manage(background::Bar::default());
+            app.manage(updates::MenuLine::default());
             // On a Mac the app keeps this computer's link with its window
             // closed, and so takes the agent's place (the engine's reach.rs).
             engine.reach.set_background(background::supported());
             background::follow(app.handle(), engine.clone());
+            updates::follow(app.handle(), engine.clone());
             tauri::async_runtime::spawn(async move {
                 engine.start_background();
             });
@@ -525,6 +561,9 @@ fn main() {
             if let Some(text) = shared.engine.terminals.store.trouble.clone() {
                 app.dialog().message(text).title("tTerm").kind(MessageDialogKind::Warning).show(|_| {});
             }
+            // A new version on trial: up, and the version before, watching,
+            // goes.
+            shared.engine.updates.up();
             Ok(())
         });
 
@@ -552,6 +591,9 @@ fn main() {
                 ask_to_quit(handle);
             }
         }
+        // Quitting, whichever way: Update by itself puts the version ready
+        // in place.
+        RunEvent::Exit => updates::at_exit(&handle.state::<App>().engine),
         _ => {}
     });
 }

@@ -98,10 +98,17 @@ jobs:
           lipo -create -output tterm-agent-macos \
             target/aarch64-apple-darwin/release/tterm-agent \
             target/x86_64-apple-darwin/release/tterm-agent
-          # Signed for this computer only (no Apple Developer ID): a file
-          # downloaded by curl is not checked by Gatekeeper, and Apple
-          # silicon runs only signed code.
-          codesign --force --sign - tterm-agent-macos
+      # Apple silicon runs only signed code. With tTerm's own certificate
+      # (from the app's 0.5.0; no Apple Developer ID yet), macOS keeps what
+      # it allowed the agent (the Desktop, Documents) across its updates; a
+      # file downloaded by curl is not checked by Gatekeeper anyway. Without
+      # the secrets (a pull request from elsewhere), for this computer only.
+      - name: Signed with tTerm's certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          TTERM_RELEASE: ${{ startsWith(github.ref, 'refs/tags/agent-v') && '1' || '' }}
+        run: sh scripts/sign-mac.sh tterm-agent-macos net.tterm.agent
       - name: What was built
         run: |
           lipo -info tterm-agent-macos

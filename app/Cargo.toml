@@ -22,6 +22,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["sync", "time", "macros"] }
 tterm-engine = { path = "../engine", features = ["cloud"] }
+# Where Tauri keeps the app's data, found before Tauri starts: a new version
+# on trial says so first thing (src/main.rs). The same dirs as Tauri's.
+dirs = "7"
 
 # The answer to "may the app quit?" that tao's delegate does not give
 # (src/mac.rs); the keychain, for the device's key (src/keychain.rs).

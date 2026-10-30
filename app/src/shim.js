@@ -334,12 +334,17 @@
   // ------------------------------------------------------------- the menu
 
   // What the app's menu asks of the page, done the way a click does it.
+  // From 0.5.0 what has no button to click goes to the page as an event it
+  // listens to (tTerm Web 0.1.15): "updates", Settings at its Updates, from
+  // Check for Updates… in tTerm's menu.
   window.__ttermApp = {
     action(name) {
       if (name === "new-terminal") {
         document.querySelector('.plus-wrap button[aria-label="New terminal"]')?.click();
       } else if (name === "close-tab") {
         document.querySelector(".tab.current .tab-close")?.click();
+      } else if (name === "updates") {
+        window.dispatchEvent(new CustomEvent("tterm-app", { detail: { action: name } }));
       }
     },
   };

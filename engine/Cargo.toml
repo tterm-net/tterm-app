@@ -43,3 +43,6 @@ libc = "0.2"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "process", "io-util", "test-util"] }
+# Releases of the app on this computer, over TLS, for the checks of its
+# updates (tests/update.rs), as the agent's (agent/tests/update.rs).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

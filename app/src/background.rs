@@ -3,7 +3,9 @@
 //! engine's reach.rs), the app keeps that link with its window closed, in
 //! the menu bar, and starts when the person logs in, as tTerm Web's agent
 //! did before it. Its icon there opens the window, says how the link is,
-//! and quits. Otherwise the app is as before: closing its window quits it.
+//! and quits; from 0.5.0, with a new version ready, Restart to Update
+//! (updates.rs). Otherwise the app is as before: closing its window quits
+//! it.
 //!
 //! What it follows is the switch and the sign-in (the engine's `kept`), not
 //! the link of the moment: no network, a quit, a slow keychain leave the
@@ -13,10 +15,11 @@
 //! the link runs while it does.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::image::Image;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, Wry};
 use tterm_engine::reach::Status;
@@ -54,6 +57,13 @@ pub struct Bar {
     /// The app keeps running in the background for the link; None until
     /// the engine knows.
     on: Mutex<Option<bool>>,
+    /// What the line of the link says now, and the item of a version
+    /// ready, if one is (from 0.5.0): the menu is made again with them.
+    said: Mutex<String>,
+    update: Mutex<Option<String>>,
+    /// The window closed into the menu bar (hide_window), not minimized or
+    /// hidden with Cmd+H: what updating by itself waits for (updates.rs).
+    closed: AtomicBool,
 }
 
 /// Whether closing the window leaves the app running.
@@ -74,7 +84,10 @@ pub fn follow(handle: &AppHandle, engine: Arc<Engine>) {
         loop {
             let k = *kept.borrow_and_update();
             let now = status.borrow_and_update().clone();
-            show(&h, k, &now);
+            // On the main thread, as the menu of a version ready
+            // (set_update): the icon's menu is changed in one place.
+            let on = h.clone();
+            let _ = h.run_on_main_thread(move || show(&on, k, &now));
             tokio::select! {
                 changed = kept.changed() => if changed.is_err() { return },
                 changed = status.changed() => if changed.is_err() { return },
@@ -114,9 +127,11 @@ fn show(handle: &AppHandle, kept: Option<bool>, now: &Status) {
         }
     }
     let on = *bar.on.lock().unwrap() == Some(true);
+    *bar.said.lock().unwrap() = now.line(HERE);
+    let update = bar.update.lock().unwrap().clone();
     let mut tray = bar.tray.lock().unwrap();
     if on && tray.is_none() {
-        match make(handle) {
+        match make(handle, update.as_deref()) {
             Ok(made) => *tray = Some(made),
             Err(e) => eprintln!("tterm: no icon in the menu bar: {e}"),
         }
@@ -127,17 +142,55 @@ fn show(handle: &AppHandle, kept: Option<bool>, now: &Status) {
     }
 }
 
-fn hidden(handle: &AppHandle) -> bool {
+/// The icon's menu with Restart to Update (`text`) or without it. On the
+/// main thread, as `show`.
+pub fn set_update(handle: &AppHandle, text: Option<String>) {
+    let bar = handle.state::<Bar>();
+    {
+        let mut update = bar.update.lock().unwrap();
+        if *update == text {
+            return;
+        }
+        update.clone_from(&text);
+    }
+    let said = bar.said.lock().unwrap().clone();
+    let mut tray = bar.tray.lock().unwrap();
+    let Some((icon, line)) = tray.as_mut() else { return };
+    match menu(handle, text.as_deref()) {
+        Ok((menu, fresh)) => {
+            let _ = fresh.set_text(said);
+            if icon.set_menu(Some(menu)).is_ok() {
+                *line = fresh;
+            }
+        }
+        Err(e) => eprintln!("tterm: the menu in the menu bar: {e}"),
+    }
+}
+
+pub fn hidden(handle: &AppHandle) -> bool {
     handle.get_webview_window("main").map(|w| !w.is_visible().unwrap_or(true)).unwrap_or(false)
 }
 
-/// The icon and its menu: Open tTerm, how the link is, Quit tTerm. Its
-/// items are the app's menu's (main.rs, on_menu).
-fn make(handle: &AppHandle) -> tauri::Result<(TrayIcon<Wry>, MenuItem<Wry>)> {
+/// The icon's menu: Open tTerm, how the link is, Restart to Update when a
+/// version is ready, Quit tTerm. Its items are the app's menu's (main.rs,
+/// on_menu).
+fn menu(handle: &AppHandle, update: Option<&str>) -> tauri::Result<(Menu<Wry>, MenuItem<Wry>)> {
     let open = MenuItem::with_id(handle, "bar-open", "Open tTerm", true, None::<&str>)?;
     let line = MenuItem::with_id(handle, "bar-status", HERE, false, None::<&str>)?;
+    let restart = update.map(|text| MenuItem::with_id(handle, "bar-update", text, true, None::<&str>)).transpose()?;
     let quit = MenuItem::with_id(handle, "bar-quit", "Quit tTerm", true, None::<&str>)?;
-    let menu = Menu::with_items(handle, &[&open, &PredefinedMenuItem::separator(handle)?, &line, &PredefinedMenuItem::separator(handle)?, &quit])?;
+    let (one, two) = (PredefinedMenuItem::separator(handle)?, PredefinedMenuItem::separator(handle)?);
+    let mut items: Vec<&dyn IsMenuItem<Wry>> = vec![&open, &one, &line, &two];
+    if let Some(restart) = restart.as_ref() {
+        items.push(restart);
+    }
+    items.push(&quit);
+    Ok((Menu::with_items(handle, &items)?, line))
+}
+
+/// The icon and its menu.
+fn make(handle: &AppHandle, update: Option<&str>) -> tauri::Result<(TrayIcon<Wry>, MenuItem<Wry>)> {
+    let (menu, line) = menu(handle, update)?;
     let icon = TrayIconBuilder::with_id("tterm")
         .icon(Image::new(ICON, ICON_SIDE, ICON_SIDE))
         .icon_as_template(true)
@@ -148,8 +201,14 @@ fn make(handle: &AppHandle) -> tauri::Result<(TrayIcon<Wry>, MenuItem<Wry>)> {
     Ok((icon, line))
 }
 
+/// Whether the window was closed into the menu bar, and not opened since.
+pub fn closed(handle: &AppHandle) -> bool {
+    handle.state::<Bar>().closed.load(Ordering::SeqCst)
+}
+
 /// The window, shown and in front, with the app in the Dock again.
 pub fn show_window(handle: &AppHandle) {
+    handle.state::<Bar>().closed.store(false, Ordering::SeqCst);
     in_dock(handle, true);
     if let Some(w) = handle.get_webview_window("main") {
         let _ = w.unminimize();
@@ -160,6 +219,7 @@ pub fn show_window(handle: &AppHandle) {
 
 /// The window closed, the app running on in the menu bar, out of the Dock.
 pub fn hide_window(handle: &AppHandle) {
+    handle.state::<Bar>().closed.store(true, Ordering::SeqCst);
     if let Some(w) = handle.get_webview_window("main") {
         let _ = w.hide();
     }

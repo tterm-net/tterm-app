@@ -24,7 +24,9 @@ one the window runs on. Search (from 0.3.1), Cmd+K, finds the commands of
 every terminal, what they printed and notes: this computer's in the app
 itself, the rest in tTerm Web, as one list. From 0.4.0 the app opens this
 computer to tTerm Web and your phone itself, in the place of tTerm Web's
-agent, and stays in the menu bar for it. Windows comes later.
+agent, and stays in the menu bar for it. From 0.5.0 it updates itself, from
+tTerm's releases here, and is signed with tTerm's own certificate (see
+Updates). Windows comes later.
 
 ## How it is made
 
@@ -41,7 +43,8 @@ engine/   Rust: the shells (pty.rs), the terminals and their pages
           (cloud_api.rs, upstream.rs), its cloud terminals over the socket
           (upstream_socket.rs). The link to tTerm Web (link.rs, proxy.rs)
           and the terminals tTerm Web opens through it (hosted.rs), run by
-          the app in the agent's place (reach.rs).
+          the app in the agent's place (reach.rs). New versions of the app,
+          found, checked and put in place (update.rs).
 agent/    tterm-agent: the engine without a window, connecting a computer
           to tTerm Web (see below).
 engine/shell/
@@ -50,7 +53,11 @@ engine/shell/
 app/      Tauri: the window, the menu, the bridge (src/shim.js) that sends
           the page's requests and socket to the engine over Tauri's IPC,
           the device's key in the keychain (src/keychain.rs), the icon in
-          the menu bar and the start at login (src/background.rs).
+          the menu bar and the start at login (src/background.rs), Restart
+          to update and Update by itself (src/updates.rs).
+scripts/  the page into web-dist (web.sh); the Mac's signature with tTerm's
+          certificate (sign-mac.sh), and the disk image and the app for
+          updates (pack-mac.sh).
 web-dist/ the page of tTerm Web, put there by scripts/web.sh at the commit
           in WEB_COMMIT. Not in git.
 ```
@@ -67,8 +74,10 @@ Allow. The browser then brings a one-time code to a port of 127.0.0.1 that
 the app opens for those minutes only, and answers nothing else on; the app
 trades the code, with a secret that never left it (RFC 7636), for a key of
 its own. The key is in the keychain: item "tTerm", account `app.tterm.net`.
-Until the app is signed by Apple, each new version is another program to the
-keychain, and the Mac asks for the password once; Always Allow keeps it so.
+Up to 0.4.0, signed for this computer only, each new version was another
+program to the keychain, and the Mac asked for the password once; Always
+Allow keeps it so. From 0.5.0 the app is signed with tTerm's own
+certificate (see Updates).
 The app is then a device in Settings → Devices of tTerm Web, and Forget there
 signs it out. Sign out in the app forgets it too.
 
@@ -176,8 +185,8 @@ computer a new key and it is added to Personal again), when the agent's
 file goes (as its uninstaller takes it), and when the file is another tTerm
 Web's or tTerm says its key is another account's computer. Terminals opened
 from tTerm Web are the app's processes, so macOS asks for access to Desktop
-and Documents for tTerm, not for the agent. tTerm Web names it "tTerm app
-0.4.0" where an agent says its version.
+and Documents for tTerm, not for the agent. tTerm Web names it "tTerm app"
+and its version, 0.5.0, where an agent says its own.
 
 ## The agent
 
@@ -251,11 +260,80 @@ The files come from GitHub Actions (`.github/workflows/agent.yml`): macOS
 both linked statically. A tag `agent-vX.Y.Z` makes a release of them,
 with the signed `tterm-agent.json` and `SHA256SUMS`.
 
+## Updates
+
+From 0.5.0 tTerm for Mac takes its new versions from this repository's
+releases, as the agent does (see The agent): a tag `vX.Y.Z` makes a release,
+the repository's Latest, with `tTerm.dmg` to download, `tTerm.app.tar.gz` for
+updates, and `tterm-app.json`, the list of them with their sizes and SHA-256,
+signed by the release key, the agent's (its private half only in this
+repository's secrets). The app takes a version only when that signature
+checks against the public half built into it and the file against the list;
+the list says it is the app's, so the agent's, signed with the same key, is
+never taken for it. GitHub decides only whether there is a new version.
+
+It looks two minutes after it starts and every six hours, and when asked
+(Check now in Settings, Check for Updates… in tTerm's menu). A new version
+is downloaded, unpacked next to the app under a name that is no app to
+Finder or to the login item (`.tTerm-0.5.1.update`) and checked there: its
+Info.plist says tTerm and that version, for a macOS this Mac has; its code
+signature is whole and tTerm's; and only then its program runs, to say
+that version (`tterm --version`). What was checked is written down, every
+file of it, and it goes in only as it was. Nothing found beside the app is
+run or taken unless it was unpacked there from the file the signed list
+names; that file waits in the app's data until it goes in, so a start in
+between does not download it again. Then the page says so: Restart to
+update in the top bar and on a card above the account, and in Settings →
+Updates. Restart asks first when terminals of this Mac would end, with the
+question of Quit; tTerm's menu and its icon in the menu bar have Restart to
+Update too. A version ready that is no longer the newest GitHub lists (made
+a pre-release, or deleted) is not ready any more, and does not go in.
+
+The new version goes in place in one step: the two folders swap
+(`renamex_np` with `RENAME_SWAP`), so the app's place never holds half an
+app. As it starts, before its window, the new one writes its pid in the
+trial file (`update.json` in the app's data), and the version before, now
+beside it, watches it: `tterm --finish-update` after Restart, which opens the
+new one first, or `--watch-start` when it went in as tTerm quit and starts
+later by itself (only signed as tTerm). One that does not say it is up
+within 45 seconds, or whose start ends before, goes, the version before
+comes back, and that version is not taken again; under the trial file's
+lock, so it comes back once, however many watch. Once the new one is up, the
+version before goes from beside it.
+
+Settings → Updates: **Update by itself** (recommended, the default) puts a
+version ready in place as tTerm quits, and, with tTerm in the menu bar and
+its window closed, as soon as nothing runs on this Mac: it starts again in
+the menu bar, and tTerm Web sees this Mac go for a few seconds. Should that
+one not go in (App Management), it is not tried by itself again for that
+version: Restart to update or the next Quit puts it in. **Ask me first**
+waits for Restart to update. A copy run from the disk image cannot replace
+itself: it offers to move itself to Applications.
+
+The app is signed with tTerm's own certificate (`scripts/sign-mac.sh`; its
+SHA-1 in `macos-cert.sha1`, the certificate and key in the secrets
+`MACOS_CERTIFICATE` and `MACOS_CERTIFICATE_PASSWORD`), under the requirement
+`identifier "net.tterm.desktop" and certificate leaf = H"…"`, and a new
+version is taken only signed so. Moving to an Apple Developer ID, the version
+before the move adds its Team ID to that requirement; never Apple's anchor
+alone, which every Apple developer's certificate has.
+What the person allowed it in Privacy & Security (Desktop, Documents) stays
+allowed across versions signed so. Whether the keychain asks for its
+password again after an update is to be seen on a Mac: it keeps such
+answers per signature, and without an Apple team that is the program's own
+hash. It is not Apple's Developer ID, so a copy downloaded with a browser is
+opened the first time with Open Anyway in System Settings → Privacy &
+Security; its updates are not asked about. On macOS 13 and later, App
+Management may ask once whether tTerm may change apps. The agent is signed
+with the same certificate, as `net.tterm.agent`.
+
 ## Building
 
 macOS builds come from GitHub Actions (`.github/workflows/build.yml`): a disk
-image with tTerm.app for Intel and Apple silicon, not signed yet. To build by
-hand you need Rust, Node 22 and, on Linux, WebKitGTK 4.1:
+image with tTerm.app for Intel and Apple silicon, signed with tTerm's
+certificate, and the app for updates; a tag `vX.Y.Z` releases them (see
+Updates). To build by hand you need Rust, Node 22 and, on Linux, WebKitGTK
+4.1:
 
 ```sh
 sh scripts/web.sh                       # the page, at WEB_COMMIT
@@ -263,11 +341,12 @@ cargo test -p tterm-engine --features cloud
                                         # the engine, with real shells
 cargo test -p tterm-agent               # the agent
 cargo build --release -p tterm-agent    # the agent: target/release/tterm-agent
-cd app && npx @tauri-apps/cli@2 build   # the app
+cd app && npx @tauri-apps/cli@2.12.4 build
+                                        # the app
 ```
 
-An app that is not signed is opened once with Open Anyway in System Settings
-→ Privacy & Security, or with
+A copy downloaded with a browser is opened once with Open Anyway in System
+Settings → Privacy & Security, or with
 `xattr -dr com.apple.quarantine /Applications/tTerm.app`.
 
 ## License

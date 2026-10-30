@@ -6,7 +6,8 @@
 //! What only the app does is answered here, signed in or not: signing in
 //! with the browser (`/api/auth/link`), the welcome of the first start
 //! (`/api/app/welcome`), This computer in Settings (`/api/app/this-computer`,
-//! from 0.4.0: reach.rs), and Sign out, which forgets the app's key too.
+//! from 0.4.0: reach.rs), the app's updates (`/api/app/update`, from 0.5.0:
+//! update.rs), and Sign out, which forgets the app's key too.
 //! `/api/state` is tTerm's, with this computer's machine marked `here` and
 //! this app's terminals with the rest (account::merge_state); when tTerm
 //! cannot be reached, it is what tTerm said last, with `"offline": true`,
@@ -15,6 +16,7 @@
 use crate::account::{self, Account, Trouble};
 use crate::api::{Flags, Response};
 use crate::reach::NotOn;
+use crate::update::Wish;
 use crate::{names, Engine};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -34,6 +36,11 @@ pub async fn route(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], 
     let method = method.to_ascii_uppercase();
     if parts.as_slice() == ["health"] {
         return None;
+    }
+    // The app's updates need no account: answered before it is ready (a
+    // keychain that asks for its password holds the account up).
+    if let ["api", "app", "update", ..] = parts.as_slice() {
+        return Some(update(engine, &method, &parts[3..], body));
     }
     account.wait_ready().await;
     // The app's own, signed in or not.
@@ -131,6 +138,46 @@ pub async fn route(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], 
             Some(proxy(&account, &method, path, body, flags).await)
         }
         _ => None,
+    }
+}
+
+/// Settings' Updates, the strip and the card (from 0.5.0): `/api/app/update`
+/// and what follows it in `rest`.
+fn update(engine: &Arc<Engine>, method: &str, rest: &[&str], body: &[u8]) -> Response {
+    let updates = &engine.updates;
+    match (method, rest) {
+        ("GET", []) => Response::json(200, updates.json(engine)),
+        ("PUT", []) => {
+            let Some(mode) = serde_json::from_slice::<Value>(body).ok().and_then(|b| b.get("mode").and_then(Value::as_str).map(str::to_string)) else {
+                return Response::error(422, "Say mode: auto or ask.");
+            };
+            match updates.set_mode(engine, &mode) {
+                Ok(()) => Response::json(200, updates.json(engine)),
+                Err(why) if why.starts_with("Say") => Response::error(422, &why),
+                Err(why) => Response::error(500, &why),
+            }
+        }
+        ("POST", ["check"]) => {
+            updates.check_now();
+            Response::json(200, updates.json(engine))
+        }
+        ("POST", ["seen"]) => {
+            updates.seen();
+            Response::json(200, updates.json(engine))
+        }
+        ("POST", ["restart"]) if updates.ready().is_none() => Response::error(409, "No new version is ready."),
+        ("POST", ["move"]) if !matches!(updates.now().phase, crate::update::Phase::Unavailable { movable: true, .. }) => {
+            Response::error(409, "tTerm does not run from the disk image.")
+        }
+        ("POST", [wish @ ("restart" | "move")]) => {
+            let wish = if *wish == "restart" { Wish::Restart } else { Wish::Move };
+            if updates.wish(wish) {
+                Response::json(202, updates.json(engine))
+            } else {
+                Response::error(409, "Only the app does that.")
+            }
+        }
+        _ => Response::error(404, "No such request."),
     }
 }
 

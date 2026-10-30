@@ -52,6 +52,8 @@ pub mod socket;
 pub mod store;
 pub mod terminals;
 #[cfg(feature = "cloud")]
+pub mod update;
+#[cfg(feature = "cloud")]
 pub mod upstream;
 #[cfg(feature = "cloud")]
 pub mod upstream_socket;
@@ -101,6 +103,9 @@ pub struct Engine {
     /// This computer opened from tTerm Web through the app (from 0.4.0).
     #[cfg(feature = "cloud")]
     pub reach: reach::Reach,
+    /// tTerm for Mac updating itself (from 0.5.0).
+    #[cfg(feature = "cloud")]
+    pub updates: update::Updates,
 }
 
 /// What every request for notes says while they cannot be read.
@@ -123,6 +128,7 @@ impl Engine {
         let mut engine = Self::made(data_dir)?;
         engine.cloud = Some(account::Account::new(upstream::Cloud::new(cloud), host, data_dir, env_file));
         engine.reach = reach::Reach::new(env_file);
+        engine.updates = update::Updates::new(update::Config::app(data_dir));
         Ok(Arc::new(engine))
     }
 
@@ -159,6 +165,8 @@ impl Engine {
             cloud: None,
             #[cfg(feature = "cloud")]
             reach: reach::Reach::new(&pty::home_dir().join(".tterm-web").join("env")),
+            #[cfg(feature = "cloud")]
+            updates: update::Updates::none(data_dir),
         })
     }
 
@@ -210,6 +218,8 @@ impl Engine {
             // This computer opened from tTerm Web, whenever it is to be
             // (from 0.4.0).
             tokio::spawn(reach::Reach::keep(self.clone()));
+            // New versions of the app (from 0.5.0).
+            tokio::spawn(update::Updates::keep(self.clone()));
         }
     }
 
