@@ -1,0 +1,104 @@
+# Words of tTerm for Mac in English: one a line, `key = text` (engine/src/say.rs).
+# Every language has the same keys (a check of say.rs sees to it). {name} is a
+# value the app puts in; a counting string has a form for each plural of the
+# language, "one: … | other: …", and {n} is the count. tTerm, tTerm Web and
+# names of terminals and machines are not translated. The page of tTerm Web
+# has its own words, in tterm-web: these are the app's alone.
+
+# ------------------------------------------------------------ menu: tTerm's menu at the top of the screen
+menu.about = À propos de tTerm
+menu.check_updates = Rechercher les mises à jour…
+# {version}: 0.6.1.
+menu.restart_update = Redémarrer pour mettre à jour ({version})…
+menu.services = Services
+menu.hide = Masquer tTerm
+menu.hide_others = Masquer les autres
+menu.show_all = Tout afficher
+menu.quit = Quitter tTerm
+menu.edit = Édition
+menu.undo = Annuler
+menu.redo = Rétablir
+menu.cut = Couper
+menu.copy = Copier
+menu.paste = Coller
+menu.select_all = Tout sélectionner
+menu.view = Présentation
+menu.reload = Recharger
+menu.window = Fenêtre
+menu.new_terminal = Nouveau terminal
+menu.close_tab = Fermer l’onglet
+menu.minimize = Placer dans le Dock
+menu.zoom = Réduire/agrandir
+
+# ------------------------------------------------------------ bar: the icon in the menu bar and its menu
+bar.open = Ouvrir tTerm
+# The line under Open tTerm: how the link to tTerm Web is.
+bar.not_opened = Ce Mac n’est pas ouvert à tTerm Web
+bar.starting = Démarrage de tTerm…
+bar.signed_out = Non connecté à tTerm
+bar.connecting = Connexion à tTerm Web…
+# {name} is this Mac's name in tTerm Web.
+bar.online = {name} : en ligne dans tTerm Web
+bar.no_network = Pas de réseau, nouvelle tentative
+
+# ------------------------------------------------------------ quit: asked before tTerm quits with terminals open
+quit.title = Quitter tTerm ?
+quit.yes = Quitter
+quit.cancel = Annuler
+quit.shells_end = one: Le shell de {n} terminal prendra fin. | other: Les shells de {n} terminaux prendront fin.
+# {running} lists what runs: "npm run dev in P/web-01, vim in P/db".
+quit.running = one: En cours d’exécution : {running}. Tout sera interrompu, et le shell de {n} terminal prendra fin. | other: En cours d’exécution : {running}. Tout sera interrompu, et les shells de {n} terminaux prendront fin.
+quit.running_item = {name} dans {label}
+# How the language lists them, two at a time: "a, b" ("a、b" in Japanese).
+quit.list = {a}, {b}
+# Two sentences one after the other: "a b" ("ab" in Chinese and Japanese).
+quit.both = {first} {second}
+quit.web_end = one: {n} terminal ouvert depuis tTerm Web sur cet ordinateur prendra fin. | other: {n} terminaux ouverts depuis tTerm Web sur cet ordinateur prendront fin.
+
+# ------------------------------------------------------------ restart: a new version ready
+restart.title = Redémarrer tTerm pour le mettre à jour ?
+# {question} is one of quit.*: what ends with the restart.
+restart.text = tTerm {version} est prêt. {question}
+restart.yes = Redémarrer
+restart.later = Plus tard
+restart.failed = tTerm n’a pas pu se mettre à jour
+
+# ------------------------------------------------------------ move: tTerm opened from the disk image
+move.title = Déplacer tTerm dans Applications ?
+move.text = tTerm s’exécute pour l’instant depuis l’image disque. Il ne peut se mettre à jour que depuis le dossier Applications.
+# {question} is one of quit.*: what ends with the move.
+move.text_ends = tTerm s’exécute pour l’instant depuis l’image disque. Il ne peut se mettre à jour que depuis le dossier Applications. Il se rouvrira ensuite depuis ce dossier. {question}
+move.yes = Déplacer dans Applications
+move.no = Pas maintenant
+move.failed = tTerm n’a pas pu être déplacé
+
+# ------------------------------------------------------------ update: why tTerm does not update, in Settings' Updates and the questions
+# {why} is the reason, as macOS or the network said it, in English.
+update.only_mac = Seul tTerm pour Mac se met à jour lui-même.
+update.from_build = Cette copie de tTerm s’exécute depuis un build, et non depuis tTerm.app : elle ne se met pas à jour elle-même.
+update.not_app = tTerm s’exécute depuis un build, et non depuis tTerm.app.
+update.from_disk_image = tTerm s’exécute depuis l’image disque. Placez-le dans Applications, et il se mettra à jour lui-même.
+update.not_disk_image = tTerm ne s’exécute pas depuis l’image disque.
+# {place} is a folder: /Users/denis/Desktop.
+update.cannot_change = tTerm ne peut pas modifier {place}, où il se trouve, et ne peut donc pas se mettre à jour. Téléchargez la nouvelle version sur tterm.net.
+update.no_key = Cette copie de tTerm n’intègre aucune clé de signature des versions.
+update.could_not_look = Impossible de rechercher une nouvelle version : {why}
+update.could_not_take = Impossible de récupérer tTerm {version} : {why}. tTerm reste tel quel.
+update.none_ready = Aucune nouvelle version n’est prête.
+update.busy = Impossible d’installer la nouvelle version : une autre copie de tTerm est en train de se mettre à jour. Réessayez dans un instant.
+update.replaced = Une autre copie de tTerm a déjà installé une nouvelle version. Quittez celle-ci, puis rouvrez tTerm.
+update.changed = tTerm {version}, qui attendait à côté de tTerm, a été modifié depuis sa vérification : il n’est pas installé et sera récupéré de nouveau.
+update.not_written = Impossible d’enregistrer la mise à jour : {why}
+update.app_management = macOS n’a pas permis à tTerm de remplacer la version actuelle par tTerm {version} ({why}). Autorisez tTerm dans Réglages Système > Confidentialité et sécurité > Gestion des apps, puis appuyez de nouveau sur Redémarrer pour mettre à jour.
+update.not_in_place = Impossible d’installer tTerm {version} : {why}
+update.cannot_watch = La version précédente ne peut pas surveiller le démarrage de la nouvelle : {why}
+update.in_place_unwatched = tTerm {version} est installé, mais la version précédente ne peut pas surveiller son démarrage ({why}). Quittez tTerm, puis rouvrez-le.
+# {to} did not start, {from} is the version before, which came back.
+update.came_back = tTerm {to} n’a pas démarré sur ce Mac : tTerm {from} a donc été rétabli. C’est la version suivante qui sera récupérée.
+update.only_mac_moves = Seul tTerm pour Mac se déplace lui-même.
+update.applications_locked = Votre compte ne peut pas modifier le dossier Applications. Faites glisser tTerm dans ce dossier depuis le Finder.
+update.newer_there = Une version plus récente de tTerm ({version}) se trouve dans Applications : ouvrez-la.
+update.not_copied = Impossible de copier tTerm dans Applications ({why})
+update.not_moved = Impossible de placer tTerm dans Applications ({why})
+update.say_mode = Indiquez le mode : auto ou ask.
+update.not_saved = Impossible d’enregistrer les paramètres sur cet ordinateur.

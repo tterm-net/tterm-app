@@ -1,0 +1,104 @@
+# Words of tTerm for Mac in English: one a line, `key = text` (engine/src/say.rs).
+# Every language has the same keys (a check of say.rs sees to it). {name} is a
+# value the app puts in; a counting string has a form for each plural of the
+# language, "one: … | other: …", and {n} is the count. tTerm, tTerm Web and
+# names of terminals and machines are not translated. The page of tTerm Web
+# has its own words, in tterm-web: these are the app's alone.
+
+# ------------------------------------------------------------ menu: tTerm's menu at the top of the screen
+menu.about = О программе tTerm
+menu.check_updates = Проверить обновления…
+# {version}: 0.6.1.
+menu.restart_update = Перезапустить и обновить ({version})…
+menu.services = Службы
+menu.hide = Скрыть tTerm
+menu.hide_others = Скрыть остальные
+menu.show_all = Показать все
+menu.quit = Завершить tTerm
+menu.edit = Правка
+menu.undo = Отменить
+menu.redo = Повторить
+menu.cut = Вырезать
+menu.copy = Скопировать
+menu.paste = Вставить
+menu.select_all = Выбрать все
+menu.view = Вид
+menu.reload = Перезагрузить
+menu.window = Окно
+menu.new_terminal = Новый терминал
+menu.close_tab = Закрыть вкладку
+menu.minimize = Свернуть
+menu.zoom = Изменить масштаб
+
+# ------------------------------------------------------------ bar: the icon in the menu bar and its menu
+bar.open = Открыть tTerm
+# The line under Open tTerm: how the link to tTerm Web is.
+bar.not_opened = Этот Mac недоступен из tTerm Web
+bar.starting = tTerm запускается…
+bar.signed_out = Вход в tTerm не выполнен
+bar.connecting = Подключение к tTerm Web…
+# {name} is this Mac's name in tTerm Web.
+bar.online = {name}: на связи с tTerm Web
+bar.no_network = Нет сети, пробуем снова
+
+# ------------------------------------------------------------ quit: asked before tTerm quits with terminals open
+quit.title = Завершить tTerm?
+quit.yes = Завершить
+quit.cancel = Отменить
+quit.shells_end = one: В {n} терминале завершится шелл. | few: В {n} терминалах завершатся шеллы. | many: В {n} терминалах завершатся шеллы.
+# {running} lists what runs: "npm run dev in P/web-01, vim in P/db".
+quit.running = one: Сейчас запущено: {running}. Всё это остановится, а в {n} терминале завершится шелл. | few: Сейчас запущено: {running}. Всё это остановится, а в {n} терминалах завершатся шеллы. | many: Сейчас запущено: {running}. Всё это остановится, а в {n} терминалах завершатся шеллы.
+quit.running_item = {name} в {label}
+# How the language lists them, two at a time: "a, b" ("a、b" in Japanese).
+quit.list = {a}, {b}
+# Two sentences one after the other: "a b" ("ab" in Chinese and Japanese).
+quit.both = {first} {second}
+quit.web_end = one: Завершится {n} терминал, открытый на этом компьютере из tTerm Web. | few: Завершатся {n} терминала, открытых на этом компьютере из tTerm Web. | many: Завершатся {n} терминалов, открытых на этом компьютере из tTerm Web.
+
+# ------------------------------------------------------------ restart: a new version ready
+restart.title = Перезапустить tTerm и обновить?
+# {question} is one of quit.*: what ends with the restart.
+restart.text = tTerm {version} готов. {question}
+restart.yes = Перезапустить
+restart.later = Позже
+restart.failed = Не удалось обновить tTerm
+
+# ------------------------------------------------------------ move: tTerm opened from the disk image
+move.title = Переместить tTerm в «Программы»?
+move.text = Сейчас tTerm запущен с образа диска. Обновляться сам он может только из папки «Программы».
+# {question} is one of quit.*: what ends with the move.
+move.text_ends = Сейчас tTerm запущен с образа диска. Обновляться сам он может только из папки «Программы». Оттуда он и откроется снова. {question}
+move.yes = Переместить в «Программы»
+move.no = Не сейчас
+move.failed = Не удалось переместить tTerm
+
+# ------------------------------------------------------------ update: why tTerm does not update, in Settings' Updates and the questions
+# {why} is the reason, as macOS or the network said it, in English.
+update.only_mac = Сам обновляется только tTerm для Mac.
+update.from_build = Этот tTerm запущен из сборки, а не из tTerm.app, и сам не обновляется.
+update.not_app = tTerm запущен из сборки, а не из tTerm.app.
+update.from_disk_image = tTerm запущен с образа диска. Перемести его в «Программы», и он будет обновляться сам.
+update.not_disk_image = tTerm запущен не с образа диска.
+# {place} is a folder: /Users/denis/Desktop.
+update.cannot_change = tTerm не может ничего менять в {place}, где он лежит, поэтому не может обновиться сам. Скачай новую версию с tterm.net.
+update.no_key = В этот tTerm не встроен ключ, которым проверяются выпуски.
+update.could_not_look = Не удалось проверить обновления: {why}
+update.could_not_take = Не удалось получить tTerm {version}: {why}. tTerm остаётся прежним.
+update.none_ready = Готовой новой версии нет.
+update.busy = Не удалось установить новую версию: другой tTerm сейчас обновляется. Попробуй ещё раз чуть позже.
+update.replaced = Другой tTerm уже установил новую версию. Заверши этот и открой tTerm снова.
+update.changed = tTerm {version}, который ждал рядом с tTerm, изменился после проверки и не будет установлен. Он загрузится заново.
+update.not_written = Не удалось записать обновление: {why}
+update.app_management = macOS не позволила tTerm заменить себя на tTerm {version} ({why}). Включи tTerm в Системных настройках → «Конфиденциальность и безопасность» → «Управление приложениями» и снова нажми «Перезапустить и обновить».
+update.not_in_place = Не удалось установить tTerm {version}: {why}
+update.cannot_watch = Предыдущая версия не может проследить за запуском новой: {why}
+update.in_place_unwatched = tTerm {version} установлен, но предыдущая версия не может проследить, как он запустится ({why}). Заверши tTerm и открой его снова.
+# {to} did not start, {from} is the version before, which came back.
+update.came_back = tTerm {to} не запустился на этом Mac, поэтому вернулся tTerm {from}. Обновление пропустит эту версию и дождётся следующей.
+update.only_mac_moves = Сам перемещается только tTerm для Mac.
+update.applications_locked = У твоей учётной записи нет прав менять «Программы». Перетащи tTerm туда в Finder.
+update.newer_there = В «Программах» уже есть более новый tTerm ({version}): открой его.
+update.not_copied = Не удалось скопировать tTerm в «Программы» ({why})
+update.not_moved = Не удалось поместить tTerm в «Программы» ({why})
+update.say_mode = Укажи режим: auto или ask.
+update.not_saved = Не удалось сохранить настройки на этом компьютере.

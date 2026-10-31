@@ -19,6 +19,9 @@
 //!
 //! Started from the disk image, tTerm offers once to move itself to
 //! Applications, where it can update itself.
+//!
+//! What it says, in its menus and questions, is in the language shown
+//! (from 0.6.0, the engine's say.rs).
 
 use crate::{background, App};
 use std::os::unix::process::CommandExt;
@@ -29,6 +32,7 @@ use std::time::Duration;
 use tauri::menu::MenuItem;
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tterm_engine::say::{say, Said};
 use tterm_engine::update::{Phase, Status, Wish};
 use tterm_engine::Engine;
 
@@ -39,10 +43,18 @@ const BY_ITSELF_EVERY: Duration = Duration::from_secs(30);
 #[derive(Default)]
 pub struct MenuLine(pub Mutex<Option<MenuItem<Wry>>>);
 
-pub const CHECK: &str = "Check for Updates…";
+fn restart_text(lang: &str, version: &str) -> String {
+    Said::new("menu.restart_update").with("version", version).said_in(lang)
+}
 
-fn restart_text(version: &str) -> String {
-    format!("Restart to Update ({version})…")
+/// The item's words now: Restart to Update with a version ready, else
+/// Check for Updates….
+pub fn menu_text(handle: &AppHandle, lang: &str) -> String {
+    let engine = handle.state::<App>().engine.clone();
+    match engine.updates.ready() {
+        Some((version, _)) => restart_text(lang, &version),
+        None => say(lang, "menu.check_updates"),
+    }
 }
 
 fn ready_version(status: &Status) -> Option<String> {
@@ -137,10 +149,17 @@ fn quiet_now(handle: &AppHandle, engine: &Engine) -> bool {
 /// tTerm's menu and the icon in the menu bar say whether a version is
 /// ready.
 fn show(handle: &AppHandle, ready: Option<String>) {
+    let lang = handle.state::<App>().engine.language_now();
     if let Some(item) = handle.state::<MenuLine>().0.lock().unwrap().as_ref() {
-        let _ = item.set_text(ready.as_deref().map(restart_text).unwrap_or_else(|| CHECK.to_string()));
+        let _ = item.set_text(ready.as_deref().map(|v| restart_text(lang, v)).unwrap_or_else(|| say(lang, "menu.check_updates")));
     }
-    background::set_update(handle, ready.map(|v| restart_text(&v)));
+    background::set_update(handle, ready.map(|v| restart_text(lang, &v)));
+}
+
+/// The words of the icon's Restart to Update, in the language shown: for
+/// its menu made again in another (background.rs).
+pub fn bar_text(engine: &Engine) -> Option<String> {
+    engine.updates.ready().map(|(v, _)| restart_text(engine.language_now(), &v))
 }
 
 /// tTerm's menu: Restart to Update when a version is ready; otherwise a look
@@ -171,12 +190,13 @@ pub fn restart(handle: &AppHandle) {
     };
     background::show_window(handle);
     let h = handle.clone();
+    let lang = app.engine.language_now();
     handle
         .dialog()
-        .message(format!("tTerm {version} is ready. {text}"))
-        .title("Restart tTerm to update?")
+        .message(Said::new("restart.text").with("version", version).with("question", text).said_in(lang))
+        .title(say(lang, "restart.title"))
         .kind(MessageDialogKind::Warning)
-        .buttons(MessageDialogButtons::OkCancelCustom("Restart".into(), "Later".into()))
+        .buttons(MessageDialogButtons::OkCancelCustom(say(lang, "restart.yes"), say(lang, "restart.later")))
         .show(move |yes| {
             if yes {
                 // The window was shown for the question: back as it was.
@@ -201,7 +221,8 @@ fn go(handle: &AppHandle, background: bool) -> bool {
         Err(why) => {
             app.asking.store(false, Ordering::SeqCst);
             if !background {
-                handle.dialog().message(why).title("tTerm could not update").kind(MessageDialogKind::Warning).show(|_| {});
+                let lang = app.engine.language_now();
+                handle.dialog().message(why.said_in(lang)).title(say(lang, "restart.failed")).kind(MessageDialogKind::Warning).show(|_| {});
             } else {
                 eprintln!("tterm: could not update: {why}");
             }
@@ -220,11 +241,11 @@ fn offer_move(handle: &AppHandle, at_start: bool) {
     if app.quitting.load(Ordering::SeqCst) || app.asking.swap(true, Ordering::SeqCst) {
         return;
     }
-    let mut text = String::from("tTerm runs from the disk image now. It can update itself only from the Applications folder.");
-    if let Some(ending) = crate::question(&app.engine) {
-        text.push_str(" It opens again from there. ");
-        text.push_str(&ending);
-    }
+    let lang = app.engine.language_now();
+    let text = match crate::question(&app.engine) {
+        Some(ending) => Said::new("move.text_ends").with("question", ending).said_in(lang),
+        None => say(lang, "move.text"),
+    };
     if !at_start {
         background::show_window(handle);
     }
@@ -232,9 +253,9 @@ fn offer_move(handle: &AppHandle, at_start: bool) {
     handle
         .dialog()
         .message(text)
-        .title("Move tTerm to Applications?")
+        .title(say(lang, "move.title"))
         .kind(MessageDialogKind::Info)
-        .buttons(MessageDialogButtons::OkCancelCustom("Move to Applications".into(), "Not now".into()))
+        .buttons(MessageDialogButtons::OkCancelCustom(say(lang, "move.yes"), say(lang, "move.no")))
         .show(move |yes| {
             let app: App = h.state::<App>().inner().clone();
             if !yes {
@@ -248,7 +269,8 @@ fn offer_move(handle: &AppHandle, at_start: bool) {
                 }
                 Err(why) => {
                     app.asking.store(false, Ordering::SeqCst);
-                    h.dialog().message(why).title("tTerm could not move").kind(MessageDialogKind::Warning).show(|_| {});
+                    let lang = app.engine.language_now();
+                    h.dialog().message(why.said_in(lang)).title(say(lang, "move.failed")).kind(MessageDialogKind::Warning).show(|_| {});
                 }
             }
         });
@@ -292,5 +314,16 @@ mod tests {
         let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         assert_eq!(config["identifier"], tterm_engine::update::BUNDLE_ID);
         assert!(config["app"].get("appDirectoriesOverride").is_none(), "Tauri's places as they are");
+    }
+
+    /// The bundle names for macOS the twelve languages the app speaks
+    /// (0.6.0): its own words for the rest follow them.
+    #[test]
+    fn the_bundle_says_the_languages_the_app_speaks() {
+        let plist = include_str!("../Info.plist");
+        let start = plist.find("<key>CFBundleLocalizations</key>").unwrap();
+        let listed: Vec<&str> = plist[start..].split("</array>").next().unwrap().split("<string>").skip(1).map(|s| s.split("</string>").next().unwrap()).collect();
+        let spoken: Vec<&str> = tterm_engine::say::LANGUAGES.iter().map(|l| if *l == "zh-CN" { "zh-Hans" } else { l }).collect();
+        assert_eq!(listed, spoken);
     }
 }

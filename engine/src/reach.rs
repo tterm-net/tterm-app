@@ -26,6 +26,7 @@
 //! file is another tTerm Web's or tTerm says the key is no machine of this
 //! account's. On again, tTerm is asked again.
 
+use crate::say::Said;
 use crate::account::{is_token, Account, AgentEnv, Verdict};
 use crate::hosted::Hosted;
 use crate::link::{self, Config, Log, Outcome, State, Timing};
@@ -77,16 +78,18 @@ pub enum Status {
 }
 
 impl Status {
-    /// One line, for the app's menu in the menu bar.
-    pub fn line(&self, here: &str) -> String {
-        match self {
-            Status::Off | Status::Removed(_) | Status::Closed(_) => format!("{here} is not opened from tTerm Web"),
-            Status::Starting => "tTerm is starting…".to_string(),
-            Status::SignedOut => "Not signed in to tTerm".to_string(),
-            Status::Waiting(_) | Status::Connecting => "Connecting to tTerm Web…".to_string(),
-            Status::Online { name } => format!("{name}: online in tTerm Web"),
-            Status::NoNetwork => "No network: trying again".to_string(),
-        }
+    /// One line, for the app's menu in the menu bar, in a language (from
+    /// 0.6.0, say.rs).
+    pub fn line(&self, lang: &str) -> String {
+        let said = match self {
+            Status::Off | Status::Removed(_) | Status::Closed(_) => Said::new("bar.not_opened"),
+            Status::Starting => Said::new("bar.starting"),
+            Status::SignedOut => Said::new("bar.signed_out"),
+            Status::Waiting(_) | Status::Connecting => Said::new("bar.connecting"),
+            Status::Online { name } => Said::new("bar.online").with("name", name.clone()),
+            Status::NoNetwork => Said::new("bar.no_network"),
+        };
+        said.said_in(lang)
     }
 }
 
@@ -820,9 +823,9 @@ mod tests {
 
     #[test]
     fn what_the_menu_bar_says() {
-        assert_eq!(Status::Online { name: "MacBook".into() }.line("This Mac"), "MacBook: online in tTerm Web");
-        assert_eq!(Status::Off.line("This Mac"), "This Mac is not opened from tTerm Web");
-        assert_eq!(Status::Closed("x".into()).line("This Mac"), "This Mac is not opened from tTerm Web");
-        assert_eq!(Status::Waiting("x".into()).line("This Mac"), "Connecting to tTerm Web…");
+        assert_eq!(Status::Online { name: "MacBook".into() }.line("en"), "MacBook: online in tTerm Web");
+        assert_eq!(Status::Off.line("en"), "This Mac is not opened from tTerm Web");
+        assert_eq!(Status::Closed("x".into()).line("en"), "This Mac is not opened from tTerm Web");
+        assert_eq!(Status::Waiting("x".into()).line("en"), "Connecting to tTerm Web…");
     }
 }

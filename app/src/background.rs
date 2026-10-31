@@ -13,6 +13,9 @@
 //!
 //! On a Mac only, for now: elsewhere closing the window quits the app, and
 //! the link runs while it does.
+//!
+//! The icon's menu is in the language shown (from 0.6.0), made again when
+//! another is chosen (relabel).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +26,7 @@ use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, Wry};
 use tterm_engine::reach::Status;
+use tterm_engine::say::say;
 use tterm_engine::Engine;
 
 /// The icon in the menu bar, 36 by 36, black on nothing: the two signs of
@@ -35,9 +39,6 @@ pub const LABEL: &str = "net.tterm.app";
 
 /// Started at login by its autostart: no window until asked for.
 pub const ARG: &str = "--background";
-
-/// What the menu bar says of this computer.
-const HERE: &str = "This Mac";
 
 /// Whether this system keeps the app in the background.
 pub fn supported() -> bool {
@@ -127,7 +128,8 @@ fn show(handle: &AppHandle, kept: Option<bool>, now: &Status) {
         }
     }
     let on = *bar.on.lock().unwrap() == Some(true);
-    *bar.said.lock().unwrap() = now.line(HERE);
+    let lang = handle.state::<crate::App>().engine.language_now();
+    *bar.said.lock().unwrap() = now.line(lang);
     let update = bar.update.lock().unwrap().clone();
     let mut tray = bar.tray.lock().unwrap();
     if on && tray.is_none() {
@@ -137,8 +139,31 @@ fn show(handle: &AppHandle, kept: Option<bool>, now: &Status) {
         }
     }
     if let Some((icon, line)) = tray.as_ref() {
-        let _ = line.set_text(now.line(HERE));
+        let _ = line.set_text(now.line(lang));
         let _ = icon.set_visible(on);
+    }
+}
+
+/// The icon's menu in the language shown now, with what it said (another
+/// language chosen: main.rs). On the main thread, as `show`.
+pub fn relabel(handle: &AppHandle) {
+    let bar = handle.state::<Bar>();
+    let engine = handle.state::<crate::App>().engine.clone();
+    let lang = engine.language_now();
+    let said = engine.reach.status().borrow().line(lang);
+    *bar.said.lock().unwrap() = said.clone();
+    let update = crate::updates::bar_text(&engine);
+    *bar.update.lock().unwrap() = update.clone();
+    let mut tray = bar.tray.lock().unwrap();
+    let Some((icon, line)) = tray.as_mut() else { return };
+    match menu(handle, update.as_deref()) {
+        Ok((menu, fresh)) => {
+            let _ = fresh.set_text(said);
+            if icon.set_menu(Some(menu)).is_ok() {
+                *line = fresh;
+            }
+        }
+        Err(e) => eprintln!("tterm: the menu in the menu bar: {e}"),
     }
 }
 
@@ -175,10 +200,11 @@ pub fn hidden(handle: &AppHandle) -> bool {
 /// version is ready, Quit tTerm. Its items are the app's menu's (main.rs,
 /// on_menu).
 fn menu(handle: &AppHandle, update: Option<&str>) -> tauri::Result<(Menu<Wry>, MenuItem<Wry>)> {
-    let open = MenuItem::with_id(handle, "bar-open", "Open tTerm", true, None::<&str>)?;
-    let line = MenuItem::with_id(handle, "bar-status", HERE, false, None::<&str>)?;
+    let lang = handle.state::<crate::App>().engine.language_now();
+    let open = MenuItem::with_id(handle, "bar-open", say(lang, "bar.open"), true, None::<&str>)?;
+    let line = MenuItem::with_id(handle, "bar-status", say(lang, "bar.not_opened"), false, None::<&str>)?;
     let restart = update.map(|text| MenuItem::with_id(handle, "bar-update", text, true, None::<&str>)).transpose()?;
-    let quit = MenuItem::with_id(handle, "bar-quit", "Quit tTerm", true, None::<&str>)?;
+    let quit = MenuItem::with_id(handle, "bar-quit", say(lang, "menu.quit"), true, None::<&str>)?;
     let (one, two) = (PredefinedMenuItem::separator(handle)?, PredefinedMenuItem::separator(handle)?);
     let mut items: Vec<&dyn IsMenuItem<Wry>> = vec![&open, &one, &line, &two];
     if let Some(restart) = restart.as_ref() {

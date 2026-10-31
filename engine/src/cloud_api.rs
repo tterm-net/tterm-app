@@ -84,6 +84,17 @@ pub async fn route(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], 
     let here = account.here();
     match (method.as_str(), parts.as_slice()) {
         ("GET", ["api", "state"]) => Some(state(engine, &account, flags.background).await),
+        // The language goes to the account, and is kept here too (from
+        // 0.6.0): the app's words follow it, and so does this computer once
+        // signed out.
+        ("PATCH", ["api", "me"]) => {
+            let answer = proxy(&account, &method, path, body, flags).await;
+            let chosen = serde_json::from_slice::<Value>(body).ok().and_then(|b| b.get("language").and_then(Value::as_str).and_then(crate::say::language));
+            if let (Some(l), true) = (chosen, (200..300).contains(&answer.status)) {
+                keep_language(engine, l);
+            }
+            Some(answer)
+        }
         ("POST", ["api", "auth", "signout"]) => {
             account.sign_out().await;
             engine.align_terminals();
@@ -141,10 +152,38 @@ pub async fn route(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], 
     }
 }
 
+/// The language the account has, kept on this computer too: the app's
+/// words in it, and this computer's page once signed out.
+fn keep_language(engine: &Engine, language: &'static str) {
+    if engine.settings.lock().unwrap().language.as_deref() == Some(language) {
+        return;
+    }
+    if let Err(e) = engine.save_settings(|s| s.language = Some(language.to_string())) {
+        eprintln!("tterm: could not keep the language: {e}");
+    }
+}
+
+/// The page's state with the language (from 0.6.0): the account's, which
+/// this computer keeps too; while the account has none, the one chosen
+/// here before signing in; and the system's, for the page to show until
+/// one is chosen.
+fn with_language(engine: &Engine, state: &mut Value) {
+    let me = &mut state["me"];
+    if !me.is_object() {
+        return;
+    }
+    match me.get("language").and_then(Value::as_str).and_then(crate::say::language) {
+        Some(theirs) => keep_language(engine, theirs),
+        None => me["language"] = json!(engine.settings.lock().unwrap().language),
+    }
+    me["systemLanguage"] = json!(engine.system_language);
+}
+
 /// Settings' Updates, the strip and the card (from 0.5.0): `/api/app/update`
 /// and what follows it in `rest`.
 fn update(engine: &Arc<Engine>, method: &str, rest: &[&str], body: &[u8]) -> Response {
     let updates = &engine.updates;
+    let lang = engine.language_now();
     match (method, rest) {
         ("GET", []) => Response::json(200, updates.json(engine)),
         ("PUT", []) => {
@@ -153,8 +192,8 @@ fn update(engine: &Arc<Engine>, method: &str, rest: &[&str], body: &[u8]) -> Res
             };
             match updates.set_mode(engine, &mode) {
                 Ok(()) => Response::json(200, updates.json(engine)),
-                Err(why) if why.starts_with("Say") => Response::error(422, &why),
-                Err(why) => Response::error(500, &why),
+                Err(why) if why.key == "update.say_mode" => Response::error(422, &why.said_in(lang)),
+                Err(why) => Response::error(500, &why.said_in(lang)),
             }
         }
         ("POST", ["check"]) => {
@@ -165,9 +204,9 @@ fn update(engine: &Arc<Engine>, method: &str, rest: &[&str], body: &[u8]) -> Res
             updates.seen();
             Response::json(200, updates.json(engine))
         }
-        ("POST", ["restart"]) if updates.ready().is_none() => Response::error(409, "No new version is ready."),
+        ("POST", ["restart"]) if updates.ready().is_none() => Response::error(409, &crate::say::say(lang, "update.none_ready")),
         ("POST", ["move"]) if !matches!(updates.now().phase, crate::update::Phase::Unavailable { movable: true, .. }) => {
-            Response::error(409, "tTerm does not run from the disk image.")
+            Response::error(409, &crate::say::say(lang, "update.not_disk_image"))
         }
         ("POST", [wish @ ("restart" | "move")]) => {
             let wish = if *wish == "restart" { Wish::Restart } else { Wish::Move };
@@ -267,7 +306,9 @@ async fn state(engine: &Arc<Engine>, account: &Arc<Account>, background: bool) -
     if offline {
         machine["online"] = json!(true);
     }
-    Response::json(200, account::merge_state(&cloud, account.here().as_ref(), machine, terminals, offline))
+    let mut merged = account::merge_state(&cloud, account.here().as_ref(), machine, terminals, offline);
+    with_language(engine, &mut merged);
+    Response::json(200, merged)
 }
 
 /// What the page needs when tTerm never answered since signing in: the
@@ -288,6 +329,7 @@ fn bare_state(engine: &Arc<Engine>, account: &Arc<Account>) -> Value {
             "projectTint": settings.project_tint,
             "plan": "free",
             "email": me["email"].clone(),
+            "language": settings.language,
         },
         "projects": [{
             "id": here.as_ref().map(|h| h.project_id.clone()).unwrap_or_else(|| settings.project_id.to_string()),

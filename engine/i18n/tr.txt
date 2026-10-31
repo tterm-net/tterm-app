@@ -1,0 +1,104 @@
+# Words of tTerm for Mac in English: one a line, `key = text` (engine/src/say.rs).
+# Every language has the same keys (a check of say.rs sees to it). {name} is a
+# value the app puts in; a counting string has a form for each plural of the
+# language, "one: … | other: …", and {n} is the count. tTerm, tTerm Web and
+# names of terminals and machines are not translated. The page of tTerm Web
+# has its own words, in tterm-web: these are the app's alone.
+
+# ------------------------------------------------------------ menu: tTerm's menu at the top of the screen
+menu.about = tTerm Hakkında
+menu.check_updates = Güncellemeleri Denetle…
+# {version}: 0.6.1.
+menu.restart_update = Yeniden Başlat ve Güncelle ({version})…
+menu.services = Servisler
+menu.hide = tTerm'i Gizle
+menu.hide_others = Diğerlerini Gizle
+menu.show_all = Tümünü Göster
+menu.quit = tTerm'den Çık
+menu.edit = Düzen
+menu.undo = Geri Al
+menu.redo = Yinele
+menu.cut = Kes
+menu.copy = Kopyala
+menu.paste = Yapıştır
+menu.select_all = Tümünü Seç
+menu.view = Görüntü
+menu.reload = Yeniden Yükle
+menu.window = Pencere
+menu.new_terminal = Yeni Terminal
+menu.close_tab = Sekmeyi Kapat
+menu.minimize = Simge Durumuna Küçült
+menu.zoom = Büyüt/Küçült
+
+# ------------------------------------------------------------ bar: the icon in the menu bar and its menu
+bar.open = tTerm'i Aç
+# The line under Open tTerm: how the link to tTerm Web is.
+bar.not_opened = Bu Mac'e tTerm Web'den erişilemiyor
+bar.starting = tTerm başlatılıyor…
+bar.signed_out = tTerm'e giriş yapılmadı
+bar.connecting = tTerm Web'e bağlanılıyor…
+# {name} is this Mac's name in tTerm Web.
+bar.online = {name}: tTerm Web'de çevrimiçi
+bar.no_network = Ağ yok: yeniden deneniyor
+
+# ------------------------------------------------------------ quit: asked before tTerm quits with terminals open
+quit.title = tTerm'den çıkılsın mı?
+quit.yes = Çık
+quit.cancel = Vazgeç
+quit.shells_end = one: {n} terminalin kabuğu sonlanacak. | other: {n} terminalin kabukları sonlanacak.
+# {running} lists what runs: "npm run dev in P/web-01, vim in P/db".
+quit.running = one: Şu anda çalışıyor: {running}. Durdurulacak ve {n} terminalin kabuğu sonlanacak. | other: Şu anda çalışıyor: {running}. Durdurulacak ve {n} terminalin kabukları sonlanacak.
+quit.running_item = {label} terminalinde {name}
+# How the language lists them, two at a time: "a, b" ("a、b" in Japanese).
+quit.list = {a}, {b}
+# Two sentences one after the other: "a b" ("ab" in Chinese and Japanese).
+quit.both = {first} {second}
+quit.web_end = one: tTerm Web'den bu bilgisayarda açılan {n} terminal sonlanacak. | other: tTerm Web'den bu bilgisayarda açılan {n} terminal sonlanacak.
+
+# ------------------------------------------------------------ restart: a new version ready
+restart.title = Güncelleme için tTerm yeniden başlatılsın mı?
+# {question} is one of quit.*: what ends with the restart.
+restart.text = tTerm {version} hazır. {question}
+restart.yes = Yeniden Başlat
+restart.later = Daha Sonra
+restart.failed = tTerm güncellenemedi
+
+# ------------------------------------------------------------ move: tTerm opened from the disk image
+move.title = tTerm, Uygulamalar klasörüne taşınsın mı?
+move.text = tTerm şu anda disk görüntüsünden çalışıyor. Kendini yalnızca Uygulamalar klasöründen güncelleyebilir.
+# {question} is one of quit.*: what ends with the move.
+move.text_ends = tTerm şu anda disk görüntüsünden çalışıyor. Kendini yalnızca Uygulamalar klasöründen güncelleyebilir. Ardından oradan yeniden açılır. {question}
+move.yes = Uygulamalar Klasörüne Taşı
+move.no = Şimdi Değil
+move.failed = tTerm taşınamadı
+
+# ------------------------------------------------------------ update: why tTerm does not update, in Settings' Updates and the questions
+# {why} is the reason, as macOS or the network said it, in English.
+update.only_mac = Yalnızca Mac için tTerm kendini günceller.
+update.from_build = Bu tTerm, tTerm.app'ten değil, bir derlemeden çalışıyor: kendini güncellemez.
+update.not_app = tTerm, tTerm.app'ten değil, bir derlemeden çalışıyor.
+update.from_disk_image = tTerm disk görüntüsünden çalışıyor. Uygulamalar klasörüne taşıdığında kendini günceller.
+update.not_disk_image = tTerm disk görüntüsünden çalışmıyor.
+# {place} is a folder: /Users/denis/Desktop.
+update.cannot_change = tTerm, bulunduğu {place} klasöründe değişiklik yapamıyor, bu yüzden kendini güncelleyemiyor. Yeni sürümü tterm.net'ten indir.
+update.no_key = Bu tTerm'de yerleşik bir sürüm anahtarı yok.
+update.could_not_look = Yeni sürüm aranamadı: {why}
+update.could_not_take = tTerm {version} alınamadı: {why}. tTerm olduğu gibi kalıyor.
+update.none_ready = Hazır yeni bir sürüm yok.
+update.busy = Yeni sürüm yüklenemedi: başka bir tTerm kendini güncelliyor. Birazdan yeniden dene.
+update.replaced = Başka bir tTerm yeni sürümü zaten yerine koydu. Bundan çık ve tTerm'i yeniden aç.
+update.changed = tTerm'in yanında bekleyen tTerm {version}, denetlendikten sonra değişti; yüklenmeyecek. Yeniden alınacak.
+update.not_written = Güncelleme kaydedilemedi: {why}
+update.app_management = macOS, tTerm'in tTerm {version} sürümünü yerine koymasına izin vermedi ({why}). Sistem Ayarları > Gizlilik ve Güvenlik > Uygulama Yönetimi bölümünde tTerm'e izin ver ve yeniden güncellemek için Yeniden başlat ve güncelle düğmesine bas.
+update.not_in_place = tTerm {version} yerine konamadı: {why}
+update.cannot_watch = Önceki sürüm izleyemiyor: {why}
+update.in_place_unwatched = tTerm {version} yerine kondu, ancak önceki sürüm onun başlamasını izleyemiyor ({why}). tTerm'den çık ve yeniden aç.
+# {to} did not start, {from} is the version before, which came back.
+update.came_back = tTerm {to} bu Mac'te başlamadı, bu yüzden tTerm {from} geri geldi. Ondan sonraki sürüm alınacak.
+update.only_mac_moves = Yalnızca Mac için tTerm kendini taşır.
+update.applications_locked = Hesabın Uygulamalar klasöründe değişiklik yapamıyor. tTerm'i Finder'da oraya sürükle.
+update.newer_there = Uygulamalar klasöründe daha yeni bir tTerm ({version}) var: onu aç.
+update.not_copied = tTerm, Uygulamalar klasörüne kopyalanamadı ({why})
+update.not_moved = tTerm, Uygulamalar klasörüne yerleştirilemedi ({why})
+update.say_mode = Modu belirt: auto ya da ask.
+update.not_saved = Ayarlar bu bilgisayara kaydedilemedi.

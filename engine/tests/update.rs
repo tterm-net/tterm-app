@@ -395,7 +395,7 @@ async fn a_version_that_does_not_come_up_goes_and_is_not_taken_again() {
     // only a version after the one that did not come up.
     let before = Updates::new(config(&site, release.public, "0.5.0", &app, &data));
     let note = before.now().note.unwrap();
-    assert!(note.contains("tTerm 0.5.1 did not start on this Mac, so tTerm 0.5.0 came back"), "{note}");
+    assert!(note.english().contains("tTerm 0.5.1 did not start on this Mac, so tTerm 0.5.0 came back"), "{note}");
     assert!(!file.exists());
     before.look().await;
     assert_eq!(before.now().phase, Phase::Idle);
@@ -441,7 +441,7 @@ async fn what_is_not_as_signed_or_not_tterm_is_not_taken() {
         let updates = Updates::new(config(&site, release.public, "0.5.0", &app, &data));
         updates.look().await;
         match updates.now().phase {
-            Phase::Failed(why) => assert!(why.contains(said), "{why}"),
+            Phase::Failed(why) => assert!(why.english().contains(said), "{why}"),
             other => panic!("{said}: {other:?}"),
         }
         assert_eq!(beside(&dir), ["tTerm.app"], "{said}: nothing left beside the app");
@@ -484,7 +484,7 @@ async fn what_is_not_as_signed_or_not_tterm_is_not_taken() {
         let updates = Updates::new(config(&site, release.public, "0.5.0", &app, &data));
         updates.look().await;
         match updates.now().phase {
-            Phase::Failed(why) => assert!(why.contains(said) && why.contains("tTerm stays as it is"), "{said}: {why}"),
+            Phase::Failed(why) => assert!(why.english().contains(said) && why.english().contains("tTerm stays as it is"), "{said}: {why}"),
             other => panic!("{said}: {other:?}"),
         }
         assert_eq!(beside(&dir), ["tTerm.app"], "{said}: nothing left beside the app");
@@ -510,8 +510,8 @@ async fn only_over_https() {
     updates.look().await;
     match updates.now().phase {
         Phase::Failed(why) => {
-            assert!(why.contains(&format!("not over HTTPS: http://127.0.0.1:{}/storage/tTerm.app.tar.gz", site.port)), "{why}");
-            assert!(!why.contains("SECRET"), "the token stays out: {why}");
+            assert!(why.english().contains(&format!("not over HTTPS: http://127.0.0.1:{}/storage/tTerm.app.tar.gz", site.port)), "{why}");
+            assert!(!why.english().contains("SECRET"), "the token stays out: {why}");
         }
         other => panic!("{other:?}"),
     }
@@ -524,7 +524,7 @@ async fn where_it_cannot_update_itself_it_says_why() {
     let data = dir.join("data");
     let plain = |bundle: Option<PathBuf>| Config { releases: "https://127.0.0.1:9/releases".into(), key: None, current: "0.5.0".into(), bundle, data_dir: data.clone(), anywhere: true };
     let built = Updates::new(plain(None));
-    assert!(matches!(built.now().phase, Phase::Unavailable { ref why, movable: false } if why.contains("runs from a build")));
+    assert!(matches!(built.now().phase, Phase::Unavailable { ref why, movable: false } if why.english().contains("runs from a build")));
     let translocated = Updates::new(plain(Some("/private/var/folders/x/T/AppTranslocation/1234/d/tTerm.app".into())));
     assert_eq!(translocated.now().phase, Phase::Unavailable { why: update::FROM_DISK_IMAGE.into(), movable: true });
     let engine = tterm_engine::Engine::new(&dir.join("engine")).unwrap();
@@ -533,9 +533,9 @@ async fn where_it_cannot_update_itself_it_says_why() {
     // Another system than macOS, without the checks' word for it.
     let elsewhere = Updates::new(Config { anywhere: false, ..plain(Some(dir.join("Applications/tTerm.app"))) });
     if cfg!(target_os = "macos") {
-        assert!(!matches!(elsewhere.now().phase, Phase::Unavailable { ref why, .. } if why.contains("Only tTerm for Mac")));
+        assert!(!matches!(elsewhere.now().phase, Phase::Unavailable { ref why, .. } if why.english().contains("Only tTerm for Mac")));
     } else {
-        assert!(matches!(elsewhere.now().phase, Phase::Unavailable { ref why, movable: false } if why.contains("Only tTerm for Mac")));
+        assert!(matches!(elsewhere.now().phase, Phase::Unavailable { ref why, movable: false } if why.english().contains("Only tTerm for Mac")));
     }
     // A folder this account cannot change (root changes any).
     if unsafe { libc::geteuid() } != 0 {
@@ -543,7 +543,7 @@ async fn where_it_cannot_update_itself_it_says_why() {
         let app = bundle(&locked, update::BUNDLE_ID, "0.5.0", "0.5.0");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
         let cannot = Updates::new(plain(Some(app)));
-        assert!(matches!(cannot.now().phase, Phase::Unavailable { ref why, movable: false } if why.contains("cannot change")), "{:?}", cannot.now().phase);
+        assert!(matches!(cannot.now().phase, Phase::Unavailable { ref why, movable: false } if why.english().contains("cannot change")), "{:?}", cannot.now().phase);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -611,7 +611,7 @@ async fn a_release_taken_back_goes_and_one_left_ready_is_not_downloaded_again() 
     // is taken again from its file.
     std::fs::write(staged.join("Contents/MacOS/tterm"), "#!/bin/sh\necho 0.5.1\n").unwrap();
     let why = third.install(false, false).unwrap_err();
-    assert!(why.contains("changed since it was checked"), "{why}");
+    assert!(why.english().contains("changed since it was checked"), "{why}");
     assert_eq!(version_of(&app), "0.5.0");
     assert!(!staged.exists() && !update::trial_file(&data).exists());
     assert!(matches!(third.now().phase, Phase::Failed(_)));
@@ -665,7 +665,7 @@ async fn a_newer_version_taken_back_is_not_ready_while_an_older_one_comes() {
     }
     updates.look().await;
     match updates.now().phase {
-        Phase::Failed(why) => assert!(why.contains("Could not take tTerm 0.5.1") && why.contains("HTTP 404"), "{why}"),
+        Phase::Failed(why) => assert!(why.english().contains("Could not take tTerm 0.5.1") && why.english().contains("HTTP 404"), "{why}"),
         other => panic!("{other:?}"),
     }
     assert!(!apps.join(".tTerm-0.5.2.update").exists(), "0.5.2 gone from beside the app");
@@ -1039,7 +1039,7 @@ async fn two_copies_ready_and_one_goes_in_the_other_touches_nothing() {
     // The second one, at its quit, its Restart or by itself: nothing of it
     // goes in, and nothing beside the app goes.
     let why = second.install(false, false).unwrap_err();
-    assert!(why.contains("Another tTerm has put a new version in place"), "{why}");
+    assert!(why.english().contains("Another tTerm has put a new version in place"), "{why}");
     assert_eq!(second.now().phase, Phase::Idle);
     assert_eq!(version_of(&staged), "0.5.0", "the version before, as it was");
     assert_eq!(version_of(&app), "0.5.1");
@@ -1124,7 +1124,7 @@ async fn a_copy_under_another_name_in_the_same_folder_touches_nothing() {
     // tTerm 2.app, at its quit or its Restart, tidying, looking: nothing of
     // the first one's version before goes.
     let why = second.install(false, false).unwrap_err();
-    assert!(why.contains("Another tTerm has put a new version in place"), "{why}");
+    assert!(why.english().contains("Another tTerm has put a new version in place"), "{why}");
     assert_eq!(second.now().phase, Phase::Idle);
     second.tidy();
     second.look().await;

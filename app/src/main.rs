@@ -10,6 +10,8 @@
 //! opens this computer to tTerm Web too, in the agent's place, and while it
 //! does it stays in the menu bar with its window closed (background.rs).
 //! From 0.5.0 it updates itself (updates.rs, and the engine's update.rs).
+//! From 0.6.0 its menus and questions are in the language the page shows
+//! (the engine's say.rs), and change with it.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -29,11 +31,18 @@ use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilde
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tterm_engine::say::{say, Said};
 use tterm_engine::socket::PageSocket;
 use tterm_engine::terminals::Outgoing;
 use tterm_engine::{api, upstream, Engine};
 
 const SHIM: &str = include_str!("shim.js");
+
+/// The shim, after the language the app shows: the page's first paint is
+/// in it before the page has asked anything (from 0.6.0).
+fn shim(lang: &str) -> String {
+    format!("window.__ttermLanguage = {};\n{SHIM}", serde_json::to_string(lang).unwrap_or_else(|_| "\"en\"".into()))
+}
 /// What one answer to the page's socket carries at most.
 const BATCH_MAX: usize = 1024 * 1024;
 /// How long the page's socket waits for something to come, at most, before
@@ -216,29 +225,35 @@ fn sweep_sockets(app: &App) {
 
 // ---------------------------------------------------------------- quitting
 
+/// What ends if tTerm quits now, in the language shown; None when nothing
+/// would.
 fn question(engine: &Engine) -> Option<String> {
-    let open = engine.terminals.live().len();
+    let lang = engine.language_now();
+    let open = engine.terminals.live().len() as u64;
     // Opened from tTerm Web on this computer, through the app (from 0.4.0).
-    let web = engine.reach.terminals();
+    let web = engine.reach.terminals() as u64;
     if open == 0 && web == 0 {
         return None;
     }
     let mut said = Vec::new();
     if open > 0 {
-        let shells = if open == 1 { "The shell of 1 terminal".to_string() } else { format!("The shells of {open} terminals") };
         let busy = engine.terminals.busy();
         if busy.is_empty() {
-            said.push(format!("{shells} will end."));
+            said.push(Said::new("quit.shells_end").count(open).said_in(lang));
         } else {
-            let running: Vec<String> = busy.iter().map(|(label, name)| format!("{name} in {label}")).collect();
-            said.push(format!("Running now: {}. It will stop, and {} will end.", running.join(", "), shells.to_lowercase()));
+            // Listed and put together as the language does ("a, b", "a、b").
+            let running = busy
+                .iter()
+                .map(|(label, name)| Said::new("quit.running_item").with("name", name.clone()).with("label", label.clone()).said_in(lang))
+                .reduce(|a, b| Said::new("quit.list").with("a", a).with("b", b).said_in(lang))
+                .unwrap_or_default();
+            said.push(Said::new("quit.running").count(open).with("running", running).said_in(lang));
         }
     }
     if web > 0 {
-        let terminals = if web == 1 { "1 terminal".to_string() } else { format!("{web} terminals") };
-        said.push(format!("{terminals} opened from tTerm Web on this computer will end."));
+        said.push(Said::new("quit.web_end").count(web).said_in(lang));
     }
-    Some(said.join(" "))
+    said.into_iter().reduce(|a, b| Said::new("quit.both").with("first", a).with("second", b).said_in(lang))
 }
 
 /// For a quit from outside the app (see mac.rs): true when it may go at
@@ -272,12 +287,13 @@ fn ask_to_quit(handle: &AppHandle) {
     // menu bar only (a quit from there, a logout).
     background::show_window(handle);
     let handle2 = handle.clone();
+    let lang = app.engine.language_now();
     handle
         .dialog()
         .message(text)
-        .title("Quit tTerm?")
+        .title(say(lang, "quit.title"))
         .kind(MessageDialogKind::Warning)
-        .buttons(MessageDialogButtons::OkCancelCustom("Quit".into(), "Cancel".into()))
+        .buttons(MessageDialogButtons::OkCancelCustom(say(lang, "quit.yes"), say(lang, "quit.cancel")))
         .show(move |yes| {
             if yes {
                 quit(handle2, app);
@@ -306,11 +322,14 @@ fn quit(handle: AppHandle, app: App) {
 /// The menu of the Mac: the usual items, with Copy and Paste (the page needs
 /// them for its keys), and the tab's Cmd+T and Cmd+W. Built everywhere, so
 /// that every build checks it; set on the Mac only, where apps have one.
-fn menu(handle: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+/// In the language shown (from 0.6.0), and made again in another
+/// (follow_language). Enter Full Screen is macOS's own, in its words.
+fn menu(handle: &AppHandle, lang: &str) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
+    let t = |key: &'static str| say(lang, key);
     let about = PredefinedMenuItem::about(
         handle,
-        Some("About tTerm"),
+        Some(&t("menu.about")),
         Some(AboutMetadata {
             name: Some("tTerm".into()),
             version: Some(env!("CARGO_PKG_VERSION").into()),
@@ -322,7 +341,7 @@ fn menu(handle: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     )?;
     // Check for Updates…, or Restart to Update once a version is ready
     // (updates.rs).
-    let update = MenuItem::with_id(handle, "update", updates::CHECK, true, None::<&str>)?;
+    let update = MenuItem::with_id(handle, "update", updates::menu_text(handle, lang), true, None::<&str>)?;
     *handle.state::<updates::MenuLine>().0.lock().unwrap() = Some(update.clone());
     let app_menu = Submenu::with_items(
         handle,
@@ -332,52 +351,78 @@ fn menu(handle: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
             &about,
             &update,
             &PredefinedMenuItem::separator(handle)?,
-            &PredefinedMenuItem::services(handle, None)?,
+            &PredefinedMenuItem::services(handle, Some(&t("menu.services")))?,
             &PredefinedMenuItem::separator(handle)?,
-            &PredefinedMenuItem::hide(handle, None)?,
-            &PredefinedMenuItem::hide_others(handle, None)?,
-            &PredefinedMenuItem::show_all(handle, None)?,
+            &PredefinedMenuItem::hide(handle, Some(&t("menu.hide")))?,
+            &PredefinedMenuItem::hide_others(handle, Some(&t("menu.hide_others")))?,
+            &PredefinedMenuItem::show_all(handle, Some(&t("menu.show_all")))?,
             &PredefinedMenuItem::separator(handle)?,
-            &MenuItem::with_id(handle, "quit", "Quit tTerm", true, Some("CmdOrCtrl+Q"))?,
+            &MenuItem::with_id(handle, "quit", t("menu.quit"), true, Some("CmdOrCtrl+Q"))?,
         ],
     )?;
     let edit = Submenu::with_items(
         handle,
-        "Edit",
+        t("menu.edit"),
         true,
         &[
-            &PredefinedMenuItem::undo(handle, None)?,
-            &PredefinedMenuItem::redo(handle, None)?,
+            &PredefinedMenuItem::undo(handle, Some(&t("menu.undo")))?,
+            &PredefinedMenuItem::redo(handle, Some(&t("menu.redo")))?,
             &PredefinedMenuItem::separator(handle)?,
-            &PredefinedMenuItem::cut(handle, None)?,
-            &PredefinedMenuItem::copy(handle, None)?,
-            &PredefinedMenuItem::paste(handle, None)?,
-            &PredefinedMenuItem::select_all(handle, None)?,
+            &PredefinedMenuItem::cut(handle, Some(&t("menu.cut")))?,
+            &PredefinedMenuItem::copy(handle, Some(&t("menu.copy")))?,
+            &PredefinedMenuItem::paste(handle, Some(&t("menu.paste")))?,
+            &PredefinedMenuItem::select_all(handle, Some(&t("menu.select_all")))?,
         ],
     )?;
     let view = Submenu::with_items(
         handle,
-        "View",
+        t("menu.view"),
         true,
         &[
-            &MenuItem::with_id(handle, "reload", "Reload", true, Some("CmdOrCtrl+R"))?,
+            &MenuItem::with_id(handle, "reload", t("menu.reload"), true, Some("CmdOrCtrl+R"))?,
             &PredefinedMenuItem::separator(handle)?,
             &PredefinedMenuItem::fullscreen(handle, None)?,
         ],
     )?;
     let window = Submenu::with_items(
         handle,
-        "Window",
+        t("menu.window"),
         true,
         &[
-            &MenuItem::with_id(handle, "new-terminal", "New Terminal", true, Some("CmdOrCtrl+T"))?,
-            &MenuItem::with_id(handle, "close-tab", "Close Tab", true, Some("CmdOrCtrl+W"))?,
+            &MenuItem::with_id(handle, "new-terminal", t("menu.new_terminal"), true, Some("CmdOrCtrl+T"))?,
+            &MenuItem::with_id(handle, "close-tab", t("menu.close_tab"), true, Some("CmdOrCtrl+W"))?,
             &PredefinedMenuItem::separator(handle)?,
-            &PredefinedMenuItem::minimize(handle, None)?,
-            &PredefinedMenuItem::maximize(handle, None)?,
+            &PredefinedMenuItem::minimize(handle, Some(&t("menu.minimize")))?,
+            &PredefinedMenuItem::maximize(handle, Some(&t("menu.zoom")))?,
         ],
     )?;
     Menu::with_items(handle, &[&app_menu, &edit, &view, &window])
+}
+
+/// Another language chosen (on the page, or in the account): tTerm's menu
+/// and the icon's in it, at once.
+fn follow_language(handle: &AppHandle, engine: &Engine) {
+    let mut language = engine.language.subscribe();
+    let h = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        while language.changed().await.is_ok() {
+            let lang = *language.borrow_and_update();
+            let on = h.clone();
+            let _ = h.run_on_main_thread(move || {
+                if cfg!(target_os = "macos") {
+                    match menu(&on, lang) {
+                        Ok(m) => {
+                            if let Err(e) = on.set_menu(m) {
+                                eprintln!("tterm: tTerm's menu in another language: {e}");
+                            }
+                        }
+                        Err(e) => eprintln!("tterm: tTerm's menu in another language: {e}"),
+                    }
+                }
+                background::relabel(&on);
+            });
+        }
+    });
 }
 
 fn on_menu(handle: &AppHandle, id: &str) {
@@ -516,10 +561,11 @@ fn main() {
                 });
             }
 
-            let m = menu(app.handle())?;
+            let m = menu(app.handle(), shared.engine.language_now())?;
             if cfg!(target_os = "macos") {
                 app.set_menu(m)?;
             }
+            follow_language(app.handle(), &shared.engine);
             #[cfg(target_os = "macos")]
             mac::install(app.handle());
             app.on_menu_event(|handle, event| on_menu(handle, event.id().as_ref()));
@@ -535,7 +581,7 @@ fn main() {
                 .inner_size(1280.0, 820.0)
                 .min_inner_size(640.0, 420.0)
                 .background_color(tauri::window::Color(19, 20, 23, 255))
-                .initialization_script(SHIM)
+                .initialization_script(shim(shared.engine.language_now()))
                 .on_navigation(move |url| {
                     if ours(url) {
                         return true;

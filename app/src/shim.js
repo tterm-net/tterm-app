@@ -26,6 +26,19 @@
     // Without storage the page remembers nothing; nothing to do.
   }
 
+  // The language the app shows (from 0.6.0, main.rs puts it before this
+  // script): the page's first paint is in it the first time, before the
+  // page has asked the engine anything. After that the page keeps the one
+  // it showed last, and the state says the rest.
+  try {
+    const shown = window.__ttermLanguage;
+    if (typeof shown === "string" && localStorage.getItem("tterm.language") === null) {
+      localStorage.setItem("tterm.language", shown);
+    }
+  } catch {
+    // Without storage the page starts in the browser's language.
+  }
+
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   const invoke = (cmd, args, options) =>
@@ -340,7 +353,9 @@
   window.__ttermApp = {
     action(name) {
       if (name === "new-terminal") {
-        document.querySelector('.plus-wrap button[aria-label="New terminal"]')?.click();
+        // Found by what it does, not by its label: that is in the language
+        // shown (from 0.6.0).
+        document.querySelector('.plus-wrap button[data-action="new-terminal"]')?.click();
       } else if (name === "close-tab") {
         document.querySelector(".tab.current .tab-close")?.click();
       } else if (name === "updates") {

@@ -120,6 +120,8 @@ struct Fake {
     /// The next request to a path is answered so, and with `{}`, once: tTerm
     /// in trouble, or a proxy's page in its place.
     fail_once: HashMap<String, u16>,
+    /// The account's language (from 0.6.0), None while none is chosen.
+    language: Option<String>,
 }
 
 impl Fake {
@@ -240,7 +242,7 @@ fn state_json(st: &Fake) -> Value {
         .collect();
     json!({
         "version": "0.1.6",
-        "me": {"id": "u1", "name": "Anna Fake", "firstName": "Anna", "initials": "AF", "theme": "dark", "projectTint": "badge", "plan": "free", "email": "anna@example.com"},
+        "me": {"id": "u1", "name": "Anna Fake", "firstName": "Anna", "initials": "AF", "theme": "dark", "projectTint": "badge", "plan": "free", "email": "anna@example.com", "language": st.language},
         "projects": [{"id": "p1", "name": "Personal", "code": "P", "color": "violet", "role": "owner", "personal": true, "own": true, "alone": true, "machines": machines, "folders": folders}],
         "terminals": [{"id": "11111111-1111-1111-1111-111111111111", "machineId": "s1", "machine": "web-01", "label": "P/web-01", "name": "1", "state": "open"}],
     })
@@ -929,6 +931,43 @@ async fn requests_go_to_tterm_in_the_apps_session() {
     assert_eq!(status, 403);
     let (status, _) = request(&a.engine, "DELETE", "/api/machines/s1", Value::Null).await;
     assert_eq!(status, 200);
+}
+
+/// The language (0.6.0): chosen before signing in, kept on this computer and
+/// shown while the account has none; chosen signed in, sent to tTerm and
+/// kept here too; the account's, once it has one, taken here; what the app
+/// says follows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_language_is_the_accounts_and_kept_here() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    let mut said = a.engine.language.subscribe();
+    let (status, _) = request(&a.engine, "PATCH", "/api/me", json!({"language": "de"})).await;
+    assert_eq!(status, 204);
+    assert!(said.has_changed().unwrap() && *said.borrow_and_update() == "de");
+    let me = state(&a.engine).await["me"].clone();
+    assert_eq!(me["language"], "de", "{me}");
+    assert!(me.get("systemLanguage").is_some(), "{me}");
+    let (status, _) = request(&a.engine, "PATCH", "/api/me", json!({"language": "klingon"})).await;
+    assert_eq!(status, 422);
+    sign_in(&cloud, &a).await;
+    // The account has none yet: the one chosen here.
+    assert_eq!(state(&a.engine).await["me"]["language"], "de");
+    let (status, _) = request(&a.engine, "PATCH", "/api/me", json!({"language": "fr"})).await;
+    assert_eq!(status, 200);
+    assert_eq!(a.engine.settings.lock().unwrap().language.as_deref(), Some("fr"), "kept here too");
+    assert_eq!(*said.borrow_and_update(), "fr");
+    // tTerm refuses it: not kept here.
+    cloud.st.lock().unwrap().fail_once.insert("/api/me".into(), 500);
+    let (status, _) = request(&a.engine, "PATCH", "/api/me", json!({"language": "ja"})).await;
+    assert_eq!(status, 500);
+    assert_eq!(a.engine.settings.lock().unwrap().language.as_deref(), Some("fr"));
+    // Chosen elsewhere, in the account: taken here, and said in it.
+    cloud.st.lock().unwrap().language = Some("pt-BR".into());
+    assert_eq!(state(&a.engine).await["me"]["language"], "pt-BR");
+    assert_eq!(a.engine.settings.lock().unwrap().language.as_deref(), Some("pt-BR"));
+    assert_eq!(*said.borrow_and_update(), "pt-BR");
+    assert_eq!(a.engine.language_now(), "pt-BR");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

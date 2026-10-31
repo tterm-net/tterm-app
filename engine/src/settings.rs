@@ -1,7 +1,7 @@
 //! What the app remembers on this computer, in a small JSON file in its own
 //! folder: the ids it gave the person, the project and the machine, and the
-//! person's choices (the name, the theme, the project's name, code and
-//! color). Written whole, under a new name first, so that a crash never
+//! person's choices (the name, the theme, the language, the project's name,
+//! code and color). Written whole, under a new name first, so that a crash never
 //! leaves half a file.
 
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,11 @@ pub struct Settings {
     /// How a new version goes in (from 0.5.0): one of UPDATES.
     #[serde(default = "default_updates")]
     pub updates: String,
+    /// The language chosen (from 0.6.0), one of say::LANGUAGES: here before
+    /// signing in; signed in, the account's, as tTerm last said it. None
+    /// until one is chosen: then the system's (Engine::language_now).
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 fn default_theme() -> String {
@@ -86,6 +91,7 @@ impl Settings {
             welcome_seen: false,
             open_from_web: None,
             updates: default_updates(),
+            language: None,
         }
     }
 
@@ -137,6 +143,9 @@ impl Settings {
         if !UPDATES.contains(&self.updates.as_str()) {
             self.updates = default_updates();
         }
+        if self.language.as_deref().is_some_and(|l| crate::say::language(l).is_none()) {
+            self.language = None;
+        }
         if !crate::names::valid_code(&self.project_code) {
             self.project_code = default_code();
         }
@@ -176,8 +185,14 @@ mod tests {
         assert_eq!(first, again);
         let mut changed = again.clone();
         changed.theme = "light".into();
+        changed.language = Some("pt-BR".into());
         changed.save(&dir).unwrap();
-        assert_eq!(Settings::load(&dir).unwrap().theme, "light");
+        let loaded = Settings::load(&dir).unwrap();
+        assert_eq!((loaded.theme.as_str(), loaded.language.as_deref()), ("light", Some("pt-BR")));
+        // A language that is none of the twelve is forgotten, not kept.
+        changed.language = Some("pt".into());
+        changed.save(&dir).unwrap();
+        assert_eq!(Settings::load(&dir).unwrap().language, None);
         std::fs::write(Settings::path(&dir), "{not json").unwrap();
         let fresh = Settings::load(&dir).unwrap();
         assert_ne!(fresh.machine_id, first.machine_id);

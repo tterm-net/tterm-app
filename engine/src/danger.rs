@@ -26,6 +26,11 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 /// Why a command was held back.
+///
+/// The page says `what` and `lost` in the language shown (0.6.0): it knows
+/// each by these exact English words (tterm-web's `web/src/danger.ts`) and
+/// has them as strings of its own. New words here need them there too, as
+/// in the core.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Danger {
     /// What it does, in plain words.

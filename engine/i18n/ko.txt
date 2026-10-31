@@ -1,0 +1,104 @@
+# Words of tTerm for Mac in English: one a line, `key = text` (engine/src/say.rs).
+# Every language has the same keys (a check of say.rs sees to it). {name} is a
+# value the app puts in; a counting string has a form for each plural of the
+# language, "one: … | other: …", and {n} is the count. tTerm, tTerm Web and
+# names of terminals and machines are not translated. The page of tTerm Web
+# has its own words, in tterm-web: these are the app's alone.
+
+# ------------------------------------------------------------ menu: tTerm's menu at the top of the screen
+menu.about = tTerm에 관하여
+menu.check_updates = 업데이트 확인…
+# {version}: 0.6.1.
+menu.restart_update = 재시작하여 업데이트({version})…
+menu.services = 서비스
+menu.hide = tTerm 가리기
+menu.hide_others = 기타 가리기
+menu.show_all = 모두 보기
+menu.quit = tTerm 종료
+menu.edit = 편집
+menu.undo = 실행 취소
+menu.redo = 실행 복귀
+menu.cut = 오려두기
+menu.copy = 복사하기
+menu.paste = 붙여넣기
+menu.select_all = 모두 선택
+menu.view = 보기
+menu.reload = 새로 고침
+menu.window = 윈도우
+menu.new_terminal = 새 터미널
+menu.close_tab = 탭 닫기
+menu.minimize = 최소화
+menu.zoom = 확대/축소
+
+# ------------------------------------------------------------ bar: the icon in the menu bar and its menu
+bar.open = tTerm 열기
+# The line under Open tTerm: how the link to tTerm Web is.
+bar.not_opened = tTerm Web에서 이 Mac을 열 수 없음
+bar.starting = tTerm을 시작하는 중…
+bar.signed_out = tTerm에 로그인하지 않음
+bar.connecting = tTerm Web에 연결하는 중…
+# {name} is this Mac's name in tTerm Web.
+bar.online = {name}: tTerm Web에서 온라인
+bar.no_network = 네트워크 없음: 다시 시도하는 중
+
+# ------------------------------------------------------------ quit: asked before tTerm quits with terminals open
+quit.title = tTerm을 종료할까요?
+quit.yes = 종료
+quit.cancel = 취소
+quit.shells_end = other: 터미널 {n}개의 셸이 종료돼요.
+# {running} lists what runs: "npm run dev in P/web-01, vim in P/db".
+quit.running = other: 지금 실행 중: {running}. 실행 중인 작업은 멈추고, 터미널 {n}개의 셸이 종료돼요.
+quit.running_item = {label}의 {name}
+# How the language lists them, two at a time: "a, b" ("a、b" in Japanese).
+quit.list = {a}, {b}
+# Two sentences one after the other: "a b" ("ab" in Chinese and Japanese).
+quit.both = {first} {second}
+quit.web_end = other: tTerm Web에서 이 컴퓨터에 연 터미널 {n}개가 종료돼요.
+
+# ------------------------------------------------------------ restart: a new version ready
+restart.title = tTerm을 재시작하여 업데이트할까요?
+# {question} is one of quit.*: what ends with the restart.
+restart.text = tTerm {version} 버전이 준비됐어요. {question}
+restart.yes = 재시작
+restart.later = 나중에
+restart.failed = tTerm을 업데이트하지 못했어요
+
+# ------------------------------------------------------------ move: tTerm opened from the disk image
+move.title = tTerm을 응용 프로그램 폴더로 옮길까요?
+move.text = 지금 tTerm이 디스크 이미지에서 실행되고 있어요. 응용 프로그램 폴더에서 실행해야 스스로 업데이트할 수 있어요.
+# {question} is one of quit.*: what ends with the move.
+move.text_ends = 지금 tTerm이 디스크 이미지에서 실행되고 있어요. 응용 프로그램 폴더에서 실행해야 스스로 업데이트할 수 있어요. 옮기면 그 폴더에서 다시 열려요. {question}
+move.yes = 응용 프로그램 폴더로 이동
+move.no = 나중에
+move.failed = tTerm을 옮기지 못했어요
+
+# ------------------------------------------------------------ update: why tTerm does not update, in Settings' Updates and the questions
+# {why} is the reason, as macOS or the network said it, in English.
+update.only_mac = Mac용 tTerm만 스스로 업데이트할 수 있어요.
+update.from_build = 이 tTerm은 tTerm.app이 아니라 빌드에서 실행되고 있어서 스스로 업데이트하지 않아요.
+update.not_app = tTerm이 tTerm.app이 아니라 빌드에서 실행되고 있어요.
+update.from_disk_image = tTerm이 디스크 이미지에서 실행되고 있어요. 응용 프로그램 폴더로 옮기면 스스로 업데이트돼요.
+update.not_disk_image = tTerm이 디스크 이미지에서 실행되고 있지 않아요.
+# {place} is a folder: /Users/denis/Desktop.
+update.cannot_change = tTerm이 들어 있는 {place} 폴더를 변경할 수 없어서 스스로 업데이트할 수 없어요. tterm.net에서 새 버전을 다운로드하세요.
+update.no_key = 이 tTerm에는 릴리스 키가 들어 있지 않아요.
+update.could_not_look = 새 버전을 확인하지 못했어요: {why}
+update.could_not_take = tTerm {version} 버전을 받지 못했어요: {why}. tTerm은 그대로 유지돼요.
+update.none_ready = 준비된 새 버전이 없어요.
+update.busy = 새 버전을 설치하지 못했어요: 다른 tTerm이 업데이트하는 중이에요. 잠시 후 다시 시도하세요.
+update.replaced = 다른 tTerm이 이미 새 버전을 설치했어요. 이 tTerm을 종료하고 tTerm을 다시 여세요.
+update.changed = tTerm 옆에서 대기하던 tTerm {version} 버전이 검증 후에 바뀌어서 설치하지 않아요. 다시 받을게요.
+update.not_written = 업데이트 정보를 기록하지 못했어요: {why}
+update.app_management = macOS가 tTerm {version} 버전의 설치를 허용하지 않았어요({why}). 시스템 설정 > 개인정보 보호 및 보안 > 앱 관리에서 tTerm을 허용한 다음, 재시작하여 업데이트 버튼을 다시 누르세요.
+update.not_in_place = tTerm {version} 버전을 설치하지 못했어요: {why}
+update.cannot_watch = 이전 버전이 새 버전의 시작을 지켜볼 수 없어요: {why}
+update.in_place_unwatched = tTerm {version} 버전을 설치했지만, 이전 버전이 새 버전의 시작을 지켜볼 수 없어요({why}). tTerm을 종료하고 다시 여세요.
+# {to} did not start, {from} is the version before, which came back.
+update.came_back = 이 Mac에서 tTerm {to} 버전이 시작되지 않아서 tTerm {from} 버전으로 되돌렸어요. tTerm {to} 버전은 건너뛰고 그다음 버전을 받을게요.
+update.only_mac_moves = Mac용 tTerm만 스스로 옮길 수 있어요.
+update.applications_locked = 이 사용자 계정으로는 응용 프로그램 폴더를 변경할 수 없어요. Finder에서 tTerm을 응용 프로그램 폴더로 드래그하세요.
+update.newer_there = 응용 프로그램 폴더에 더 새로운 tTerm({version})이 있어요. 그 tTerm을 여세요.
+update.not_copied = tTerm을 응용 프로그램 폴더에 복사하지 못했어요({why})
+update.not_moved = tTerm을 응용 프로그램 폴더에 넣지 못했어요({why})
+update.say_mode = 모드를 auto 또는 ask로 지정하세요.
+update.not_saved = 이 컴퓨터에 설정을 저장하지 못했어요.

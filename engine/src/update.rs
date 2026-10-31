@@ -61,6 +61,7 @@
 //! with the roots built in and the system's own, and the same proxy, if
 //! this computer has one (proxy.rs). Only over HTTPS, redirects included.
 
+use crate::say::Said;
 use crate::{proxy, Engine};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
@@ -146,7 +147,7 @@ const LOCK_WAIT: Duration = Duration::from_secs(20);
 
 /// What the page and the menus are told while tTerm cannot update itself
 /// from where it runs, and moving it helps.
-pub const FROM_DISK_IMAGE: &str = "tTerm runs from the disk image. Move it to Applications, and it updates itself.";
+pub const FROM_DISK_IMAGE: Said = Said::new("update.from_disk_image");
 
 // ------------------------------------------------------------- releases
 
@@ -1260,10 +1261,11 @@ pub enum Phase {
     /// it was then (`tree_digest`).
     Ready { version: String, staged: PathBuf, digest: String },
     Installing(String),
-    /// The last look or download did not work: why.
-    Failed(String),
+    /// The last look or download did not work: why. Kept as something to
+    /// say (say.rs), in the language Settings shows when it asks (from 0.6.0).
+    Failed(Said),
     /// Not here: why, and whether moving to Applications helps.
-    Unavailable { why: String, movable: bool },
+    Unavailable { why: Said, movable: bool },
 }
 
 impl Phase {
@@ -1297,7 +1299,7 @@ pub struct Status {
     pub checked_at: Option<i64>,
     pub updated: Option<Updated>,
     /// A line Settings keeps showing: the version that did not start here.
-    pub note: Option<String>,
+    pub note: Option<Said>,
 }
 
 /// What the page or a menu asks of the app.
@@ -1399,7 +1401,7 @@ impl Updates {
                 // Another start of this version is on trial.
                 Some(t) if t.to == config.current && !t.rolled_back => {}
                 Some(t) if t.rolled_back && t.from == config.current => {
-                    status.note = Some(format!("tTerm {} did not start on this Mac, so tTerm {} came back. The version after it will be taken.", t.to, t.from));
+                    status.note = Some(Said::new("update.came_back").with("to", t.to.clone()).with("from", t.from.clone()));
                     let _ = std::fs::remove_file(&file);
                 }
                 // For the version before to say.
@@ -1422,7 +1424,7 @@ impl Updates {
     /// An updater that does nothing: for the engine without the app.
     pub fn none(data_dir: &Path) -> Updates {
         let config = Config { releases: String::new(), key: None, current: crate::VERSION.to_string(), bundle: None, data_dir: data_dir.to_path_buf(), anywhere: false };
-        let (state, _) = watch::channel(Status { phase: Phase::Unavailable { why: "Only tTerm for Mac updates itself.".into(), movable: false }, next: None, ready_at: None, checked_at: None, updated: None, note: None });
+        let (state, _) = watch::channel(Status { phase: Phase::Unavailable { why: Said::new("update.only_mac"), movable: false }, next: None, ready_at: None, checked_at: None, updated: None, note: None });
         Updates { config, state, nudge: Notify::new(), wishes: Mutex::new(None), looked: Mutex::new(None), trial_mine: Mutex::new(false), withdrawn: Mutex::new(None), tidying: Mutex::new(()) }
     }
 
@@ -1518,13 +1520,15 @@ impl Updates {
         }
     }
 
-    /// What the page shows in Settings, the strip and the card.
+    /// What the page shows in Settings, the strip and the card: why not
+    /// and the note in the language shown (from 0.6.0).
     pub fn json(&self, engine: &Engine) -> Value {
         let s = self.now();
         let mode = engine.settings.lock().unwrap().updates.clone();
+        let lang = engine.language_now();
         let (problem, movable) = match &s.phase {
-            Phase::Failed(why) => (Some(why.clone()), false),
-            Phase::Unavailable { why, movable } => (Some(why.clone()), *movable),
+            Phase::Failed(why) => (Some(why.said_in(lang)), false),
+            Phase::Unavailable { why, movable } => (Some(why.said_in(lang)), *movable),
             _ => (None, false),
         };
         json!({
@@ -1538,7 +1542,7 @@ impl Updates {
             "problem": problem,
             "movable": movable,
             "updated": s.updated.as_ref().map(|u| json!({"from": u.from, "to": u.to, "notes": format!("{RELEASE_PAGE}{}", u.to)})),
-            "note": s.note,
+            "note": s.note.as_ref().map(|n| n.said_in(lang)),
         })
     }
 
@@ -1626,7 +1630,7 @@ impl Updates {
         }
         *self.looked.lock().unwrap() = Some(Instant::now());
         let (Some(key), Some(bundle)) = (self.config.key, self.config.bundle.clone()) else {
-            self.set(|s| s.phase = Phase::Failed("This tTerm has no release key built in.".into()));
+            self.set(|s| s.phase = Phase::Failed(Said::new("update.no_key")));
             return;
         };
         let data = self.config.data_dir.clone();
@@ -1691,7 +1695,7 @@ impl Updates {
                 self.set(|s| {
                     s.checked_at = Some(checked);
                     if matches!(s.phase, Phase::Checking) {
-                        s.phase = Phase::Failed(format!("Could not look for a new version: {why}"));
+                        s.phase = Phase::Failed(Said::new("update.could_not_look").with("why", why.clone()));
                     }
                 });
                 return;
@@ -1792,7 +1796,7 @@ impl Updates {
                 let _ = std::fs::remove_file(&kept);
                 self.set(|s| {
                     if matches!(s.phase, Phase::Downloading(_)) {
-                        s.phase = Phase::Failed(format!("Could not take tTerm {version}: {why}. tTerm stays as it is."));
+                        s.phase = Phase::Failed(Said::new("update.could_not_take").with("version", version.clone()).with("why", why.clone()));
                         s.next = Some(version.clone());
                     }
                 });
@@ -1806,8 +1810,8 @@ impl Updates {
     /// (`tree_digest`): it may have waited beside the app for days. What goes
     /// wrong leaves the app as it was and the version ready, for Restart
     /// again, unless it changed, or GitHub took it back meanwhile.
-    pub fn install(&self, relaunch: bool, background: bool) -> Result<String, String> {
-        let bundle = self.config.bundle.clone().ok_or("tTerm runs from a build, not from tTerm.app.")?;
+    pub fn install(&self, relaunch: bool, background: bool) -> Result<String, Said> {
+        let bundle = self.config.bundle.clone().ok_or(Said::new("update.not_app"))?;
         // From Ready to Installing in one step, never while tidying: a look
         // that ends meanwhile leaves it alone, and so does tidying.
         let mut taken = None;
@@ -1820,8 +1824,8 @@ impl Updates {
                 }
             });
         }
-        let (version, staged, digest) = taken.ok_or("No new version is ready.")?;
-        let back = |why: String| {
+        let (version, staged, digest) = taken.ok_or(Said::new("update.none_ready"))?;
+        let back = |why: Said| {
             let withdrawn = self.withdrawn.lock().unwrap().take().is_some_and(|w| w == version);
             let mut dropped = false;
             self.set(|s| {
@@ -1848,7 +1852,7 @@ impl Updates {
             // to the swap: another copy of the app at the same place changes
             // nothing of it meanwhile (`stage`, its `install`).
             let Some(_held) = lock(&self.config.data_dir, LOCK_WAIT) else {
-                return Err(back("Could not put the new version in: another tTerm is updating itself. Try again in a moment.".into()));
+                return Err(back(Said::new("update.busy")));
             };
             if self.replaced() {
                 // Another copy has put a version in: nothing of this one's
@@ -1861,11 +1865,11 @@ impl Updates {
                         s.next = None;
                     }
                 });
-                return Err("Another tTerm has put a new version in place already. Quit this one, and open tTerm again.".into());
+                return Err(Said::new("update.replaced"));
             }
             if tree_digest(&staged).ok().as_deref() != Some(digest.as_str()) {
                 let _ = remove_tree(&staged);
-                let why = format!("tTerm {version}, waiting beside tTerm, changed since it was checked, and does not go in. It is taken again.");
+                let why = Said::new("update.changed").with("version", version.clone());
                 self.withdrawn.lock().unwrap().take();
                 self.set(|s| {
                     s.phase = Phase::Failed(why.clone());
@@ -1878,7 +1882,7 @@ impl Updates {
             // between here and its watcher (a logout) leaves a new version
             // that is still watched when it starts, or the version before
             // with a trial that is not its own, which it drops.
-            write_trial(&file, &trial).map_err(|e| back(format!("Could not write down the update: {e}")))?;
+            write_trial(&file, &trial).map_err(|e| back(Said::new("update.not_written").with("why", e.to_string())))?;
             if let Err(e) = swap(&staged, &bundle) {
                 let _ = std::fs::remove_file(&file);
                 return Err(back(not_in_place(&version, &e)));
@@ -1889,7 +1893,7 @@ impl Updates {
             // The version before watching it start, or all back as it was.
             // Should even that not work, the new version stays in, with its
             // trial: it is watched when it starts.
-            let undo = |why: String| -> String {
+            let undo = |why: String| -> Said {
                 let swapped_back = match lock(&self.config.data_dir, LOCK_WAIT) {
                     Some(_held) => {
                         // Only while no start of the new version has taken
@@ -1904,17 +1908,17 @@ impl Updates {
                     None => false,
                 };
                 if swapped_back {
-                    return back(why);
+                    return back(Said::new("update.cannot_watch").with("why", why));
                 }
                 self.withdrawn.lock().unwrap().take();
-                let said = format!("tTerm {version} is in place, and the version before cannot watch it start ({why}). Quit tTerm and open it again.");
+                let said = Said::new("update.in_place_unwatched").with("version", version.clone()).with("why", why);
                 self.set(|s| {
                     s.phase = Phase::Failed(said.clone());
                     s.next = Some(version.clone());
                 });
                 said
             };
-            let watcher = program(&staged).map_err(|e| undo(format!("The version before cannot watch: {e}")))?;
+            let watcher = program(&staged).map_err(undo)?;
             let spawned = Command::new(watcher)
                 .arg("--finish-update")
                 .arg(&file)
@@ -1924,7 +1928,7 @@ impl Updates {
                 .stderr(Stdio::null())
                 .process_group(0)
                 .spawn()
-                .map_err(|e| undo(format!("The version before cannot watch: {e}")))?;
+                .map_err(|e| undo(e.to_string()))?;
             let (watcher, started) = reap(spawned);
             // Written down: the new version, started, sees it is watched.
             if let Some(_held) = lock(&self.config.data_dir, LOCK_WAIT) {
@@ -1938,26 +1942,26 @@ impl Updates {
 
     /// Copies tTerm to Applications, in the place of one there: where the app
     /// opens from next, once this one has quit.
-    pub fn move_to_applications(&self) -> Result<PathBuf, String> {
-        let bundle = self.config.bundle.clone().ok_or("tTerm runs from a build, not from tTerm.app.")?;
+    pub fn move_to_applications(&self) -> Result<PathBuf, Said> {
+        let bundle = self.config.bundle.clone().ok_or(Said::new("update.not_app"))?;
         let apps = Path::new("/Applications");
         if !cfg!(target_os = "macos") {
-            return Err("Only tTerm for Mac moves itself.".into());
+            return Err(Said::new("update.only_mac_moves"));
         }
         if !writable(apps) {
-            return Err("Your account cannot change Applications. Drag tTerm there in Finder.".into());
+            return Err(Said::new("update.applications_locked"));
         }
         let target = apps.join(APP_NAME);
         if let Ok(there) = read_plist(&target) {
             if there.identifier == BUNDLE_ID && newer(&there.version, &self.config.current) {
-                return Err(format!("A newer tTerm ({}) is in Applications: open that one.", there.version));
+                return Err(Said::new("update.newer_there").with("version", there.version));
             }
         }
         let copy = apps.join(format!(".tTerm-move-{}", std::process::id()));
         let _ = remove_tree(&copy);
         run(Command::new("/usr/bin/ditto").arg("--noqtn").arg(&bundle).arg(&copy), TOOL_TIME, None).map_err(|e| {
             let _ = remove_tree(&copy);
-            format!("Could not copy tTerm to Applications ({e})")
+            Said::new("update.not_copied").with("why", e.to_string())
         })?;
         let placed = if std::fs::symlink_metadata(&target).is_ok() {
             swap(&copy, &target).map(|()| {
@@ -1968,50 +1972,51 @@ impl Updates {
         };
         placed.map_err(|e| {
             let _ = remove_tree(&copy);
-            format!("Could not put tTerm in Applications ({e})")
+            Said::new("update.not_moved").with("why", e.to_string())
         })?;
         Ok(target)
     }
 
     /// Settings' Update by itself or Ask me first.
-    pub fn set_mode(&self, engine: &Engine, mode: &str) -> Result<(), String> {
+    pub fn set_mode(&self, engine: &Engine, mode: &str) -> Result<(), Said> {
         if !crate::settings::UPDATES.contains(&mode) {
-            return Err("Say mode: auto or ask.".into());
+            return Err(Said::new("update.say_mode"));
         }
-        engine.save_settings(|s| s.updates = mode.to_string()).map(|_| ()).map_err(|_| "Could not save the settings on this computer.".to_string())
+        engine.save_settings(|s| s.updates = mode.to_string()).map(|_| ()).map_err(|_| Said::new("update.not_saved"))
     }
 }
 
 /// Why the version ready did not go in place. On a Mac from 13 on, App
 /// Management may keep an app from changing apps, its own too, until the
 /// person allows it.
-fn not_in_place(version: &str, error: &std::io::Error) -> String {
-    if cfg!(target_os = "macos") && matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
-        format!("macOS did not let tTerm put tTerm {version} in its place ({error}). Allow tTerm in System Settings, Privacy & Security, App Management, and press Restart to update again.")
+fn not_in_place(version: &str, error: &std::io::Error) -> Said {
+    let key = if cfg!(target_os = "macos") && matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+        "update.app_management"
     } else {
-        format!("Could not put tTerm {version} in place: {error}")
-    }
+        "update.not_in_place"
+    };
+    Said::new(key).with("version", version).with("why", error.to_string())
 }
 
 /// Whether the app can update itself from where it runs: why not, and
 /// whether moving it to Applications helps.
-fn usable(config: &Config) -> Result<(), (String, bool)> {
+fn usable(config: &Config) -> Result<(), (Said, bool)> {
     if !cfg!(target_os = "macos") && !config.anywhere {
-        return Err(("Only tTerm for Mac updates itself.".into(), false));
+        return Err((Said::new("update.only_mac"), false));
     }
     let Some(bundle) = &config.bundle else {
-        return Err(("This tTerm runs from a build, not from tTerm.app: it does not update itself.".into(), false));
+        return Err((Said::new("update.from_build"), false));
     };
     let path = bundle.to_string_lossy();
     if path.contains("/AppTranslocation/") {
-        return Err((FROM_DISK_IMAGE.into(), true));
+        return Err((FROM_DISK_IMAGE, true));
     }
     let parent = bundle.parent().unwrap_or(Path::new("/"));
     if !writable(parent) || !writable(bundle) {
         if path.starts_with("/Volumes/") {
-            return Err((FROM_DISK_IMAGE.into(), true));
+            return Err((FROM_DISK_IMAGE, true));
         }
-        return Err((format!("tTerm cannot change {}, where it is, so it cannot update itself. Download the new version from tterm.net.", parent.display()), false));
+        return Err((Said::new("update.cannot_change").with("place", parent.display().to_string()), false));
     }
     Ok(())
 }

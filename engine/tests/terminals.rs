@@ -238,6 +238,18 @@ async fn the_api_answers_like_the_core() {
     assert_eq!(named["initials"], "DG");
     let (status, _) = request(&e, "PATCH", "/api/me", json!({"theme": "neon"})).await;
     assert_eq!(status, 422);
+    // The language (0.6.0): none until chosen, then the one chosen, and
+    // the app's words in it.
+    let (_, before) = request(&e, "GET", "/api/state", Value::Null).await;
+    assert_eq!(before["me"]["language"], Value::Null);
+    let (status, _) = request(&e, "PATCH", "/api/me", json!({"language": "ru"})).await;
+    assert_eq!(status, 204);
+    assert_eq!(e.language_now(), "ru");
+    assert_eq!(*e.language.borrow(), "ru");
+    for wrong in [json!("RU"), json!("pt"), json!(7), json!("")] {
+        let (status, _) = request(&e, "PATCH", "/api/me", json!({"language": wrong})).await;
+        assert_eq!(status, 422, "{wrong}");
+    }
 
     let pid = project["id"].as_str().unwrap();
     let (status, edited) = request(&e, "PATCH", &format!("/api/projects/{pid}"), json!({"name": "Home", "code": "h", "color": "teal"})).await;
@@ -246,10 +258,12 @@ async fn the_api_answers_like_the_core() {
     let (_, state) = request(&e, "GET", "/api/state", Value::Null).await;
     assert_eq!(state["projects"][0]["name"], "Home");
     assert_eq!(state["me"]["theme"], "light");
+    assert_eq!(state["me"]["language"], "ru");
 
     // Remembered on the computer.
     let again = Engine::new(&e.data_dir).unwrap();
     assert_eq!(again.state_json().await["projects"][0]["color"], "teal");
+    assert_eq!(again.language_now(), "ru");
     // No one has signed in: the page shows this computer only.
     assert_eq!(state["local"], true);
     let (status, refused) = request(&e, "POST", "/api/auth/link", json!({})).await;

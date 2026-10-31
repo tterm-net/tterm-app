@@ -1,0 +1,104 @@
+# Words of tTerm for Mac in English: one a line, `key = text` (engine/src/say.rs).
+# Every language has the same keys (a check of say.rs sees to it). {name} is a
+# value the app puts in; a counting string has a form for each plural of the
+# language, "one: … | other: …", and {n} is the count. tTerm, tTerm Web and
+# names of terminals and machines are not translated. The page of tTerm Web
+# has its own words, in tterm-web: these are the app's alone.
+
+# ------------------------------------------------------------ menu: tTerm's menu at the top of the screen
+menu.about = tTerm について
+menu.check_updates = アップデートを確認…
+# {version}: 0.6.1.
+menu.restart_update = 再起動してアップデート（{version}）…
+menu.services = サービス
+menu.hide = tTerm を隠す
+menu.hide_others = ほかを隠す
+menu.show_all = すべてを表示
+menu.quit = tTerm を終了
+menu.edit = 編集
+menu.undo = 取り消す
+menu.redo = やり直す
+menu.cut = カット
+menu.copy = コピー
+menu.paste = ペースト
+menu.select_all = すべてを選択
+menu.view = 表示
+menu.reload = 再読み込み
+menu.window = ウインドウ
+menu.new_terminal = 新規ターミナル
+menu.close_tab = タブを閉じる
+menu.minimize = しまう
+menu.zoom = 拡大/縮小
+
+# ------------------------------------------------------------ bar: the icon in the menu bar and its menu
+bar.open = tTerm を開く
+# The line under Open tTerm: how the link to tTerm Web is.
+bar.not_opened = この Mac は tTerm Web から開けない設定です
+bar.starting = tTerm を起動しています…
+bar.signed_out = tTerm にサインインしていません
+bar.connecting = tTerm Web に接続しています…
+# {name} is this Mac's name in tTerm Web.
+bar.online = {name}：tTerm Web でオンライン
+bar.no_network = ネットワークに接続されていません：再試行中
+
+# ------------------------------------------------------------ quit: asked before tTerm quits with terminals open
+quit.title = tTerm を終了しますか？
+quit.yes = 終了
+quit.cancel = キャンセル
+quit.shells_end = other: ターミナル {n} 個のシェルが終了します。
+# {running} lists what runs: "npm run dev in P/web-01, vim in P/db".
+quit.running = other: 実行中のコマンドが停止します：{running}。ターミナル {n} 個のシェルも終了します。
+quit.running_item = {label} の {name}
+# How the language lists them, two at a time: "a, b" ("a、b" in Japanese).
+quit.list = {a}、{b}
+# Two sentences one after the other: "a b" ("ab" in Chinese and Japanese).
+quit.both = {first}{second}
+quit.web_end = other: tTerm Web からこのコンピューターで開いたターミナル {n} 個が終了します。
+
+# ------------------------------------------------------------ restart: a new version ready
+restart.title = tTerm を再起動してアップデートしますか？
+# {question} is one of quit.*: what ends with the restart.
+restart.text = tTerm {version} の準備ができました。{question}
+restart.yes = 再起動
+restart.later = あとで
+restart.failed = tTerm をアップデートできませんでした
+
+# ------------------------------------------------------------ move: tTerm opened from the disk image
+move.title = tTerm を「アプリケーション」フォルダーに移動しますか？
+move.text = tTerm は現在ディスクイメージから実行されています。自動でアップデートできるのは、「アプリケーション」フォルダーにある場合だけです。
+# {question} is one of quit.*: what ends with the move.
+move.text_ends = tTerm は現在ディスクイメージから実行されています。自動でアップデートできるのは、「アプリケーション」フォルダーにある場合だけです。移動後は、そこから起動し直します。{question}
+move.yes = 「アプリケーション」に移動
+move.no = 今はしない
+move.failed = tTerm を移動できませんでした
+
+# ------------------------------------------------------------ update: why tTerm does not update, in Settings' Updates and the questions
+# {why} is the reason, as macOS or the network said it, in English.
+update.only_mac = 自動でアップデートできるのは Mac 版 tTerm だけです。
+update.from_build = この tTerm は tTerm.app ではなくビルドから実行されているため、自動ではアップデートされません。
+update.not_app = tTerm は tTerm.app ではなくビルドから実行されています。
+update.from_disk_image = tTerm はディスクイメージから実行されています。「アプリケーション」フォルダーに移動すると、自動でアップデートされます。
+update.not_disk_image = tTerm はディスクイメージから実行されていません。
+# {place} is a folder: /Users/denis/Desktop.
+update.cannot_change = tTerm は自身が置かれている {place} を変更できないため、自動でアップデートできません。新しいバージョンを tterm.net からダウンロードしてください。
+update.no_key = この tTerm にはリリース用の鍵が組み込まれていません。
+update.could_not_look = 新しいバージョンを確認できませんでした：{why}
+update.could_not_take = tTerm {version} を取得できませんでした：{why}。tTerm は現在のバージョンのままです。
+update.none_ready = 準備のできた新しいバージョンはありません。
+update.busy = 新しいバージョンをインストールできませんでした：別の tTerm がアップデート中です。しばらくしてから、もう一度お試しください。
+update.replaced = 別の tTerm がすでに新しいバージョンを配置しています。こちらを終了して、tTerm をもう一度開いてください。
+update.changed = tTerm の隣で待機していた tTerm {version} が確認後に変更されていたため、インストールしません。もう一度取得します。
+update.not_written = アップデートの情報を書き込めませんでした：{why}
+update.app_management = macOS が、tTerm による tTerm {version} の配置を許可しませんでした（{why}）。「システム設定」＞「プライバシーとセキュリティ」＞「App管理」で tTerm を許可してから、もう一度「再起動してアップデート」を押してください。
+update.not_in_place = tTerm {version} を配置できませんでした：{why}
+update.cannot_watch = 以前のバージョンが起動を監視できません：{why}
+update.in_place_unwatched = tTerm {version} を配置しましたが、以前のバージョンがその起動を監視できません（{why}）。tTerm を終了して、もう一度開いてください。
+# {to} did not start, {from} is the version before, which came back.
+update.came_back = この Mac で tTerm {to} が起動しなかったため、tTerm {from} に戻りました。その次のバージョンが出たら、そちらを取得します。
+update.only_mac_moves = 自分で移動できるのは Mac 版 tTerm だけです。
+update.applications_locked = お使いのアカウントでは「アプリケーション」フォルダーを変更できません。Finder で tTerm をそこにドラッグしてください。
+update.newer_there = 「アプリケーション」フォルダーに、より新しい tTerm（{version}）があります。そちらを開いてください。
+update.not_copied = tTerm を「アプリケーション」フォルダーにコピーできませんでした（{why}）
+update.not_moved = tTerm を「アプリケーション」フォルダーに配置できませんでした（{why}）
+update.say_mode = モードを auto または ask で指定してください。
+update.not_saved = このコンピューターに設定を保存できませんでした。

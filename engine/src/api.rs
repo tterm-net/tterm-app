@@ -513,12 +513,24 @@ fn patch_me(engine: &Arc<Engine>, body: &[u8]) -> Response {
             return Response::error(422, "The tint is one of badge, block.");
         }
     }
+    // The language of the page and of the app's words (from 0.6.0).
+    let language = match change.get("language") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(l)) => match crate::say::language(l) {
+            Some(l) => Some(l),
+            None => return Response::error(422, &format!("The language is one of {}.", crate::say::LANGUAGES.join(", "))),
+        },
+        Some(_) => return Response::error(422, &format!("The language is one of {}.", crate::say::LANGUAGES.join(", "))),
+    };
     let saved = engine.save_settings(|s| {
         if let Some(t) = theme {
             s.theme = t;
         }
         if let Some(t) = tint {
             s.project_tint = t;
+        }
+        if let Some(l) = language {
+            s.language = Some(l.to_string());
         }
         if let Some(n) = name.clone() {
             s.name = Some(n);

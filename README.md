@@ -26,7 +26,8 @@ itself, the rest in tTerm Web, as one list. From 0.4.0 the app opens this
 computer to tTerm Web and your phone itself, in the place of tTerm Web's
 agent, and stays in the menu bar for it. From 0.5.0 it updates itself, from
 tTerm's releases here, and is signed with tTerm's own certificate (see
-Updates). Windows comes later.
+Updates). From 0.6.0 it speaks the twelve languages of tterm.net, its menus
+too (see Languages). Windows comes later.
 
 ## How it is made
 
@@ -326,6 +327,28 @@ opened the first time with Open Anyway in System Settings → Privacy &
 Security; its updates are not asked about. On macOS 13 and later, App
 Management may ask once whether tTerm may change apps. The agent is signed
 with the same certificate, as `net.tterm.agent`.
+
+## Languages
+
+From 0.6.0 the app speaks the twelve languages of the site and of tTerm
+Web's page: English, Deutsch, Español, Français, Italiano, Polski,
+Português, Türkçe, Русский, 日本語, 한국어 and 简体中文. The page has its own
+words (tTerm Web 0.1.16, `web/src/i18n`); the app's own are in
+`engine/i18n/<language>.txt`, files of the same kind, built into the
+program (`engine/src/say.rs`): tTerm's menu, the icon in the menu bar and
+its line, the questions at Quit, Restart to update and Move to
+Applications, and what Settings' Updates says when tTerm does not update.
+
+The language is the one chosen in the account's menu, Language: before
+signing in it is kept on this Mac (`settings.json`); signed in, in the
+account, and on this Mac too, so the menus are in it and stay in it after
+signing out. Until one is chosen, the system's, when it is one of the
+twelve (System Settings, Language & Region, tTerm's own there first),
+otherwise English. A choice changes the page and the menus at once. What
+macOS adds by itself (Enter Full Screen, dictation, the About window's own
+words) is in the system's language: the bundle names the twelve
+(`app/Info.plist`). The engine's other messages, about what went wrong, are
+in English for now.
 
 ## Building
 

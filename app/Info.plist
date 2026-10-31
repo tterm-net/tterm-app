@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged by Tauri into tTerm.app's own (from 0.6.0). The twelve
+     languages tTerm speaks (the engine's say.rs): macOS then says its own
+     words in the app, such as Enter Full Screen and the About window, in
+     the system's language when it is one of them, and System Settings
+     offers them for tTerm under Language & Region, Applications. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>en</string>
+		<string>de</string>
+		<string>es</string>
+		<string>fr</string>
+		<string>it</string>
+		<string>pl</string>
+		<string>pt-BR</string>
+		<string>tr</string>
+		<string>ru</string>
+		<string>ja</string>
+		<string>ko</string>
+		<string>zh-Hans</string>
+	</array>
+</dict>
+</plist>

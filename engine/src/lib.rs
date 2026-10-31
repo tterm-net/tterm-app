@@ -24,6 +24,8 @@
 //! tterm-agent did: the agent without a window (agent/) is this engine with
 //! that link, through the computer's proxy if it has one (proxy.rs). From
 //! 0.4.0 the app runs that link itself, in the agent's place (reach.rs).
+//! From 0.6.0 the app's own words come in twelve languages (say.rs), the
+//! page's: the one chosen, here or in the account, or the system's.
 
 #[cfg(feature = "cloud")]
 pub mod account;
@@ -45,6 +47,7 @@ pub mod proxy;
 pub mod pty;
 #[cfg(feature = "cloud")]
 pub mod reach;
+pub mod say;
 pub mod search;
 pub mod settings;
 pub mod shell;
@@ -106,6 +109,11 @@ pub struct Engine {
     /// tTerm for Mac updating itself (from 0.5.0).
     #[cfg(feature = "cloud")]
     pub updates: update::Updates,
+    /// The system's language, when it is one of the twelve (from 0.6.0).
+    pub system_language: Option<&'static str>,
+    /// The language the app's own words are in now (language_now): the app
+    /// says its menus anew when it changes.
+    pub language: tokio::sync::watch::Sender<&'static str>,
 }
 
 /// What every request for notes says while they cannot be read.
@@ -151,6 +159,8 @@ impl Engine {
             }
         }
         store.close_left_open(LEFT_OPEN);
+        let system_language = say::system();
+        let language = tokio::sync::watch::Sender::new(Self::language_of(&settings, system_language));
         Ok(Engine {
             data_dir: data_dir.to_path_buf(),
             settings: Mutex::new(settings),
@@ -167,7 +177,21 @@ impl Engine {
             reach: reach::Reach::new(&pty::home_dir().join(".tterm-web").join("env")),
             #[cfg(feature = "cloud")]
             updates: update::Updates::none(data_dir),
+            system_language,
+            language,
         })
+    }
+
+    /// The language of the app's words (from 0.6.0): the one chosen, else
+    /// the system's when it is one of the twelve, else English. The page
+    /// shows the same (it gets both in the state: `language`,
+    /// `systemLanguage`).
+    pub fn language_now(&self) -> &'static str {
+        Self::language_of(&self.settings.lock().unwrap(), self.system_language)
+    }
+
+    fn language_of(settings: &Settings, system: Option<&'static str>) -> &'static str {
+        settings.language.as_deref().and_then(say::language).or(system).unwrap_or("en")
     }
 
     /// What runs alongside, on the async runtime: the passport is read once,
@@ -229,6 +253,14 @@ impl Engine {
         change(&mut next);
         next.save(&self.data_dir)?;
         *settings = next.clone();
+        drop(settings);
+        // Another language chosen: the app's words follow it.
+        let now = Self::language_of(&next, self.system_language);
+        self.language.send_if_modified(|was| {
+            let changed = *was != now;
+            *was = now;
+            changed
+        });
         Ok(next)
     }
 
@@ -377,6 +409,10 @@ impl Engine {
             "projectTint": s.project_tint,
             "plan": "free",
             "email": Value::Null,
+            // The language chosen here (from 0.6.0), or null; and the
+            // system's, which the page shows until one is chosen.
+            "language": s.language,
+            "systemLanguage": self.system_language,
         })
     }
 

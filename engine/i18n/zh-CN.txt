@@ -1,0 +1,104 @@
+# Words of tTerm for Mac in English: one a line, `key = text` (engine/src/say.rs).
+# Every language has the same keys (a check of say.rs sees to it). {name} is a
+# value the app puts in; a counting string has a form for each plural of the
+# language, "one: … | other: …", and {n} is the count. tTerm, tTerm Web and
+# names of terminals and machines are not translated. The page of tTerm Web
+# has its own words, in tterm-web: these are the app's alone.
+
+# ------------------------------------------------------------ menu: tTerm's menu at the top of the screen
+menu.about = 关于 tTerm
+menu.check_updates = 检查更新…
+# {version}: 0.6.1.
+menu.restart_update = 重新启动以更新（{version}）…
+menu.services = 服务
+menu.hide = 隐藏 tTerm
+menu.hide_others = 隐藏其他
+menu.show_all = 全部显示
+menu.quit = 退出 tTerm
+menu.edit = 编辑
+menu.undo = 撤销
+menu.redo = 重做
+menu.cut = 剪切
+menu.copy = 拷贝
+menu.paste = 粘贴
+menu.select_all = 全选
+menu.view = 显示
+menu.reload = 重新载入
+menu.window = 窗口
+menu.new_terminal = 新建终端
+menu.close_tab = 关闭标签页
+menu.minimize = 最小化
+menu.zoom = 缩放
+
+# ------------------------------------------------------------ bar: the icon in the menu bar and its menu
+bar.open = 打开 tTerm
+# The line under Open tTerm: how the link to tTerm Web is.
+bar.not_opened = 这台 Mac 未向 tTerm Web 开放
+bar.starting = tTerm 正在启动…
+bar.signed_out = 未登录 tTerm
+bar.connecting = 正在连接 tTerm Web…
+# {name} is this Mac's name in tTerm Web.
+bar.online = {name}：在 tTerm Web 中在线
+bar.no_network = 无网络：正在重试
+
+# ------------------------------------------------------------ quit: asked before tTerm quits with terminals open
+quit.title = 退出 tTerm？
+quit.yes = 退出
+quit.cancel = 取消
+quit.shells_end = other: {n} 个终端的 shell 将会结束。
+# {running} lists what runs: "npm run dev in P/web-01, vim in P/db".
+quit.running = other: {running} 正在运行，将会停止。{n} 个终端的 shell 也将结束。
+quit.running_item = {label} 中的 {name}
+# How the language lists them, two at a time: "a, b" ("a、b" in Japanese).
+quit.list = {a}、{b}
+# Two sentences one after the other: "a b" ("ab" in Chinese and Japanese).
+quit.both = {first}{second}
+quit.web_end = other: 从 tTerm Web 在这台电脑上打开的 {n} 个终端将会结束。
+
+# ------------------------------------------------------------ restart: a new version ready
+restart.title = 重新启动 tTerm 以更新？
+# {question} is one of quit.*: what ends with the restart.
+restart.text = tTerm {version} 已就绪。{question}
+restart.yes = 重新启动
+restart.later = 稍后
+restart.failed = tTerm 无法更新
+
+# ------------------------------------------------------------ move: tTerm opened from the disk image
+move.title = 将 tTerm 移到“应用程序”文件夹？
+move.text = tTerm 目前正在从磁盘映像运行。只有在“应用程序”文件夹中，它才能自行更新。
+# {question} is one of quit.*: what ends with the move.
+move.text_ends = tTerm 目前正在从磁盘映像运行。只有在“应用程序”文件夹中，它才能自行更新。移动后，它会从那里重新打开。{question}
+move.yes = 移到“应用程序”文件夹
+move.no = 以后再说
+move.failed = tTerm 无法移动
+
+# ------------------------------------------------------------ update: why tTerm does not update, in Settings' Updates and the questions
+# {why} is the reason, as macOS or the network said it, in English.
+update.only_mac = 只有 tTerm Mac 版会自行更新。
+update.from_build = 这个 tTerm 运行的是开发构建，而不是 tTerm.app：它不会自行更新。
+update.not_app = tTerm 运行的是开发构建，而不是 tTerm.app。
+update.from_disk_image = tTerm 正在从磁盘映像运行。把它移到“应用程序”文件夹后，它就会自行更新。
+update.not_disk_image = tTerm 并非从磁盘映像运行。
+# {place} is a folder: /Users/denis/Desktop.
+update.cannot_change = tTerm 无法修改它所在的 {place}，因此无法自行更新。请从 tterm.net 下载新版本。
+update.no_key = 这个 tTerm 没有内置发布密钥。
+update.could_not_look = 无法检查新版本：{why}
+update.could_not_take = 无法获取 tTerm {version}：{why}。tTerm 将保持现状。
+update.none_ready = 没有已就绪的新版本。
+update.busy = 无法安装新版本：另一个 tTerm 正在自行更新。请稍后再试。
+update.replaced = 另一个 tTerm 已经安装了新版本。请退出当前这个，然后重新打开 tTerm。
+update.changed = 在 tTerm 旁等待安装的 tTerm {version} 在校验后发生了变化，因此不会安装。将重新获取。
+update.not_written = 无法记录更新信息：{why}
+update.app_management = macOS 不允许 tTerm 用 tTerm {version} 替换自身（{why}）。请在“系统设置”>“隐私与安全性”>“App 管理”中允许 tTerm，然后再次点击“重新启动以更新”。
+update.not_in_place = 无法安装 tTerm {version}：{why}
+update.cannot_watch = 旧版本无法监视新版本启动：{why}
+update.in_place_unwatched = tTerm {version} 已安装，但旧版本无法监视它启动（{why}）。请退出 tTerm，然后重新打开。
+# {to} did not start, {from} is the version before, which came back.
+update.came_back = tTerm {to} 未能在这台 Mac 上启动，因此已恢复为 tTerm {from}。之后将改为获取 {to} 之后的版本。
+update.only_mac_moves = 只有 tTerm Mac 版会自行移动。
+update.applications_locked = 你的用户账户无法修改“应用程序”文件夹。请在“访达”中把 tTerm 拖到那里。
+update.newer_there = “应用程序”文件夹中已有较新的 tTerm（{version}）：请打开那个。
+update.not_copied = 无法将 tTerm 拷贝到“应用程序”文件夹（{why}）
+update.not_moved = 无法将 tTerm 放入“应用程序”文件夹（{why}）
+update.say_mode = 请指定模式：auto 或 ask。
+update.not_saved = 无法在这台电脑上保存设置。
