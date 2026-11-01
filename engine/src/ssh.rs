@@ -109,6 +109,10 @@ struct Found {
     known: bool,
     history: bool,
     last_used: Option<i64>,
+    /// The user and port of the newest `ssh` typed to it in tTerm's
+    /// terminals (`ssh root@host`, `-l`, `-p`): what ssh used then (0.7.1).
+    typed_user: Option<String>,
+    typed_port: Option<u16>,
 }
 
 /// Every host this Mac knows, with the keys read from `history` (the store's
@@ -123,8 +127,13 @@ pub fn hosts(ssh: &Ssh, history: &[(String, i64)]) -> Vec<Host> {
         found.entry(alias).or_default().config = true;
     }
     for (command, at) in history {
-        if let Some(target) = ssh_target(command) {
-            let e = found.entry(target).or_default();
+        if let Some(typed) = ssh_typed(command) {
+            let e = found.entry(typed.host).or_default();
+            if !e.history {
+                // The newest command (history comes newest first) says how.
+                e.typed_user = typed.user;
+                e.typed_port = typed.port;
+            }
             e.history = true;
             e.last_used = Some(e.last_used.map_or(*at, |had| had.max(*at)));
         }
@@ -138,9 +147,10 @@ pub fn hosts(ssh: &Ssh, history: &[(String, i64)]) -> Vec<Host> {
     hosts
 }
 
-/// A host as `ssh -G` sees it, by the name it is listed under.
+/// A host as `ssh -G` sees it, by the name it is listed under, with the
+/// user and port typed for it (its destination).
 fn resolved(ssh: &Ssh, known_text: &str, alias: String, f: Found) -> Host {
-    let settings = effective(ssh, &alias);
+    let settings = effective(ssh, &destination(&alias, f.typed_user.as_deref(), f.typed_port));
     let hostname = settings.one("hostname").unwrap_or_else(|| alias.clone());
     let port = settings.one("port").and_then(|p| p.parse().ok()).unwrap_or(22);
     let user = settings.one("user").unwrap_or_default();
@@ -536,36 +546,122 @@ impl Settings {
 /// the user@ stripped. None when the command is not a plain `ssh host`
 /// (a subcommand, an option that eats the next word, a URL).
 pub fn ssh_target(command: &str) -> Option<String> {
+    ssh_typed(command).map(|typed| typed.host)
+}
+
+/// An `ssh` command as typed: the host, and the user and port it was given
+/// (`user@host`, `-l user`, `-p port`, `-o User=…`, `-o Port=…`, or an
+/// `ssh://user@host:port`), which ssh takes over the config's (0.7.1).
+#[derive(Debug, PartialEq)]
+pub struct Typed {
+    pub host: String,
+    pub user: Option<String>,
+    pub port: Option<u16>,
+}
+
+pub fn ssh_typed(command: &str) -> Option<Typed> {
     let mut words = command.split_whitespace();
     if words.next()? != "ssh" {
         return None;
     }
-    // Options that take a value in the next word: it is not the host.
+    // Options that take a value: joined (-p22) or in the next word.
     const TAKES_VALUE: &[char] = &['B', 'b', 'c', 'D', 'E', 'e', 'F', 'I', 'i', 'J', 'L', 'l', 'm', 'O', 'o', 'p', 'Q', 'R', 'S', 'W', 'w'];
-    let mut skip_next = false;
+    let (mut user, mut port) = (None::<String>, None::<u16>);
+    let mut wants: Option<char> = None;
+    let take = |opt: char, value: &str, user: &mut Option<String>, port: &mut Option<u16>| match opt {
+        'l' if !value.is_empty() => *user = Some(value.to_string()),
+        'p' => *port = value.parse().ok().or(*port),
+        'o' => {
+            if let Some((key, val)) = value.split_once('=') {
+                let val = val.trim();
+                if key.trim().eq_ignore_ascii_case("user") && !val.is_empty() {
+                    *user = Some(val.to_string());
+                } else if key.trim().eq_ignore_ascii_case("port") {
+                    *port = val.parse().ok().or(*port);
+                }
+            }
+        }
+        _ => {}
+    };
     for word in words {
-        if skip_next {
-            skip_next = false;
+        if let Some(opt) = wants.take() {
+            take(opt, word, &mut user, &mut port);
             continue;
         }
-        if let Some(opt) = word.strip_prefix('-') {
-            // A bundle like -4v, or -p with the value joined (-p22): a value
-            // option at the end of the bundle eats the next word.
-            if let Some(last) = opt.chars().last() {
-                let joined = opt.len() > 1 && TAKES_VALUE.contains(&opt.chars().nth(opt.len() - 1).unwrap()) && opt.chars().take(opt.len() - 1).all(|c| !TAKES_VALUE.contains(&c));
-                skip_next = TAKES_VALUE.contains(&last) && !joined;
+        if let Some(bundle) = word.strip_prefix('-') {
+            // A bundle like -4v; the first option in it that takes a value
+            // takes the rest of the word, or the next word.
+            for (i, c) in bundle.char_indices() {
+                if TAKES_VALUE.contains(&c) {
+                    let rest = &bundle[i + c.len_utf8()..];
+                    if rest.is_empty() {
+                        wants = Some(c);
+                    } else {
+                        take(c, rest, &mut user, &mut port);
+                    }
+                    break;
+                }
             }
             continue;
         }
-        // The first bare word is the host (or user@host); a command after
-        // it is the remote command, not another host.
-        let host = word.rsplit('@').next().unwrap_or(word);
-        if host.is_empty() || host.contains("://") {
+        // The first bare word is the host (user@host, or an ssh:// URL); a
+        // command after it is the remote command, not another host.
+        let (who, mut host) = match word.strip_prefix("ssh://") {
+            Some(url) => {
+                let (who, rest) = url.rsplit_once('@').map_or((None, url), |(u, h)| (Some(u), h));
+                let rest = rest.trim_end_matches('/');
+                let (host, given) = match rest.rsplit_once(':') {
+                    Some((h, p)) if !h.contains(':') || h.ends_with(']') => (h, p.parse().ok()),
+                    _ => (rest, None),
+                };
+                if given.is_some() {
+                    port = given;
+                }
+                (who, host.trim_matches(['[', ']']).to_string())
+            }
+            None => {
+                let (who, host) = word.rsplit_once('@').map_or((None, word), |(u, h)| (Some(u), h));
+                (who, host.to_string())
+            }
+        };
+        if let Some(who) = who.filter(|w| !w.is_empty()) {
+            user = Some(who.to_string());
+        }
+        host = host.trim().to_string();
+        if host.is_empty() || host.contains('/') {
             return None;
         }
-        return Some(host.to_string());
+        return Some(Typed { host, user, port });
     }
     None
+}
+
+/// What ssh is given to reach a host the way the person did (0.7.1): the
+/// alias alone, or with the user and port they typed as `ssh://user@host:port`,
+/// which ssh takes over its config (`ssh -G`, a login, a terminal through
+/// this Mac). An IPv6 address with a port cannot be written so: its port is
+/// left to the config.
+pub fn destination(alias: &str, user: Option<&str>, port: Option<u16>) -> String {
+    let port = port.filter(|p| *p != 22 && !alias.contains(':'));
+    if user.is_none() && port.is_none() {
+        return alias.to_string();
+    }
+    let who = user.map(|u| format!("{u}@")).unwrap_or_default();
+    let host = if alias.contains(':') { format!("[{alias}]") } else { alias.to_string() };
+    match port {
+        Some(port) => format!("ssh://{who}{host}:{port}"),
+        None => format!("ssh://{who}{host}"),
+    }
+}
+
+/// A listed host's destination by its alias, from the `ssh` commands of
+/// tTerm's terminals (newest first), without running ssh.
+pub fn destination_for(alias: &str, history: &[(String, i64)]) -> String {
+    let typed = history.iter().filter_map(|(command, _)| ssh_typed(command)).find(|t| t.host == alias);
+    match typed {
+        Some(t) => destination(alias, t.user.as_deref(), t.port),
+        None => alias.to_string(),
+    }
 }
 
 /// A hashed known_hosts entry for a name, as OpenSSH writes it: for the
@@ -599,6 +695,28 @@ mod tests {
         assert_eq!(ssh_target("scp a b"), None);
         assert_eq!(ssh_target("ssh"), None);
         assert_eq!(ssh_target("ssh -i key"), None, "the option eats the only word");
+    }
+
+    #[test]
+    fn the_user_and_port_typed_are_kept() {
+        let typed = |c: &str| ssh_typed(c).map(|t| (t.host, t.user, t.port));
+        assert_eq!(typed("ssh root@app.tterm.net"), Some(("app.tterm.net".into(), Some("root".into()), None)));
+        assert_eq!(typed("ssh -p 2222 -l deploy web"), Some(("web".into(), Some("deploy".into()), Some(2222))));
+        assert_eq!(typed("ssh -p2222 -ldeploy web uptime"), Some(("web".into(), Some("deploy".into()), Some(2222))));
+        assert_eq!(typed("ssh -o User=admin -o Port=2200 db"), Some(("db".into(), Some("admin".into()), Some(2200))));
+        assert_eq!(typed("ssh -i ~/.ssh/id_ed25519 -4v root@10.0.0.5"), Some(("10.0.0.5".into(), Some("root".into()), None)));
+        assert_eq!(typed("ssh ssh://root@example.com:2222"), Some(("example.com".into(), Some("root".into()), Some(2222))));
+        assert_eq!(typed("ssh -J bastion inner"), Some(("inner".into(), None, None)));
+        assert_eq!(typed("ssh web"), Some(("web".into(), None, None)));
+        assert_eq!(typed("scp a b"), None);
+        assert_eq!(destination("app.tterm.net", Some("root"), None), "ssh://root@app.tterm.net");
+        assert_eq!(destination("web", Some("deploy"), Some(2222)), "ssh://deploy@web:2222");
+        assert_eq!(destination("web", None, Some(22)), "web");
+        assert_eq!(destination("web", None, None), "web");
+        assert_eq!(destination("2001:db8::1", Some("root"), Some(2200)), "ssh://root@[2001:db8::1]");
+        let history = vec![("ssh root@app.tterm.net".to_string(), 2), ("ssh app.tterm.net".to_string(), 1)];
+        assert_eq!(destination_for("app.tterm.net", &history), "ssh://root@app.tterm.net", "the newest command");
+        assert_eq!(destination_for("other", &history), "other");
     }
 
     #[test]

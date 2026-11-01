@@ -5010,7 +5010,7 @@ dependencies = [
 
 [[package]]
 name = "tterm-app"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "block2",
  "dirs",
@@ -5028,7 +5028,7 @@ dependencies = [
 
 [[package]]
 name = "tterm-engine"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.22.1",
  "flate2",

@@ -692,7 +692,10 @@ impl Vault {
     pub async fn ssh_try(&self, engine: &Arc<Engine>, alias: &str, passphrase: Option<&str>) -> Done<Value> {
         let ssh = self.ssh();
         let helper = self.askpass(engine, passphrase)?;
-        let attempt = crate::ssh::run(&ssh, alias, &[], &["true"], None, askpass_pair(&helper, passphrase)).await;
+        // As the person reached it: the user and port they typed (0.7.1).
+        let history = engine.terminals.store.ssh_commands().await;
+        let dest = crate::ssh::destination_for(alias, &history);
+        let attempt = crate::ssh::run(&ssh, &dest, &[], &["true"], None, askpass_pair(&helper, passphrase)).await;
         Ok(json!({"ok": attempt.ok, "error": attempt.error}))
     }
 
@@ -706,8 +709,12 @@ impl Vault {
         let ticked: HashMap<String, Option<String>> = keys.iter().map(|(p, ph)| (expand(&ssh.home, p), ph.clone().filter(|p| !p.is_empty()))).collect();
         let mut work = Moving { ticked, in_vault: None, uploaded: HashMap::new(), saved_with: BTreeSet::new() };
         let mut results = Vec::new();
+        // Each server as the person reached it: the user and port they typed
+        // in tTerm's terminals, over the config's (0.7.1).
+        let history = engine.terminals.store.ssh_commands().await;
         for (alias, method) in servers {
-            let one = self.move_one(engine, &ssh, project, alias, method, &mut work).await;
+            let dest = crate::ssh::destination_for(alias, &history);
+            let one = self.move_one(engine, &ssh, project, alias, &dest, method, &mut work).await;
             results.push(match one {
                 Ok(machine) => json!({"alias": alias, "ok": true, "machine": machine}),
                 Err(why) => json!({"alias": alias, "ok": false, "error": why}),
@@ -732,10 +739,12 @@ impl Vault {
 
     /// One server of a move, start to finish; Err is the reason the page
     /// shows for it, and nothing was saved.
-    async fn move_one(&self, engine: &Arc<Engine>, ssh: &crate::ssh::Ssh, project: &str, alias: &str, method: &str, work: &mut Moving) -> Result<Value, String> {
+    /// `dest` is what ssh is given for it (crate::ssh::destination): the
+    /// alias, or with the user and port typed for it.
+    async fn move_one(&self, engine: &Arc<Engine>, ssh: &crate::ssh::Ssh, project: &str, alias: &str, dest: &str, method: &str, work: &mut Moving) -> Result<Value, String> {
         let settings = {
-            let (ssh, alias) = (ssh.clone(), alias.to_string());
-            tokio::task::spawn_blocking(move || crate::ssh::effective(&ssh, &alias)).await.map_err(|e| e.to_string())?
+            let (ssh, dest) = (ssh.clone(), dest.to_string());
+            tokio::task::spawn_blocking(move || crate::ssh::effective(&ssh, &dest)).await.map_err(|e| e.to_string())?
         };
         let hostname = settings.one("hostname").unwrap_or_else(|| alias.to_string());
         let port: u16 = settings.one("port").and_then(|p| p.parse().ok()).unwrap_or(22);
@@ -761,7 +770,7 @@ impl Vault {
                 if let Some(j) = self.jump_block(ssh, &settings, &known) {
                     body["jump"] = j;
                 }
-                let key_id = self.key_for(engine, ssh, alias, &settings, work).await?;
+                let key_id = self.key_for(engine, ssh, dest, &settings, work).await?;
                 body["keyId"] = json!(key_id);
                 used_key = Some(key_id);
             }
@@ -773,7 +782,7 @@ impl Vault {
                 let script = crate::ssh::add_line_script(&line);
                 let phrase = self.phrase_for(ssh, &settings, work);
                 let helper = self.askpass(engine, phrase.as_deref()).map_err(|f| f.message)?;
-                let attempt = crate::ssh::run(ssh, alias, &[], &["sh", "-s"], Some(&script), askpass_pair(&helper, phrase.as_deref())).await;
+                let attempt = crate::ssh::run(ssh, dest, &[], &["sh", "-s"], Some(&script), askpass_pair(&helper, phrase.as_deref())).await;
                 if !attempt.ok {
                     return Err(format!("This Mac could not sign in to add tTerm's line: {}", attempt.error.unwrap_or_default()));
                 }
@@ -798,7 +807,7 @@ impl Vault {
                 }
                 let here = account.here().ok_or("This Mac is not one of your account's machines yet. Wait until tTerm shows it in Personal, then move the server.")?;
                 body["via"] = json!(here.id.to_string());
-                body["target"] = json!(alias);
+                body["target"] = json!(dest);
             }
             other => return Err(format!("There is no way in called {other}.")),
         }
@@ -817,7 +826,7 @@ impl Vault {
         if let Some((line, phrase)) = added_line {
             let helper = self.askpass(engine, phrase.as_deref()).ok().flatten();
             let script = crate::ssh::remove_line_script(&line);
-            let _ = crate::ssh::run(ssh, alias, &[], &["sh", "-s"], Some(&script), askpass_pair(&helper, phrase.as_deref())).await;
+            let _ = crate::ssh::run(ssh, dest, &[], &["sh", "-s"], Some(&script), askpass_pair(&helper, phrase.as_deref())).await;
         }
         Err(refused)
     }
@@ -827,7 +836,7 @@ impl Vault {
     /// already. Before anything is saved this Mac signs in with that key
     /// alone, as the core takes the app's word for it; then it is sealed and
     /// uploaded, once per move, unless the vault has it.
-    async fn key_for(&self, engine: &Arc<Engine>, ssh: &crate::ssh::Ssh, alias: &str, settings: &crate::ssh::Settings, work: &mut Moving) -> Result<String, String> {
+    async fn key_for(&self, engine: &Arc<Engine>, ssh: &crate::ssh::Ssh, dest: &str, settings: &crate::ssh::Settings, work: &mut Moving) -> Result<String, String> {
         let (_vault_id, vk) = self.vault_key().map_err(|_| "Open your vault first.".to_string())?;
         let files = existing_identity_files(&ssh.home, settings);
         if files.is_empty() {
@@ -854,7 +863,7 @@ impl Vault {
         // The login, with this key alone (and the agent's copy of it).
         let helper = self.askpass(engine, phrase.as_deref()).map_err(|f| f.message)?;
         let extra = ["-v", "-o", "FingerprintHash=sha256", "-o", "IdentitiesOnly=yes", "-i", path.as_str()];
-        let attempt = crate::ssh::run(ssh, alias, &extra, &["true"], None, askpass_pair(&helper, phrase.as_deref())).await;
+        let attempt = crate::ssh::run(ssh, dest, &extra, &["true"], None, askpass_pair(&helper, phrase.as_deref())).await;
         if !attempt.ok {
             return Err(format!("This Mac could not sign in with {shown}: {}", attempt.error.unwrap_or_default()));
         }

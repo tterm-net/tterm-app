@@ -237,7 +237,11 @@ Through this Mac.
 Move to cloud (`engine/src/vault.rs`, `ssh.rs`) finds the servers the Mac
 knows — from `~/.ssh/config`, `known_hosts` (hashed `|1|` entries too) and
 the `ssh` commands its own terminals ran — reads each one's effective
-settings with `ssh -G` (never connecting), and for each server the way in
+settings with `ssh -G` (never connecting), with the user and port typed in
+those commands (`ssh root@host`, `-l`, `-p`, from 0.7.1) over the config's,
+as ssh took them then; known_hosts' entries of servers already listed are
+not listed again, and a server only known_hosts knows is not ticked (from
+0.7.0's first runs). For each server the way in
 the person chose: **My key** (the key sealed and uploaded, the login signed
 by this Mac or whatever browser is open), **Let tTerm in** (the app signs in
 once and adds tTerm's CA line to `authorized_keys`, then the core signs in
