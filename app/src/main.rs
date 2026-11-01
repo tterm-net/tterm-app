@@ -19,6 +19,10 @@ mod background;
 mod keychain;
 #[cfg(target_os = "macos")]
 mod mac;
+// The vault's keeper for the GUI checks (TTERM_TEST_KEEPER=1): never in a
+// release build.
+#[cfg(debug_assertions)]
+mod test_keeper;
 mod updates;
 
 use std::collections::HashMap;
@@ -37,6 +41,16 @@ use tterm_engine::terminals::Outgoing;
 use tterm_engine::{api, upstream, Engine};
 
 const SHIM: &str = include_str!("shim.js");
+
+/// The vault's keeper: the keychain and LocalAuthentication (keychain.rs);
+/// in a debug build with TTERM_TEST_KEEPER=1, the checks' in-memory one.
+fn vault_keeper(host: Arc<keychain::AppHost>) -> Arc<dyn tterm_engine::vault::Keeper> {
+    #[cfg(debug_assertions)]
+    if test_keeper::wanted() {
+        return Arc::new(test_keeper::TestKeeper::new());
+    }
+    host
+}
 
 /// The shim, after the language the app shows: the page's first paint is
 /// in it before the page has asked anything (from 0.6.0).
@@ -109,13 +123,15 @@ async fn api(request: Request<'_>, app: State<'_, App>) -> Result<Response, Stri
     Ok(Response::new(out))
 }
 
+/// A socket of the page. Async (from 0.7.0), so it opens on the runtime:
+/// signed in, its socket on tTerm starts with it, for the vault.
 #[tauri::command]
-fn ws_open(app: State<'_, App>) -> u64 {
+async fn ws_open(app: State<'_, App>) -> Result<u64, String> {
     let (page, rx) = PageSocket::new(app.engine.clone());
     let id = app.next_socket.fetch_add(1, Ordering::SeqCst);
     let socket = Arc::new(Socket { page, rx: AsyncMutex::new(rx), asked: Mutex::new(Instant::now()) });
     app.sockets.lock().unwrap().insert(id, socket);
-    id
+    Ok(id)
 }
 
 fn socket(app: &App, id: u64) -> Option<Arc<Socket>> {
@@ -532,7 +548,9 @@ fn main() {
             let dir = app.path().app_data_dir()?;
             let cloud = cloud_address();
             let host = Arc::new(keychain::AppHost::new(app.handle().clone(), &cloud, dir.clone()));
-            let engine = Engine::with_cloud(&dir, &cloud, host, &agent_env())?;
+            // The same AppHost is the vault's keeper (the keychain and
+            // LocalAuthentication, from 0.7.0) and the account's host.
+            let engine = Engine::with_cloud(&dir, &cloud, host.clone(), vault_keeper(host), &agent_env())?;
             let shared: App = Arc::new(Shared {
                 engine: engine.clone(),
                 sockets: Mutex::new(HashMap::new()),

@@ -665,6 +665,27 @@ impl Store {
         .await
     }
 
+    /// The `ssh` commands this computer's terminals ran, newest first, each
+    /// once: where the vault's discovery finds hosts the person reached that
+    /// `~/.ssh/config` does not name (from 0.7.0). Only commands that start
+    /// with `ssh `, with their last-used time in milliseconds.
+    #[cfg(feature = "cloud")]
+    pub async fn ssh_commands(&self) -> Vec<(String, i64)> {
+        self.read(move |c| {
+            let mut st = c.prepare(
+                "SELECT command, max(started_at) FROM blocks
+                 WHERE command LIKE 'ssh %' AND expires_at > ?1
+                 GROUP BY command
+                 ORDER BY max(started_at) DESC, max(id) DESC
+                 LIMIT 500",
+            )?;
+            let rows = st.query_map(params![now_ms()], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<(String, i64)>>>()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     /// A terminal no longer in memory, as the store remembers it.
     pub async fn ended_row(&self, id: &str) -> Option<EndedRow> {
         let id = id.to_string();

@@ -27,7 +27,12 @@ tterm-engine = { path = "../engine", features = ["cloud"] }
 dirs = "7"
 
 # The answer to "may the app quit?" that tao's delegate does not give
-# (src/mac.rs); the keychain, for the device's key (src/keychain.rs).
+# (src/mac.rs); the keychain, for the device's key and the vault's
+# (src/keychain.rs); LocalAuthentication, the gate before the vault key
+# (src/keychain.rs), through objc2 and a completion block (block2).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-security-framework = "3"
+block2 = "0.6"
+# OSX_10_15: the data protection keychain (kSecUseDataProtectionKeychain),
+# where the vault's KEK is asked to be this Mac's only (src/keychain.rs).
+security-framework = { version = "3", features = ["OSX_10_15"] }

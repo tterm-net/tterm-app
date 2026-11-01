@@ -102,3 +102,17 @@ update.not_copied = Не удалось скопировать tTerm в «Про
 update.not_moved = Не удалось поместить tTerm в «Программы» ({why})
 update.say_mode = Укажи режим: auto или ask.
 update.not_saved = Не удалось сохранить настройки на этом компьютере.
+
+# ------------------------------------------------------------ vault: the Touch ID question for the vault of SSH keys
+# macOS shows each in its own dialog for Touch ID or the Mac's password,
+# after "tTerm is trying to": the end of that sentence, without a full stop.
+# The system's own sentence in each language (macOS 26, APP_ASKING_AUTH in
+# LocalAuthentication's UIAgent.loctable): most take an infinitive (de „Die
+# App „tTerm“ möchte …“, fr « … » souhaite …, pl próbuje …, ru пытается …);
+# in ja, ko and tr the string comes last, after a colon (ja …次の操作を実行し
+# ようとしています: …, tr … şu işlemi yapmaya çalışıyor: …): a noun phrase.
+vault.reason_open = открыть хранилище tTerm
+vault.reason_create = создать хранилище tTerm
+vault.reason_lock = разрешить этому Mac открывать хранилище tTerm
+vault.reason_approve = разрешить новому браузеру открыть хранилище tTerm
+vault.reason_recovery = создать новый код восстановления хранилища tTerm

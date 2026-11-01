@@ -102,3 +102,17 @@ update.not_copied = Nie udało się skopiować tTerma do folderu Aplikacje ({why
 update.not_moved = Nie udało się umieścić tTerma w folderze Aplikacje ({why})
 update.say_mode = Podaj tryb: auto lub ask.
 update.not_saved = Nie udało się zapisać ustawień na tym komputerze.
+
+# ------------------------------------------------------------ vault: the Touch ID question for the vault of SSH keys
+# macOS shows each in its own dialog for Touch ID or the Mac's password,
+# after "tTerm is trying to": the end of that sentence, without a full stop.
+# The system's own sentence in each language (macOS 26, APP_ASKING_AUTH in
+# LocalAuthentication's UIAgent.loctable): most take an infinitive (de „Die
+# App „tTerm“ möchte …“, fr « … » souhaite …, pl próbuje …, ru пытается …);
+# in ja, ko and tr the string comes last, after a colon (ja …次の操作を実行し
+# ようとしています: …, tr … şu işlemi yapmaya çalışıyor: …): a noun phrase.
+vault.reason_open = otworzyć sejf tTerm
+vault.reason_create = utworzyć sejf tTerm
+vault.reason_lock = pozwolić temu Macowi otworzyć sejf tTerm
+vault.reason_approve = pozwolić nowej przeglądarce otworzyć sejf tTerm
+vault.reason_recovery = wygenerować nowy kod odzyskiwania sejfu tTerm

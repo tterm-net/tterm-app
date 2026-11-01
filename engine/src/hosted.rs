@@ -178,6 +178,22 @@ pub fn script_timeout(value: Option<&Value>) -> Duration {
     }
 }
 
+/// The argv of an `open` message's `exec` (from 0.7.0): a non-empty array of
+/// strings, the first the program to run. None when there is no usable
+/// `exec`, so the open falls back to the login shell with `cmd`.
+fn exec_argv(value: Option<&Value>) -> Option<Vec<String>> {
+    let array = value?.as_array()?;
+    if array.is_empty() {
+        return None;
+    }
+    let argv: Vec<String> = array.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+    // Every item must be a string, and the program must not be empty.
+    if argv.len() != array.len() || argv[0].is_empty() {
+        return None;
+    }
+    Some(argv)
+}
+
 /// The text of a value: a string as it is, a number or a boolean written
 /// out; nothing for null or a missing value.
 fn text(value: Option<&Value>) -> String {
@@ -398,14 +414,21 @@ impl Hosted {
             out.json(json!({"t": "exit", "code": null, "error": "too many terminals open on this machine", "ch": ch})).await;
             return;
         }
-        let cmd = text(msg.get("cmd"));
         let cols = number(msg.get("cols"), 80, 1000);
         let rows = number(msg.get("rows"), 24, 500);
         // Off when the core is about to type its one-time key; its shell
         // scripts turn echo back on once they have read it. Set before the
         // shell exists, it cannot race the key.
         let echo = truthy(msg.get("echo"), true);
-        let argv = vec![pty::login_shell(), "-c".to_string(), cmd];
+        // A `mac` terminal (Through this Mac, from 0.7.0) carries `exec`: an
+        // argv run directly, `ssh -- <target>`, in place of `cmd`. It starts
+        // in the classic mode, no login shell and no markers. The normal
+        // open still carries `cmd`, run by the login shell with -c as sshd
+        // runs one; an open with neither falls back to a plain login shell.
+        let argv = match exec_argv(msg.get("exec")) {
+            Some(argv) => argv,
+            None => vec![pty::login_shell(), "-c".to_string(), text(msg.get("cmd"))],
+        };
         // What the shell printed before it ended is read whole, however long
         // the link takes to come back for it (Drain::Patient), as tterm-agent did.
         let started = match pty::spawn_with(&argv, &self.env(true), &pty::home_dir(), cols, rows, echo, pty::Drain::Patient) {
@@ -883,6 +906,32 @@ mod tests {
                 None => panic!("no exit for terminal {ch}"),
             }
         }
+    }
+
+    #[test]
+    fn a_mac_terminal_runs_ssh_directly() {
+        // The core opens a `mac` terminal with `exec`: run as it is given.
+        assert_eq!(exec_argv(Some(&json!(["ssh", "--", "web-01"]))), Some(vec!["ssh".into(), "--".into(), "web-01".into()]));
+        // No exec, or an empty or ill-formed one: fall back to the shell.
+        assert_eq!(exec_argv(None), None);
+        assert_eq!(exec_argv(Some(&json!([]))), None);
+        assert_eq!(exec_argv(Some(&json!(["", "x"]))), None, "the program must not be empty");
+        assert_eq!(exec_argv(Some(&json!(["ssh", 7]))), None, "every item is a string");
+        assert_eq!(exec_argv(Some(&json!("ssh"))), None);
+    }
+
+    #[tokio::test]
+    async fn a_mac_terminal_opens_with_its_argv() {
+        // `exec` starts that program, not the login shell: here a short
+        // command that ends, so the terminal reports its exit.
+        let hosted = Hosted::new(Timing::default(), Arc::new(|_: &str| {}), None);
+        let (tx, mut rx) = mpsc::channel(64);
+        let (ctl, _ctl) = mpsc::channel(8);
+        let out = Out::new(tx, ctl);
+        hosted.open(1, &json!({"exec": ["/bin/echo", "through the mac"], "echo": true}), &out).await;
+        let exit = exit_of(&mut rx, 1).await;
+        assert_eq!(exit["code"], 0, "{exit}");
+        hosted.end_all().await;
     }
 
     #[tokio::test]

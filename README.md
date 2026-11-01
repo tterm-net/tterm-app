@@ -45,7 +45,11 @@ engine/   Rust: the shells (pty.rs), the terminals and their pages
           (upstream_socket.rs). The link to tTerm Web (link.rs, proxy.rs)
           and the terminals tTerm Web opens through it (hosted.rs), run by
           the app in the agent's place (reach.rs). New versions of the app,
-          found, checked and put in place (update.rs).
+          found, checked and put in place (update.rs). The vault of SSH
+          keys and Move to cloud (from 0.7.0): the crypto (crypto.rs), the
+          keys read and signed (sshkeys.rs), ~/.ssh discovery and the login
+          tries (ssh.rs), the vault itself with the keychain and tTerm
+          (vault.rs).
 agent/    tterm-agent: the engine without a window, connecting a computer
           to tTerm Web (see below).
 engine/shell/
@@ -188,6 +192,76 @@ Web's or tTerm says its key is another account's computer. Terminals opened
 from tTerm Web are the app's processes, so macOS asks for access to Desktop
 and Documents for tTerm, not for the agent. tTerm Web names it "tTerm app"
 and its version, 0.5.0, where an agent says its own.
+
+## The vault of SSH keys, and Move to cloud
+
+From 0.7.0 a server this Mac reaches with `ssh` can be opened from anywhere
+in the person's tTerm account — any browser, their phone — without the Mac.
+The person's SSH keys go into a *vault*, encrypted end to end: tTerm keeps
+only the ciphertext, the public half and the fingerprint, never a private
+key in the clear.
+
+The crypto (`engine/src/crypto.rs`) is the contract's exactly, so that a
+browser's WebCrypto and this engine produce the same bytes: a box is
+AES-256-GCM with a random nonce (`nonce || ciphertext || tag`), keys are
+HKDF-SHA256, a new browser and this Mac agree with X25519, and each box
+says what it is for in its additional data. A vault key (32 random bytes)
+encrypts each SSH key; the vault key itself is kept wrapped for each way of
+opening it (a *lock*). On this Mac the lock is a key in the keychain
+(service `net.tterm.desktop.vault`), read only after a LocalAuthentication
+check — Touch ID, or the Mac's password, asked in the app's language. It is
+asked for as this Mac's only, readable while the Mac is unlocked
+(`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`), which macOS honours only
+in the data protection keychain, given to apps with a provisioning profile;
+until tTerm has one, the item is in the login keychain, and the check is a
+gate in the app run before a normal item is read: it guards against someone
+at the keyboard, not against other programs of the same user. With a
+Developer ID the vault key moves into the Secure Enclave with no new vault.
+A recovery code (shown once) is a third way in; a vault made in a browser
+opens on this Mac once with it, and then has this Mac's own lock. While the
+app runs the vault key stays in the engine's memory, until Lock or sign out;
+sign out forgets the keychain item too.
+
+The keys themselves (`engine/src/sshkeys.rs`) are read from `~/.ssh` as
+OpenSSH writes them, encrypted keys too (the passphrase given once), into
+the contract's JWK plaintext, and used to sign a login *raw* for tTerm's
+core, which builds the SSH signature and checks it against the public half
+before it uses it: Ed25519's 64 bytes, RSA PKCS#1 v1.5 (SHA-256 or
+SHA-512), ECDSA's `r || s` of fixed length. Only a login is signed: what the
+core asks to sign must be exactly the SSH user-auth request (RFC 4252 §7) of
+a public-key login with that very key, or nothing is signed, so the key
+cannot be used for anything else through tTerm. Security keys (`sk-*`),
+keys only an agent holds, and other types are not moved — their servers go
+Through this Mac.
+
+Move to cloud (`engine/src/vault.rs`, `ssh.rs`) finds the servers the Mac
+knows — from `~/.ssh/config`, `known_hosts` (hashed `|1|` entries too) and
+the `ssh` commands its own terminals ran — reads each one's effective
+settings with `ssh -G` (never connecting), and for each server the way in
+the person chose: **My key** (the key sealed and uploaded, the login signed
+by this Mac or whatever browser is open), **Let tTerm in** (the app signs in
+once and adds tTerm's CA line to `authorized_keys`, then the core signs in
+with a short certificate), or **Through this Mac** (a terminal of this Mac
+that runs `ssh`, while the Mac is online). A key moves only when it is
+ticked, after this Mac signed in with it alone, and once; nothing is saved
+for a server that fails, and a key or a line added for it goes again. An
+encrypted key is opened with a passphrase passed only through the
+environment of that one `ssh` process, to a forced `SSH_ASKPASS` helper that
+answers nothing but the passphrase question.
+
+On the page's socket to the cloud — up while the page's is, terminals or
+not — the engine says which keys it can sign for (`vault.can`), answers the
+core's `vault.sign` for them itself, and never passes a signing request to
+the page. A `mac` terminal (Through this Mac)
+the core opens with an `exec` of `ssh -- <target>`, which the engine runs
+directly in place of the login shell, in the classic mode.
+
+The keychain item and the LocalAuthentication prompt are the app's, macOS
+only (`app/src/keychain.rs`); the engine reaches them through a small trait
+it also stands in for on Linux, so its checks run without a Mac. A debug
+build of the app started with `TTERM_TEST_KEEPER=1` keeps the KEK in memory
+and passes the check (`TTERM_TEST_KEEPER_DENY=1` fails it), for the GUI
+checks on Linux; a release build has none of that.
 
 ## The agent
 

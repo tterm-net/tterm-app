@@ -15,6 +15,7 @@
 use crate::account::{Account, Trouble};
 use crate::terminals::{Outgoing, INPUT, OUTPUT};
 use crate::upstream::SocketRefused;
+use crate::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -49,6 +50,10 @@ struct Inner {
     /// To tTerm, while connected.
     link: Option<mpsc::UnboundedSender<Message>>,
     running: bool,
+    /// The fingerprints the page itself said it can sign for (its own
+    /// `vault.can`, from 0.7.0): sent with the engine's, as one list, since
+    /// the core takes the last `vault.can` of a socket as the whole of it.
+    page_can: Vec<String>,
 }
 
 /// How a connection to tTerm ended.
@@ -64,6 +69,9 @@ enum Ended {
 /// One page socket's way to tTerm.
 pub struct Relay {
     account: Arc<Account>,
+    /// The engine, for the vault: it answers `vault.sign` on this socket
+    /// itself and tells the core which keys it can sign for (`vault.can`).
+    engine: Arc<Engine>,
     to_page: mpsc::Sender<Outgoing>,
     inner: Mutex<Inner>,
     closed: AtomicBool,
@@ -71,8 +79,8 @@ pub struct Relay {
 }
 
 impl Relay {
-    pub fn new(account: Arc<Account>, to_page: mpsc::Sender<Outgoing>) -> Arc<Relay> {
-        Arc::new(Relay { account, to_page, inner: Mutex::new(Inner::default()), closed: AtomicBool::new(false), stop: Notify::new() })
+    pub fn new(account: Arc<Account>, engine: Arc<Engine>, to_page: mpsc::Sender<Outgoing>) -> Arc<Relay> {
+        Arc::new(Relay { account, engine, to_page, inner: Mutex::new(Inner::default()), closed: AtomicBool::new(false), stop: Notify::new() })
     }
 
     pub fn has(&self, ch: u32) -> bool {
@@ -106,6 +114,40 @@ impl Relay {
             let me = self.clone();
             tokio::spawn(async move { me.run().await });
         }
+    }
+
+    /// Connects to tTerm now, with no channel yet (from 0.7.0): the page is
+    /// there and signed in, so the core's `vault.pairing` and `vault.changed`
+    /// reach it, and the engine can sign for its vault on this socket even
+    /// when the page shows no cloud terminal. Needs a runtime to start on;
+    /// without one it starts with the page's first message.
+    pub fn start(self: &Arc<Self>) -> bool {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return false };
+        let start = !std::mem::replace(&mut self.inner.lock().unwrap().running, true);
+        if start && !self.closed.load(Ordering::SeqCst) {
+            let me = self.clone();
+            runtime.spawn(async move { me.run().await });
+        }
+        true
+    }
+
+    /// One of the page's own vault messages, with no channel (`vault.can`,
+    /// `vault.signed`, `vault.unable`): a `vault.can` joins the engine's in
+    /// the list the core gets; the rest go as the page wrote them.
+    pub fn page_vault(self: &Arc<Self>, raw: &str, msg: &Value) {
+        let op = msg.get("op").and_then(Value::as_str).unwrap_or("");
+        let mut inner = self.inner.lock().unwrap();
+        if op == "vault.can" {
+            inner.page_can = msg.get("keys").and_then(Value::as_array).map(|keys| keys.iter().filter_map(|k| k.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            let all = joined(&self.vault_can().borrow(), &inner.page_can);
+            if let Some(link) = &inner.link {
+                let _ = link.send(Message::Text(can_message(&all).into()));
+            }
+        } else if let Some(link) = &inner.link {
+            let _ = link.send(Message::Text(raw.to_string().into()));
+        }
+        drop(inner);
+        self.start();
     }
 
     /// A message of the page for one of its channels on tTerm.
@@ -172,8 +214,12 @@ impl Relay {
         self.stop.notify_one();
     }
 
+    /// The relay is over when the page's socket went (from 0.7.0): not when
+    /// its last cloud channel did, since the socket carries the vault too
+    /// (the core's `vault.pairing`, `vault.changed`, and `vault.sign` for
+    /// the engine's keys).
     fn done(&self) -> bool {
-        self.closed.load(Ordering::SeqCst) || self.inner.lock().unwrap().channels.is_empty()
+        self.closed.load(Ordering::SeqCst)
     }
 
     async fn run(self: Arc<Self>) {
@@ -246,8 +292,16 @@ impl Relay {
     /// One connection: the channels attached, then everything both ways
     /// until it ends.
     async fn pump(&self, socket: crate::upstream::CloudSocket) -> Ended {
+        // A vault opened in an account signed out since is locked first:
+        // this socket announces nothing of it.
+        if let Some(vault) = self.engine.vault.clone() {
+            vault.check_account(&self.engine).await;
+        }
         let (mut sink, mut stream) = socket.split();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        // The vault's keys now, and whenever they change while this socket
+        // is up: the core asks a socket to sign only for what it announced.
+        let mut can = self.vault_can();
         {
             let mut inner = self.inner.lock().unwrap();
             for (ch, channel) in &inner.channels {
@@ -256,10 +310,18 @@ impl Relay {
                     let _ = tx.send(Message::Text(json!({"op": "pause", "ch": ch}).to_string().into()));
                 }
             }
-            inner.link = Some(tx);
+            let all = joined(&can.borrow_and_update(), &inner.page_can);
+            let _ = tx.send(Message::Text(can_message(&all).into()));
+            inner.link = Some(tx.clone());
         }
         let ended = loop {
             tokio::select! {
+                _ = can.changed() => {
+                    let all = joined(&can.borrow_and_update(), &self.inner.lock().unwrap().page_can);
+                    if tx.send(Message::Text(can_message(&all).into())).is_err() {
+                        break Ended::Dropped;
+                    }
+                }
                 out = rx.recv() => match out {
                     Some(message) => {
                         if sink.send(message).await.is_err() {
@@ -275,6 +337,17 @@ impl Relay {
                 came = stream.next() => match came {
                     Some(Ok(Message::Text(text))) => {
                         let text = text.as_str().to_string();
+                        // A request to sign a login the engine answers
+                        // itself: the key never goes to the page.
+                        if self.maybe_sign(&text, &tx) {
+                            continue;
+                        }
+                        // The vault's news goes on to the page once the
+                        // engine has read the vault again, so what the page
+                        // asks then (GET /api/app/vault) is new already.
+                        if self.vault_news(&text) {
+                            continue;
+                        }
                         self.heard_text(&text);
                         if self.to_page.send(Outgoing::Text(text)).await.is_err() {
                             break Ended::PageGone;
@@ -334,6 +407,82 @@ impl Relay {
 /// The attach of a channel, from where the page got to.
 fn attach_message(ch: u32, c: &Channel, focus: bool) -> String {
     json!({"op": "attach", "ch": ch, "id": c.id, "after": c.after, "cols": c.cols, "rows": c.rows, "focus": focus}).to_string()
+}
+
+/// The `vault.can` message: the fingerprints this socket can sign for now,
+/// empty when the vault is locked.
+fn can_message(keys: &[String]) -> String {
+    json!({"op": "vault.can", "keys": keys}).to_string()
+}
+
+/// The engine's fingerprints and the page's, each once, the engine's first.
+fn joined(engine: &[String], page: &[String]) -> Vec<String> {
+    let mut all = engine.to_vec();
+    for k in page {
+        if !all.contains(k) {
+            all.push(k.clone());
+        }
+    }
+    all
+}
+
+impl Relay {
+    /// What the vault can sign for, to watch; an always-empty, never-changing
+    /// one when there is no vault (so the socket still announces, as locked).
+    fn vault_can(&self) -> tokio::sync::watch::Receiver<Vec<String>> {
+        match self.engine.vault.as_ref() {
+            Some(v) => v.watch_can(),
+            None => tokio::sync::watch::channel(Vec::new()).1,
+        }
+    }
+
+    /// The core's `vault.changed` (keys or locks changed, in a browser too):
+    /// the engine reads its vault again, so what it can sign for, and so
+    /// says, follows; then the message goes on to the page. Whether it was
+    /// such a message (and so is on its way to the page already).
+    fn vault_news(&self, text: &str) -> bool {
+        if !text.contains("\"vault.changed\"") {
+            return false;
+        }
+        let Ok(msg) = serde_json::from_str::<Value>(text) else { return false };
+        if msg.get("op").and_then(Value::as_str) != Some("vault.changed") {
+            return false;
+        }
+        let Some(vault) = self.engine.vault.clone() else { return false };
+        let engine = self.engine.clone();
+        let to_page = self.to_page.clone();
+        let text = text.to_string();
+        tokio::spawn(async move {
+            vault.reload(&engine).await;
+            let _ = to_page.send(Outgoing::Text(text)).await;
+        });
+        true
+    }
+
+    /// If `text` is a `vault.sign` from the core, the engine signs it with
+    /// the vault's key and answers on this socket (`vault.signed`, or
+    /// `vault.unable` when it cannot), and the message is not passed to the
+    /// page. Whether it was such a message.
+    fn maybe_sign(&self, text: &str, link: &mpsc::UnboundedSender<Message>) -> bool {
+        let Ok(msg) = serde_json::from_str::<Value>(text) else { return false };
+        if msg.get("op").and_then(Value::as_str) != Some("vault.sign") {
+            return false;
+        }
+        let id = msg.get("id").cloned().unwrap_or(Value::Null);
+        let key = msg.get("key").and_then(Value::as_str).unwrap_or("");
+        let alg = msg.get("alg").and_then(Value::as_str).unwrap_or("");
+        let data = msg.get("data").and_then(Value::as_str).and_then(crate::crypto::from_b64u);
+        let signed = match (self.engine.vault.as_ref(), data) {
+            (Some(vault), Some(data)) => vault.sign(key, alg, &data),
+            _ => None,
+        };
+        let answer = match signed {
+            Some(sig) => json!({"op": "vault.signed", "id": id, "sig": crate::crypto::b64u(&sig)}),
+            None => json!({"op": "vault.unable", "id": id}),
+        };
+        let _ = link.send(Message::Text(answer.to_string().into()));
+        true
+    }
 }
 
 #[cfg(test)]

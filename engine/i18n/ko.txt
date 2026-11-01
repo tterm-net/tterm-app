@@ -102,3 +102,17 @@ update.not_copied = tTerm을 응용 프로그램 폴더에 복사하지 못했�
 update.not_moved = tTerm을 응용 프로그램 폴더에 넣지 못했어요({why})
 update.say_mode = 모드를 auto 또는 ask로 지정하세요.
 update.not_saved = 이 컴퓨터에 설정을 저장하지 못했어요.
+
+# ------------------------------------------------------------ vault: the Touch ID question for the vault of SSH keys
+# macOS shows each in its own dialog for Touch ID or the Mac's password,
+# after "tTerm is trying to": the end of that sentence, without a full stop.
+# The system's own sentence in each language (macOS 26, APP_ASKING_AUTH in
+# LocalAuthentication's UIAgent.loctable): most take an infinitive (de „Die
+# App „tTerm“ möchte …“, fr « … » souhaite …, pl próbuje …, ru пытается …);
+# in ja, ko and tr the string comes last, after a colon (ja …次の操作を実行し
+# ようとしています: …, tr … şu işlemi yapmaya çalışıyor: …): a noun phrase.
+vault.reason_open = tTerm 보관함 잠금 해제
+vault.reason_create = tTerm 보관함 생성
+vault.reason_lock = 이 Mac에서 tTerm 보관함을 열도록 허용
+vault.reason_approve = 새 브라우저에서 tTerm 보관함을 열도록 허용
+vault.reason_recovery = tTerm 보관함의 새 복구 코드 생성

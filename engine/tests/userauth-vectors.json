@@ -1,0 +1,84 @@
+{
+  "about": "Real SSH user-auth signing inputs (RFC 4252 section 7), captured from asyncssh 2.24.1 (the core's client, through a key pair shaped like the core's RelayKeyPair) and from OpenSSH's ssh (through an agent that records the sign request), logging in as 'deploy' to a local asyncssh server. The keys are throwaway test keys, in the vault's plaintext form. Made by a capture script outside the repository; see the test.",
+  "cases": [
+    {
+      "source": "asyncssh 2.24.1",
+      "key": "id_ed25519",
+      "alg": "ssh-ed25519",
+      "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP8u2Jv/4hVNtqi4YYiEzYxh4fKE1uyK9O5hO/XQ+22E",
+      "plaintext": "{\"v\":1,\"type\":\"ssh-ed25519\",\"jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"_y7Ym__iFU22qLhhiITNjGHh8oTW7Ir07mE79dD7bYQ\",\"d\":\"1ceEpordC9d_hSylavL2darAgV5GeGDNDpBAJXagJag\"},\"comment\":\"ed@tterm-test\"}",
+      "data": "AAAAIGAADeazw5HslcGlzNWzVl1e0bfcQIzbsncUxCbM1z6KMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAAAtzc2gtZWQyNTUxOQAAADMAAAALc3NoLWVkMjU1MTkAAAAg_y7Ym__iFU22qLhhiITNjGHh8oTW7Ir07mE79dD7bYQ"
+    },
+    {
+      "source": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.20, OpenSSL 3.0.13 30 Jan 2024",
+      "key": "id_ed25519",
+      "alg": "ssh-ed25519",
+      "note": "flags=0",
+      "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP8u2Jv/4hVNtqi4YYiEzYxh4fKE1uyK9O5hO/XQ+22E",
+      "plaintext": "{\"v\":1,\"type\":\"ssh-ed25519\",\"jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"_y7Ym__iFU22qLhhiITNjGHh8oTW7Ir07mE79dD7bYQ\",\"d\":\"1ceEpordC9d_hSylavL2darAgV5GeGDNDpBAJXagJag\"},\"comment\":\"ed@tterm-test\"}",
+      "data": "AAAAII3kFJyeVzrJOL1Im6icMhm-rNXmqaFDSRQrEQktzjEqMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAAAtzc2gtZWQyNTUxOQAAADMAAAALc3NoLWVkMjU1MTkAAAAg_y7Ym__iFU22qLhhiITNjGHh8oTW7Ir07mE79dD7bYQ"
+    },
+    {
+      "source": "asyncssh 2.24.1",
+      "key": "id_rsa",
+      "alg": "rsa-sha2-256",
+      "publicKey": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQChwCw7PCB85dV9yeHCxIYKYbukTqAWO9d0mp+WmbIB00Y/sP/4tieTjRDIiouM6KoD210NcmtBxqYakVMc02GbXVgblrIPOPAq0tIg7/bMV4359GUcjeD51Hm4uetAase2khqd1Olnogm8+F7or9cg9TCQZelShvAcn4DM0geqPcaf3fjILnmDOWqY3xJ9OygcR8H++3+cAvcRVmpjqNidaTXQqjTkJxJb3Ddm9IVGRSBlrl3HelpBzMEfj6c0yZVdxc1tHM9NiB9PU1KYxQCSetCB9nfAvenGSy6bHMG9aZJ99HLxxvOPgJzpDGv4iNUPBSqWHzaV5ARN0KFci9d7",
+      "plaintext": "{\"v\":1,\"type\":\"ssh-rsa\",\"jwk\":{\"kty\":\"RSA\",\"n\":\"ocAsOzwgfOXVfcnhwsSGCmG7pE6gFjvXdJqflpmyAdNGP7D_-LYnk40QyIqLjOiqA9tdDXJrQcamGpFTHNNhm11YG5ayDzjwKtLSIO_2zFeN-fRlHI3g-dR5uLnrQGrHtpIandTpZ6IJvPhe6K_XIPUwkGXpUobwHJ-AzNIHqj3Gn934yC55gzlqmN8SfTsoHEfB_vt_nAL3EVZqY6jYnWk10Ko05CcSW9w3ZvSFRkUgZa5dx3paQczBH4-nNMmVXcXNbRzPTYgfT1NSmMUAknrQgfZ3wL3pxksumxzBvWmSffRy8cbzj4Cc6Qxr-IjVDwUqlh82leQETdChXIvXew\",\"e\":\"AQAB\",\"d\":\"Sojq-OrGj7c7DylRsnXrzGnn1Rl0FHrD2FQOGRA-4i9wrhXKhlmt2ATHiJmrH6Xw_jD96p3gheFbll-EHILddgHoAWKKL5CNvzYBpTLel5_66QTw-Nz6IDWEV5a4rKjn2Z3uzO8ZFOuqsB0FYxTwPZwuokOL5j8O8yme6QMZjB0Kd_2P7-iXjj_weXNO5LWr2Ckwbx9fOdBm1-FsRDfpQCcNqeF9AP-W2fC_-V-YQJ0k8CDeknUE8kqjC04doY8JpVGPm9d4jpiyusAHbTpZ_MFePf7VCcmcPowBD-ivPgMq5pBVelqxQXYuWwOoOcGuR0biUa2yOU6xHg6ODYLByQ\",\"p\":\"2N_JVadxcwv4gZd_EV4mjRBC-Gspf2pA3MdNtmAoSzVYrk5DjYPLe89wvaSSJVMBftnfqwmgyQ5xbuzSQvEShevkvilvAUEXU77uHM8IIIii6rC1ZqF0PsxPzs_Ev81V26orvqxHLJz7T_wYvD0WryEcCsTobAEYBbEEvNKcJvk\",\"q\":\"vu6J0JtmVxQu7-b-CIEzZdNlhGgx_azVif3xSd9YrmX2xPfI0FMQqm0-tIzcM0ziLNqsqVirB4yQNdJy2rHVZ_d7l0yav-D39SKwRaiyTF5uk2N6FSf_IB0yhj4H3oyO6RxT7fBLtfD2I41YKW60aqCCp2oIRluJIy4T0IhaSxM\",\"dp\":\"GPl0WvvEUcZQIMRMariX4ei8fZUBm12mCIafCWB7Y2XKR5BVsSc7OI_D4OLhvZCYfH4khrK-JEkYgPieofzW8DshBVEKKm_PeuJi00h4HB7_-9zLlv0CwPSQQDWm55uCxqALF5MJQzb0rdpPEuZKBXLfotHYHg_mL0maTRBH0Sk\",\"dq\":\"BWPCbCsW1npxYMBKh37uLn-rK_OtBZYtaPnMJ-OwIywprSG5f3f4znbLAFnBlYkkEVQS76zbFxl2sK5CI75FYevwhzLYY3Y8SaUzCKRcdB9uS6bROWupngR0-qkhm7yoBBiSnfLckEQ_Dn3c8T54xVHGnmc12JaY5m9Ui9xtgBU\",\"qi\":\"UgK2M3ecahPBOnptdk_YRy8TlIUFbRXDDf3vtCqYqKu3YH0s84wfdA_aR-L1JrhLlXlHeohqQFCHRLKFxp5S56jCtnXOy5tSzXIJmLx4B172hBDyWINnB6SUTAqSvL-omAqn9PNzZljV48Yj6cz2WsLJ1EhVh_504u_-XFuZX9E\"},\"comment\":\"rsa@tterm-test\"}",
+      "data": "AAAAIND7lUL06aYGK2YESu60sUp7mQaZs7sAm7wK_VqjtcjfMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAAAxyc2Etc2hhMi0yNTYAAAEXAAAAB3NzaC1yc2EAAAADAQABAAABAQChwCw7PCB85dV9yeHCxIYKYbukTqAWO9d0mp-WmbIB00Y_sP_4tieTjRDIiouM6KoD210NcmtBxqYakVMc02GbXVgblrIPOPAq0tIg7_bMV4359GUcjeD51Hm4uetAase2khqd1Olnogm8-F7or9cg9TCQZelShvAcn4DM0geqPcaf3fjILnmDOWqY3xJ9OygcR8H--3-cAvcRVmpjqNidaTXQqjTkJxJb3Ddm9IVGRSBlrl3HelpBzMEfj6c0yZVdxc1tHM9NiB9PU1KYxQCSetCB9nfAvenGSy6bHMG9aZJ99HLxxvOPgJzpDGv4iNUPBSqWHzaV5ARN0KFci9d7"
+    },
+    {
+      "source": "asyncssh 2.24.1",
+      "key": "id_rsa",
+      "alg": "rsa-sha2-512",
+      "publicKey": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQChwCw7PCB85dV9yeHCxIYKYbukTqAWO9d0mp+WmbIB00Y/sP/4tieTjRDIiouM6KoD210NcmtBxqYakVMc02GbXVgblrIPOPAq0tIg7/bMV4359GUcjeD51Hm4uetAase2khqd1Olnogm8+F7or9cg9TCQZelShvAcn4DM0geqPcaf3fjILnmDOWqY3xJ9OygcR8H++3+cAvcRVmpjqNidaTXQqjTkJxJb3Ddm9IVGRSBlrl3HelpBzMEfj6c0yZVdxc1tHM9NiB9PU1KYxQCSetCB9nfAvenGSy6bHMG9aZJ99HLxxvOPgJzpDGv4iNUPBSqWHzaV5ARN0KFci9d7",
+      "plaintext": "{\"v\":1,\"type\":\"ssh-rsa\",\"jwk\":{\"kty\":\"RSA\",\"n\":\"ocAsOzwgfOXVfcnhwsSGCmG7pE6gFjvXdJqflpmyAdNGP7D_-LYnk40QyIqLjOiqA9tdDXJrQcamGpFTHNNhm11YG5ayDzjwKtLSIO_2zFeN-fRlHI3g-dR5uLnrQGrHtpIandTpZ6IJvPhe6K_XIPUwkGXpUobwHJ-AzNIHqj3Gn934yC55gzlqmN8SfTsoHEfB_vt_nAL3EVZqY6jYnWk10Ko05CcSW9w3ZvSFRkUgZa5dx3paQczBH4-nNMmVXcXNbRzPTYgfT1NSmMUAknrQgfZ3wL3pxksumxzBvWmSffRy8cbzj4Cc6Qxr-IjVDwUqlh82leQETdChXIvXew\",\"e\":\"AQAB\",\"d\":\"Sojq-OrGj7c7DylRsnXrzGnn1Rl0FHrD2FQOGRA-4i9wrhXKhlmt2ATHiJmrH6Xw_jD96p3gheFbll-EHILddgHoAWKKL5CNvzYBpTLel5_66QTw-Nz6IDWEV5a4rKjn2Z3uzO8ZFOuqsB0FYxTwPZwuokOL5j8O8yme6QMZjB0Kd_2P7-iXjj_weXNO5LWr2Ckwbx9fOdBm1-FsRDfpQCcNqeF9AP-W2fC_-V-YQJ0k8CDeknUE8kqjC04doY8JpVGPm9d4jpiyusAHbTpZ_MFePf7VCcmcPowBD-ivPgMq5pBVelqxQXYuWwOoOcGuR0biUa2yOU6xHg6ODYLByQ\",\"p\":\"2N_JVadxcwv4gZd_EV4mjRBC-Gspf2pA3MdNtmAoSzVYrk5DjYPLe89wvaSSJVMBftnfqwmgyQ5xbuzSQvEShevkvilvAUEXU77uHM8IIIii6rC1ZqF0PsxPzs_Ev81V26orvqxHLJz7T_wYvD0WryEcCsTobAEYBbEEvNKcJvk\",\"q\":\"vu6J0JtmVxQu7-b-CIEzZdNlhGgx_azVif3xSd9YrmX2xPfI0FMQqm0-tIzcM0ziLNqsqVirB4yQNdJy2rHVZ_d7l0yav-D39SKwRaiyTF5uk2N6FSf_IB0yhj4H3oyO6RxT7fBLtfD2I41YKW60aqCCp2oIRluJIy4T0IhaSxM\",\"dp\":\"GPl0WvvEUcZQIMRMariX4ei8fZUBm12mCIafCWB7Y2XKR5BVsSc7OI_D4OLhvZCYfH4khrK-JEkYgPieofzW8DshBVEKKm_PeuJi00h4HB7_-9zLlv0CwPSQQDWm55uCxqALF5MJQzb0rdpPEuZKBXLfotHYHg_mL0maTRBH0Sk\",\"dq\":\"BWPCbCsW1npxYMBKh37uLn-rK_OtBZYtaPnMJ-OwIywprSG5f3f4znbLAFnBlYkkEVQS76zbFxl2sK5CI75FYevwhzLYY3Y8SaUzCKRcdB9uS6bROWupngR0-qkhm7yoBBiSnfLckEQ_Dn3c8T54xVHGnmc12JaY5m9Ui9xtgBU\",\"qi\":\"UgK2M3ecahPBOnptdk_YRy8TlIUFbRXDDf3vtCqYqKu3YH0s84wfdA_aR-L1JrhLlXlHeohqQFCHRLKFxp5S56jCtnXOy5tSzXIJmLx4B172hBDyWINnB6SUTAqSvL-omAqn9PNzZljV48Yj6cz2WsLJ1EhVh_504u_-XFuZX9E\"},\"comment\":\"rsa@tterm-test\"}",
+      "data": "AAAAIDkEgJt4KZp6A6ZW-vYmfj4lPQffg4T04K0o613wc5CFMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAAAxyc2Etc2hhMi01MTIAAAEXAAAAB3NzaC1yc2EAAAADAQABAAABAQChwCw7PCB85dV9yeHCxIYKYbukTqAWO9d0mp-WmbIB00Y_sP_4tieTjRDIiouM6KoD210NcmtBxqYakVMc02GbXVgblrIPOPAq0tIg7_bMV4359GUcjeD51Hm4uetAase2khqd1Olnogm8-F7or9cg9TCQZelShvAcn4DM0geqPcaf3fjILnmDOWqY3xJ9OygcR8H--3-cAvcRVmpjqNidaTXQqjTkJxJb3Ddm9IVGRSBlrl3HelpBzMEfj6c0yZVdxc1tHM9NiB9PU1KYxQCSetCB9nfAvenGSy6bHMG9aZJ99HLxxvOPgJzpDGv4iNUPBSqWHzaV5ARN0KFci9d7"
+    },
+    {
+      "source": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.20, OpenSSL 3.0.13 30 Jan 2024",
+      "key": "id_rsa",
+      "alg": "rsa-sha2-512",
+      "note": "flags=4",
+      "publicKey": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQChwCw7PCB85dV9yeHCxIYKYbukTqAWO9d0mp+WmbIB00Y/sP/4tieTjRDIiouM6KoD210NcmtBxqYakVMc02GbXVgblrIPOPAq0tIg7/bMV4359GUcjeD51Hm4uetAase2khqd1Olnogm8+F7or9cg9TCQZelShvAcn4DM0geqPcaf3fjILnmDOWqY3xJ9OygcR8H++3+cAvcRVmpjqNidaTXQqjTkJxJb3Ddm9IVGRSBlrl3HelpBzMEfj6c0yZVdxc1tHM9NiB9PU1KYxQCSetCB9nfAvenGSy6bHMG9aZJ99HLxxvOPgJzpDGv4iNUPBSqWHzaV5ARN0KFci9d7",
+      "plaintext": "{\"v\":1,\"type\":\"ssh-rsa\",\"jwk\":{\"kty\":\"RSA\",\"n\":\"ocAsOzwgfOXVfcnhwsSGCmG7pE6gFjvXdJqflpmyAdNGP7D_-LYnk40QyIqLjOiqA9tdDXJrQcamGpFTHNNhm11YG5ayDzjwKtLSIO_2zFeN-fRlHI3g-dR5uLnrQGrHtpIandTpZ6IJvPhe6K_XIPUwkGXpUobwHJ-AzNIHqj3Gn934yC55gzlqmN8SfTsoHEfB_vt_nAL3EVZqY6jYnWk10Ko05CcSW9w3ZvSFRkUgZa5dx3paQczBH4-nNMmVXcXNbRzPTYgfT1NSmMUAknrQgfZ3wL3pxksumxzBvWmSffRy8cbzj4Cc6Qxr-IjVDwUqlh82leQETdChXIvXew\",\"e\":\"AQAB\",\"d\":\"Sojq-OrGj7c7DylRsnXrzGnn1Rl0FHrD2FQOGRA-4i9wrhXKhlmt2ATHiJmrH6Xw_jD96p3gheFbll-EHILddgHoAWKKL5CNvzYBpTLel5_66QTw-Nz6IDWEV5a4rKjn2Z3uzO8ZFOuqsB0FYxTwPZwuokOL5j8O8yme6QMZjB0Kd_2P7-iXjj_weXNO5LWr2Ckwbx9fOdBm1-FsRDfpQCcNqeF9AP-W2fC_-V-YQJ0k8CDeknUE8kqjC04doY8JpVGPm9d4jpiyusAHbTpZ_MFePf7VCcmcPowBD-ivPgMq5pBVelqxQXYuWwOoOcGuR0biUa2yOU6xHg6ODYLByQ\",\"p\":\"2N_JVadxcwv4gZd_EV4mjRBC-Gspf2pA3MdNtmAoSzVYrk5DjYPLe89wvaSSJVMBftnfqwmgyQ5xbuzSQvEShevkvilvAUEXU77uHM8IIIii6rC1ZqF0PsxPzs_Ev81V26orvqxHLJz7T_wYvD0WryEcCsTobAEYBbEEvNKcJvk\",\"q\":\"vu6J0JtmVxQu7-b-CIEzZdNlhGgx_azVif3xSd9YrmX2xPfI0FMQqm0-tIzcM0ziLNqsqVirB4yQNdJy2rHVZ_d7l0yav-D39SKwRaiyTF5uk2N6FSf_IB0yhj4H3oyO6RxT7fBLtfD2I41YKW60aqCCp2oIRluJIy4T0IhaSxM\",\"dp\":\"GPl0WvvEUcZQIMRMariX4ei8fZUBm12mCIafCWB7Y2XKR5BVsSc7OI_D4OLhvZCYfH4khrK-JEkYgPieofzW8DshBVEKKm_PeuJi00h4HB7_-9zLlv0CwPSQQDWm55uCxqALF5MJQzb0rdpPEuZKBXLfotHYHg_mL0maTRBH0Sk\",\"dq\":\"BWPCbCsW1npxYMBKh37uLn-rK_OtBZYtaPnMJ-OwIywprSG5f3f4znbLAFnBlYkkEVQS76zbFxl2sK5CI75FYevwhzLYY3Y8SaUzCKRcdB9uS6bROWupngR0-qkhm7yoBBiSnfLckEQ_Dn3c8T54xVHGnmc12JaY5m9Ui9xtgBU\",\"qi\":\"UgK2M3ecahPBOnptdk_YRy8TlIUFbRXDDf3vtCqYqKu3YH0s84wfdA_aR-L1JrhLlXlHeohqQFCHRLKFxp5S56jCtnXOy5tSzXIJmLx4B172hBDyWINnB6SUTAqSvL-omAqn9PNzZljV48Yj6cz2WsLJ1EhVh_504u_-XFuZX9E\"},\"comment\":\"rsa@tterm-test\"}",
+      "data": "AAAAIOaUR4NoD2yEe3V_CBoD66cblvUN_13oropOHgbmmNboMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAAAxyc2Etc2hhMi01MTIAAAEXAAAAB3NzaC1yc2EAAAADAQABAAABAQChwCw7PCB85dV9yeHCxIYKYbukTqAWO9d0mp-WmbIB00Y_sP_4tieTjRDIiouM6KoD210NcmtBxqYakVMc02GbXVgblrIPOPAq0tIg7_bMV4359GUcjeD51Hm4uetAase2khqd1Olnogm8-F7or9cg9TCQZelShvAcn4DM0geqPcaf3fjILnmDOWqY3xJ9OygcR8H--3-cAvcRVmpjqNidaTXQqjTkJxJb3Ddm9IVGRSBlrl3HelpBzMEfj6c0yZVdxc1tHM9NiB9PU1KYxQCSetCB9nfAvenGSy6bHMG9aZJ99HLxxvOPgJzpDGv4iNUPBSqWHzaV5ARN0KFci9d7"
+    },
+    {
+      "source": "asyncssh 2.24.1",
+      "key": "id_p256",
+      "alg": "ecdsa-sha2-nistp256",
+      "publicKey": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBNJbgzXo6TMa0KytFhdu++WjVlhglTj/NDfdLhamHXFt2ylrwsbyb9DcrUvpQ8p+OcyE6f07T8XHPnIWuzqjUkg=",
+      "plaintext": "{\"v\":1,\"type\":\"ecdsa-sha2-nistp256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"0luDNejpMxrQrK0WF2775aNWWGCVOP80N90uFqYdcW0\",\"y\":\"2ylrwsbyb9DcrUvpQ8p-OcyE6f07T8XHPnIWuzqjUkg\",\"d\":\"hEjn_j1nrmOriAr6RtKgpTEFPzegilMfFpo3XOztAak\"},\"comment\":\"p256@tterm-test\"}",
+      "data": "AAAAIIssSCkkyHyZRu8qtRgmrCygpzfLl25kdo5nqMs-7dNlMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAAaAAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQTSW4M16OkzGtCsrRYXbvvlo1ZYYJU4_zQ33S4Wph1xbdspa8LG8m_Q3K1L6UPKfjnMhOn9O0_Fxz5yFrs6o1JI"
+    },
+    {
+      "source": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.20, OpenSSL 3.0.13 30 Jan 2024",
+      "key": "id_p256",
+      "alg": "ecdsa-sha2-nistp256",
+      "note": "flags=0",
+      "publicKey": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBNJbgzXo6TMa0KytFhdu++WjVlhglTj/NDfdLhamHXFt2ylrwsbyb9DcrUvpQ8p+OcyE6f07T8XHPnIWuzqjUkg=",
+      "plaintext": "{\"v\":1,\"type\":\"ecdsa-sha2-nistp256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"0luDNejpMxrQrK0WF2775aNWWGCVOP80N90uFqYdcW0\",\"y\":\"2ylrwsbyb9DcrUvpQ8p-OcyE6f07T8XHPnIWuzqjUkg\",\"d\":\"hEjn_j1nrmOriAr6RtKgpTEFPzegilMfFpo3XOztAak\"},\"comment\":\"p256@tterm-test\"}",
+      "data": "AAAAIC9sk-eADDGnoifjOR5P6O_2FUr0WAEhmyZFhJN4Oo-wMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAAaAAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQTSW4M16OkzGtCsrRYXbvvlo1ZYYJU4_zQ33S4Wph1xbdspa8LG8m_Q3K1L6UPKfjnMhOn9O0_Fxz5yFrs6o1JI"
+    },
+    {
+      "source": "asyncssh 2.24.1",
+      "key": "id_p384",
+      "alg": "ecdsa-sha2-nistp384",
+      "publicKey": "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBOuKFYHCTf23cqwu+DKaOseSuRfYYMXYLEMQrjStw7H3UWdTPT2GHvyMcamSA/EzrUgAz4C1h0I7eNeOryAGp59T/TIpNX25dl5P5A3P2RNNgKxWSZKg+/0wlvDzL98mfg==",
+      "plaintext": "{\"v\":1,\"type\":\"ecdsa-sha2-nistp384\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-384\",\"x\":\"64oVgcJN_bdyrC74Mpo6x5K5F9hgxdgsQxCuNK3DsfdRZ1M9PYYe_IxxqZID8TOt\",\"y\":\"SADPgLWHQjt4146vIAann1P9Mik1fbl2Xk_kDc_ZE02ArFZJkqD7_TCW8PMv3yZ-\",\"d\":\"1974ndYg81z-UXuLHbSJhFWBULW6UiS4v5NFlBoOUjp5aFbLafIvOco78k5H1J8K\"},\"comment\":\"p384@tterm-test\"}",
+      "data": "AAAAILBgIveUNZVAXLHZgbRECegsZuSfWo3CqqQHDwbSD-ljMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAABNlY2RzYS1zaGEyLW5pc3RwMzg0AAAAiAAAABNlY2RzYS1zaGEyLW5pc3RwMzg0AAAACG5pc3RwMzg0AAAAYQTrihWBwk39t3KsLvgymjrHkrkX2GDF2CxDEK40rcOx91FnUz09hh78jHGpkgPxM61IAM-AtYdCO3jXjq8gBqefU_0yKTV9uXZeT-QNz9kTTYCsVkmSoPv9MJbw8y_fJn4"
+    },
+    {
+      "source": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.20, OpenSSL 3.0.13 30 Jan 2024",
+      "key": "id_p384",
+      "alg": "ecdsa-sha2-nistp384",
+      "note": "flags=0",
+      "publicKey": "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBOuKFYHCTf23cqwu+DKaOseSuRfYYMXYLEMQrjStw7H3UWdTPT2GHvyMcamSA/EzrUgAz4C1h0I7eNeOryAGp59T/TIpNX25dl5P5A3P2RNNgKxWSZKg+/0wlvDzL98mfg==",
+      "plaintext": "{\"v\":1,\"type\":\"ecdsa-sha2-nistp384\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-384\",\"x\":\"64oVgcJN_bdyrC74Mpo6x5K5F9hgxdgsQxCuNK3DsfdRZ1M9PYYe_IxxqZID8TOt\",\"y\":\"SADPgLWHQjt4146vIAann1P9Mik1fbl2Xk_kDc_ZE02ArFZJkqD7_TCW8PMv3yZ-\",\"d\":\"1974ndYg81z-UXuLHbSJhFWBULW6UiS4v5NFlBoOUjp5aFbLafIvOco78k5H1J8K\"},\"comment\":\"p384@tterm-test\"}",
+      "data": "AAAAIO7fMvL03iL-zjPxpAF1QCYMLVNUFq9rLJWNHiDI92YhMgAAAAZkZXBsb3kAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAABNlY2RzYS1zaGEyLW5pc3RwMzg0AAAAiAAAABNlY2RzYS1zaGEyLW5pc3RwMzg0AAAACG5pc3RwMzg0AAAAYQTrihWBwk39t3KsLvgymjrHkrkX2GDF2CxDEK40rcOx91FnUz09hh78jHGpkgPxM61IAM-AtYdCO3jXjq8gBqefU_0yKTV9uXZeT-QNz9kTTYCsVkmSoPv9MJbw8y_fJn4"
+    }
+  ],
+  "otherKey": {
+    "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMYQDZFDjhFGivbPzGE18CgFlo4TNH3qiLLBnbXP0/6p"
+  }
+}

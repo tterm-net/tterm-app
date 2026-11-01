@@ -122,6 +122,29 @@ struct Fake {
     fail_once: HashMap<String, u16>,
     /// The account's language (from 0.6.0), None while none is chosen.
     language: Option<String>,
+    /// The vault (from 0.7.0): the object as GET /api/vault gives it, its
+    /// pairings, the own-machines added, and what drives the socket's
+    /// vault.sign.
+    vault: Option<Value>,
+    pairings: HashMap<String, Value>,
+    own: Vec<Value>,
+    reachable_ok: bool,
+    principal_n: u32,
+    /// The vault.sign requests the page socket sends, each once it hears a
+    /// vault.can with its key: (id, fingerprint, alg, data b64u).
+    sign_requests: Vec<(String, String, String, String)>,
+    /// The vault.signed / vault.unable the engine answered over the socket,
+    /// and the vault.can key lists the socket heard.
+    signed: Vec<Value>,
+    cans: Vec<Vec<String>>,
+    /// What the socket is to send the engine next (vault.changed, …).
+    push: Vec<Value>,
+    /// The locks said used, the keys taken out of the vault, the locks
+    /// added (POST /api/vault/locks), and a refusal for the next own machine.
+    lock_used: Vec<String>,
+    deleted_keys: Vec<String>,
+    locks_added: usize,
+    own_refuse: Option<(u16, String)>,
 }
 
 impl Fake {
@@ -420,6 +443,104 @@ fn answer(st: &Arc<Mutex<Fake>>, base: &str, method: &str, path: &str, headers: 
             (201, json!({"machine": {"id": id, "name": text("name"), "projectId": "p1", "code": "P"}, "created": true}))
         }
         ("GET", "/api/state") => (200, state_json(&st)),
+        // ------------------------------------------------- the vault (0.7.0)
+        ("GET", "/api/vault") => (200, json!({"vault": st.vault.clone()})),
+        ("POST", "/api/vault") => {
+            if st.vault.is_some() {
+                return (409, json!({"error": "a vault exists already"}));
+            }
+            // A browser makes it with no lock (vault.py create_vault).
+            let lock = &body["lock"];
+            let locks = if lock.is_object() { json!([{"id": lock["id"], "kind": lock["kind"], "label": lock["label"], "wrap": lock["wrap"], "thisDevice": true}]) } else { json!([]) };
+            let vault = json!({
+                "id": text("id"),
+                "prfSalt": "AAAA",
+                "recoverySalt": text("recoverySalt"),
+                "recoveryWrap": text("recoveryWrap"),
+                "locks": locks,
+                "keys": [],
+            });
+            st.vault = Some(vault.clone());
+            (201, json!({"vault": vault}))
+        }
+        ("GET", "/api/vault/recovery") => match st.vault.as_ref() {
+            Some(v) => (200, json!({"recoverySalt": v["recoverySalt"], "recoveryWrap": v["recoveryWrap"]})),
+            None => (404, json!({"error": "This account has no vault."})),
+        },
+        ("POST", "/api/vault/locks") => {
+            let Some(v) = st.vault.as_mut() else { return (404, json!({"error": "This account has no vault."})) };
+            if body["kind"] != "app" && body["kind"] != "passkey" {
+                return (422, json!({"error": "A lock is a passkey or the app."}));
+            }
+            let wrap_ok = tterm_engine::crypto::from_b64u(&text("wrap")).map(|w| w.len() == 60).unwrap_or(false);
+            if !wrap_ok {
+                return (422, json!({"error": "The wrap is not 60 bytes."}));
+            }
+            v["locks"].as_array_mut().unwrap().push(json!({"id": text("id"), "kind": text("kind"), "label": text("label"), "wrap": text("wrap"), "thisDevice": true}));
+            st.locks_added += 1;
+            (201, json!({"vault": st.vault.clone()}))
+        }
+        ("PUT", "/api/vault/recovery") => {
+            if let Some(v) = st.vault.as_mut() {
+                v["recoverySalt"] = json!(text("recoverySalt"));
+                v["recoveryWrap"] = json!(text("recoveryWrap"));
+            }
+            (204, Value::Null)
+        }
+        ("POST", "/api/vault/keys") => {
+            let taken = st.vault.as_ref().map(|v| v["keys"].as_array().unwrap().iter().any(|k| k["fingerprint"] == text("fingerprint").as_str())).unwrap_or(false);
+            if taken {
+                return (409, json!({"error": "This key is in the vault already."}));
+            }
+            let key = json!({
+                "id": text("id"), "name": text("name"), "type": text("type"),
+                "publicKey": text("publicKey"), "fingerprint": text("fingerprint"),
+                "sealed": text("sealed"), "source": text("source"), "servers": [],
+            });
+            if let Some(v) = st.vault.as_mut() {
+                v["keys"].as_array_mut().unwrap().push(key);
+            }
+            (201, json!({"vault": st.vault.clone()}))
+        }
+        ("POST", "/api/machines/reachable") => (200, json!({"ok": st.reachable_ok})),
+        ("POST", "/api/machines/own/line") => {
+            st.principal_n += 1;
+            let principal = format!("m-{}", st.principal_n);
+            (200, json!({"principal": principal, "line": format!("cert-authority,principals=\"{principal}\" ssh-ed25519 AAAACA tterm-web ca-1")}))
+        }
+        ("POST", "/api/machines/own") => {
+            if let Some((status, why)) = st.own_refuse.take() {
+                return (status, json!({"error": why}));
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            let m = json!({"id": id, "name": text("name"), "method": text("method"), "host": body["host"].clone(), "keyId": body["keyId"].clone(), "via": body["via"].clone(), "target": body["target"].clone(), "jump": body["jump"].clone()});
+            st.own.push(m.clone());
+            (201, json!({"machine": m}))
+        }
+        (m, p) if p.starts_with("/api/vault/pairings/") => {
+            return vault_pairing(&mut st, m, p, &body);
+        }
+        ("POST", p) if p.starts_with("/api/vault/locks/") && p.ends_with("/used") => {
+            let id = p.trim_start_matches("/api/vault/locks/").trim_end_matches("/used").to_string();
+            let known = st.vault.as_ref().map(|v| v["locks"].as_array().unwrap().iter().any(|l| l["id"] == id.as_str())).unwrap_or(false);
+            if !known {
+                return (404, json!({"error": "no such lock"}));
+            }
+            st.lock_used.push(id);
+            (204, Value::Null)
+        }
+        ("DELETE", p) if p.starts_with("/api/vault/keys/") => {
+            let id = p.trim_start_matches("/api/vault/keys/").to_string();
+            let Some(v) = st.vault.as_mut() else { return (404, json!({"error": "This account has no vault."})) };
+            let keys = v["keys"].as_array_mut().unwrap();
+            let before = keys.len();
+            keys.retain(|k| k["id"] != id.as_str());
+            if keys.len() == before {
+                return (404, json!({"error": "No such key."}));
+            }
+            st.deleted_keys.push(id);
+            (204, Value::Null)
+        }
         ("POST", "/api/folders") => {
             let f = json!({"id": uuid::Uuid::new_v4().to_string(), "projectId": text("projectId"), "name": text("name"), "notes": []});
             st.folders.push(f.clone());
@@ -466,6 +587,52 @@ fn answer(st: &Arc<Mutex<Fake>>, base: &str, method: &str, path: &str, headers: 
     }
 }
 
+/// The vault's pairings in the fake tTerm: the new browser (the test) seeds
+/// one waiting, with the commit and the pubB it will reveal; when the Mac
+/// answers with pubA, the browser reveals pubB at once.
+fn vault_pairing(st: &mut Fake, method: &str, path: &str, body: &Value) -> (u16, Value) {
+    let rest = path.trim_start_matches("/api/vault/pairings/");
+    let (id, action) = rest.split_once('/').unwrap_or((rest, ""));
+    let text = |k: &str| body.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    match (method, action) {
+        ("GET", "") => match st.pairings.get(id) {
+            Some(p) => (200, p.clone()),
+            None => (404, json!({"error": "no such pairing"})),
+        },
+        ("POST", "answer") => {
+            let Some(p) = st.pairings.get_mut(id) else { return (404, json!({"error": "no such pairing"})) };
+            // Once only, as the core: from waiting.
+            if p["state"] != "waiting" {
+                return (409, json!({"error": "This request is not at that step."}));
+            }
+            p["pubA"] = json!(text("pubA"));
+            p["state"] = json!("answered");
+            // The browser reveals its pubB as soon as it has pubA.
+            if let Some(reveal) = p.get("_pubB").cloned() {
+                p["pubB"] = reveal;
+                p["state"] = json!("revealed");
+            }
+            (204, Value::Null)
+        }
+        ("POST", "approve") => {
+            let Some(p) = st.pairings.get_mut(id) else { return (404, json!({"error": "no such pairing"})) };
+            if p["state"] != "revealed" {
+                return (409, json!({"error": "This request is not at that step."}));
+            }
+            p["sealed"] = json!(text("sealed"));
+            p["state"] = json!("approved");
+            (204, Value::Null)
+        }
+        ("POST", "deny") => {
+            if let Some(p) = st.pairings.get_mut(id) {
+                p["state"] = json!("denied");
+            }
+            (204, Value::Null)
+        }
+        _ => (404, json!({"error": "no such pairing request"})),
+    }
+}
+
 /// The page's socket: a terminal of its own, 11111111-…, that greets and
 /// echoes the keys, numbering what it sends.
 #[allow(clippy::result_large_err)]
@@ -494,10 +661,19 @@ async fn socket(stream: TcpStream, st: Arc<Mutex<Fake>>, mut gone: tokio::sync::
         return;
     }
     let mut seq: HashMap<u32, u64> = HashMap::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
     loop {
         let message = tokio::select! {
             m = source.next() => m,
             _ = gone.changed() => return,
+            // What the test has for the engine (vault.changed, …).
+            _ = tick.tick() => {
+                let push = std::mem::take(&mut st.lock().unwrap().push);
+                for m in push {
+                    let _ = sink.send(Message::Text(m.to_string().into())).await;
+                }
+                continue;
+            }
         };
         let Some(Ok(message)) = message else { return };
         if std::mem::take(&mut st.lock().unwrap().close_4401) {
@@ -508,6 +684,29 @@ async fn socket(stream: TcpStream, st: Arc<Mutex<Fake>>, mut gone: tokio::sync::
             Message::Text(text) => {
                 let msg: Value = serde_json::from_str(text.as_str()).unwrap_or(Value::Null);
                 let ch = msg["ch"].as_u64().unwrap_or(0) as u32;
+                // The vault over the socket (0.7.0): the engine announces
+                // which keys it can sign for, and answers a request to sign.
+                if msg["op"] == "vault.can" {
+                    let keys: Vec<String> = msg["keys"].as_array().into_iter().flatten().filter_map(|k| k.as_str().map(str::to_string)).collect();
+                    // Ask it to sign, each request once, when it can sign
+                    // for the key.
+                    let asks: Vec<(String, String, String, String)> = {
+                        let mut f = st.lock().unwrap();
+                        f.cans.push(keys.clone());
+                        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut f.sign_requests).into_iter().partition(|(_, fp, _, _)| keys.contains(fp));
+                        f.sign_requests = later;
+                        now
+                    };
+                    for (id, fp, alg, data) in asks {
+                        let ask = json!({"op": "vault.sign", "id": id, "key": fp, "alg": alg, "data": data, "machine": "web-01", "keyName": "id_ed25519"});
+                        let _ = sink.send(Message::Text(ask.to_string().into())).await;
+                    }
+                    continue;
+                }
+                if msg["op"] == "vault.signed" || msg["op"] == "vault.unable" {
+                    st.lock().unwrap().signed.push(msg.clone());
+                    continue;
+                }
                 if msg["op"] == "attach" {
                     st.lock().unwrap().attaches.push(msg.clone());
                     if msg["id"] != "11111111-1111-1111-1111-111111111111" {
@@ -663,7 +862,8 @@ async fn app(cloud: &Cloud) -> App {
 }
 
 async fn app_in(cloud: &Cloud, dir: PathBuf, env: PathBuf, host: Arc<FakeHost>) -> App {
-    let engine = Engine::with_cloud(&dir, &cloud.base, host.clone(), &env).expect("engine");
+    let keeper = common::TestKeeper::new();
+    let engine = Engine::with_cloud(&dir, &cloud.base, host.clone(), keeper, &env).expect("engine");
     engine.start_background();
     App { engine, host, env, dir }
 }
@@ -2230,4 +2430,794 @@ async fn a_keychain_that_cannot_be_read_leaves_the_login_item() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(b.engine.reach.kept_now(), None, "not known: the login item stays as it is");
     assert_eq!(reach(&b.engine).await["open"], true);
+}
+
+// ------------------------------------------- the vault of SSH keys (0.7.0)
+
+/// The vault's local API, against the fake tTerm (vault.rs). These share a
+/// temp home when they read ~/.ssh, so they take turns.
+static HOME_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+async fn app_vault(e: &Arc<Engine>, method: &str, path: &str, body: Value) -> (u16, Value) {
+    request(e, method, path, body).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_vault_is_created_opened_and_locked() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    sign_in(&cloud, &a).await;
+    // Before: a Mac can hold a vault, none exists, it is not open.
+    let (status, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["available"], true);
+    assert_eq!(v["exists"], false);
+    assert_eq!(v["open"], false);
+    // Create: a recovery code once, the vault held open, the KEK kept.
+    let (status, made) = app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    assert_eq!(status, 200, "{made}");
+    let code = made["recoveryCode"].as_str().unwrap();
+    assert_eq!(code.split('-').count(), 6, "{code}");
+    assert!(cloud.st.lock().unwrap().vault.is_some(), "tTerm has the vault");
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!(v["exists"], true);
+    assert_eq!(v["open"], true, "create holds it open");
+    // Lock, then open again from the keychain and tTerm's wrap.
+    let (status, locked) = app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    assert_eq!(status, 200, "{locked}");
+    assert_eq!(locked["open"], false);
+    let (status, opened) = app_vault(&a.engine, "POST", "/api/app/vault/open", Value::Null).await;
+    assert_eq!(status, 200, "{opened}");
+    assert_eq!(opened["open"], true);
+    // A second create is refused: one vault per account.
+    let (status, _) = app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    assert_eq!(status, 409);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_recovery_code_replaces_the_old() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    sign_in(&cloud, &a).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    let first_salt = cloud.st.lock().unwrap().vault.as_ref().unwrap()["recoverySalt"].as_str().unwrap().to_string();
+    let (status, again) = app_vault(&a.engine, "POST", "/api/app/vault/recovery", Value::Null).await;
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["recoveryCode"].as_str().unwrap().split('-').count(), 6);
+    let second_salt = cloud.st.lock().unwrap().vault.as_ref().unwrap()["recoverySalt"].as_str().unwrap().to_string();
+    assert_ne!(first_salt, second_salt, "a new salt and wrap");
+}
+
+/// An app whose vault keeper the test can look into.
+async fn app_kept(cloud: &Cloud) -> (App, Arc<common::TestKeeper>) {
+    let dir = common::data_dir();
+    let env = dir.join("home").join(".tterm-web").join("env");
+    let keeper = common::TestKeeper::new();
+    let host = Arc::new(FakeHost::default());
+    let engine = Engine::with_cloud(&dir, &cloud.base, host.clone(), keeper.clone(), &env).expect("engine");
+    engine.start_background();
+    (App { engine, host, env, dir }, keeper)
+}
+
+/// The vault key, as this Mac's lock in the fake tTerm and the KEK the
+/// keeper kept give it back.
+fn vault_key_of(cloud: &Cloud, keeper: &common::TestKeeper) -> [u8; 32] {
+    use tterm_engine::crypto;
+    let vault = cloud.st.lock().unwrap().vault.clone().expect("a vault");
+    let lock = vault["locks"].as_array().unwrap().iter().find(|l| l["kind"] == "app").expect("an app lock").clone();
+    let kek = crypto::key_of(&keeper.kek(vault["id"].as_str().unwrap()).expect("a KEK")).unwrap();
+    let vk = crypto::open_key(&kek, &crypto::from_b64u(lock["wrap"].as_str().unwrap()).unwrap(), &crypto::lock_aad(lock["id"].as_str().unwrap())).expect("the lock opens");
+    *vk
+}
+
+/// A vault as a browser makes it (vault.py create_vault, no lock): its
+/// recovery code's salt and wrap of `vk`, and a passkey lock of the
+/// browser's, which is no lock of this Mac's.
+fn browser_vault(vk: &[u8; 32], code: &str) -> Value {
+    use tterm_engine::crypto::{self, b64u};
+    let id = uuid::Uuid::new_v4().to_string();
+    let salt = [5u8; 16];
+    let kek = crypto::recovery_kek(&crypto::normalize_code(code).unwrap(), &salt);
+    let wrap = crypto::seal(&kek, vk, &crypto::recovery_aad(&id));
+    json!({"id": id, "prfSalt": "AAAA", "recoverySalt": b64u(&salt), "recoveryWrap": b64u(&wrap),
+        "locks": [{"id": uuid::Uuid::new_v4().to_string(), "kind": "passkey", "label": "Safari on Mac", "wrap": b64u(&[1u8; 60]), "credentialId": "AAAA", "thisDevice": false}],
+        "keys": []})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_without_touch_id_is_refused() {
+    let cloud = Cloud::start().await;
+    let (a, keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    // The person cancels the LocalAuthentication: open is refused with 403
+    // (not the 401 of a session that ended), and the gate was asked.
+    keeper.auth_fails.store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = keeper.auths();
+    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/open", Value::Null).await;
+    assert_eq!(status, 403, "{why}");
+    assert!(why.get("signedOut").is_none(), "{why}");
+    assert!(why["error"].as_str().unwrap().contains("Touch ID"), "{why}");
+    assert!(keeper.auths() > before, "the gate was asked");
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!(v["open"], false, "{v}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signing_out_forgets_the_vaults_key_locked_or_open() {
+    let cloud = Cloud::start().await;
+    let (a, keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    let vault_id = cloud.st.lock().unwrap().vault.as_ref().unwrap()["id"].as_str().unwrap().to_string();
+    // Locked first: Sign out forgets the KEK all the same.
+    app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    assert!(keeper.kek(&vault_id).is_some());
+    let (status, out) = request(&a.engine, "POST", "/api/auth/signout", json!({})).await;
+    assert_eq!(status, 200, "{out}");
+    assert!(keeper.kek(&vault_id).is_none(), "the KEK is gone");
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!(v["open"], false, "{v}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_forgotten_in_a_browser_locks_the_vault_here() {
+    let cloud = Cloud::start().await;
+    let (a, keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    let vault_id = cloud.st.lock().unwrap().vault.as_ref().unwrap()["id"].as_str().unwrap().to_string();
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!(v["open"], true);
+    // Devices › Forget in a browser: the app's next call to tTerm finds its
+    // device gone, and it is signed out here. The vault opened in that
+    // account locks, its KEK goes, and the API says signed out.
+    cloud.forget_devices();
+    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/recovery", Value::Null).await;
+    assert_eq!(status, 401, "{why}");
+    assert_eq!(why["signedOut"], true, "{why}");
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!(v["open"], false, "{v}");
+    assert!(v["keys"].as_array().unwrap().is_empty());
+    assert!(keeper.kek(&vault_id).is_none(), "the KEK is gone");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vault_made_in_a_browser_opens_once_with_the_code_then_with_touch_id() {
+    use tterm_engine::crypto;
+    let cloud = Cloud::start().await;
+    let (a, keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    let vk = [9u8; 32];
+    let vault = browser_vault(&vk, "K7QF-29XM-PL4D-8VHT-R2NC-6WJB");
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    cloud.st.lock().unwrap().vault = Some(vault);
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!((v["exists"].clone(), v["open"].clone()), (json!(true), json!(false)), "{v}");
+
+    // Without the code: this Mac has no lock of it, and Touch ID is not
+    // asked for nothing.
+    let before = keeper.auths();
+    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({})).await;
+    assert_eq!(status, 409, "{why}");
+    assert!(why["error"].as_str().unwrap().contains("recovery code"), "{why}");
+    assert_eq!(keeper.auths(), before);
+    // Not a code, or another vault's: 422, and no lock.
+    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({"recoveryCode": "not a code"})).await;
+    assert_eq!(status, 422, "{why}");
+    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({"recoveryCode": "AAAA-AAAA-AAAA-AAAA-AAAA-AAAA"})).await;
+    assert_eq!(status, 422, "{why}");
+    assert_eq!(cloud.st.lock().unwrap().locks_added, 0);
+    assert_eq!(keeper.auths(), before, "a wrong code asks no Touch ID");
+
+    // The right one, as a person might type it: open, and this Mac has its
+    // own lock now, whose wrap opens with the KEK it kept.
+    let (status, opened) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({"recoveryCode": "k7qf 29xm pl4d 8vht r2nc 6wjb"})).await;
+    assert_eq!(status, 200, "{opened}");
+    assert_eq!(opened["open"], true);
+    assert_eq!(keeper.auths(), before + 1, "Touch ID once, for this Mac's lock");
+    assert_eq!(cloud.st.lock().unwrap().locks_added, 1);
+    assert_eq!(vault_key_of(&cloud, &keeper), vk, "the lock holds the vault key");
+    let lock_id = cloud.st.lock().unwrap().vault.as_ref().unwrap()["locks"].as_array().unwrap().iter().find(|l| l["kind"] == "app").unwrap()["id"].as_str().unwrap().to_string();
+    let lock = cloud.st.lock().unwrap().vault.as_ref().unwrap()["locks"].as_array().unwrap().iter().find(|l| l["kind"] == "app").unwrap().clone();
+    assert!(lock["label"].as_str().unwrap().starts_with("tTerm for ") && lock["label"].as_str().unwrap().contains(" on "), "{lock}");
+    assert_eq!(crypto::from_b64u(lock["wrap"].as_str().unwrap()).unwrap().len(), 60);
+
+    // Locked, it opens again with Touch ID alone, and the lock is said used.
+    app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    let (status, opened) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({})).await;
+    assert_eq!(status, 200, "{opened}");
+    assert_eq!(keeper.auths(), before + 2);
+    assert!(until(5, || cloud.st.lock().unwrap().lock_used.contains(&lock_id)).await, "the lock was said used");
+    // The code again, with a lock here: the lock stays the one.
+    app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    let (status, _) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({"recoveryCode": "K7QF-29XM-PL4D-8VHT-R2NC-6WJB"})).await;
+    assert_eq!(status, 200);
+    assert_eq!(cloud.st.lock().unwrap().locks_added, 1, "no second lock");
+    assert!(keeper.kek(&vault_id).is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn this_macs_lock_taken_off_in_a_browser_locks_the_vault_here() {
+    let cloud = Cloud::start().await;
+    let (a, keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    let vault_id = cloud.st.lock().unwrap().vault.as_ref().unwrap()["id"].as_str().unwrap().to_string();
+    assert!(keeper.kek(&vault_id).is_some());
+    // In a browser's Settings › Keys this Mac's lock is taken off; tTerm
+    // says vault.changed, and the engine reads the vault again.
+    {
+        let mut st = cloud.st.lock().unwrap();
+        let v = st.vault.as_mut().unwrap();
+        v["locks"] = json!([{"id": uuid::Uuid::new_v4().to_string(), "kind": "passkey", "label": "Safari", "wrap": tterm_engine::crypto::b64u(&[1u8; 60]), "credentialId": "AAAA", "thisDevice": false}]);
+    }
+    let vault = a.engine.vault.clone().unwrap();
+    vault.reload(&a.engine).await;
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!(v["open"], false, "locked here: {v}");
+    assert!(keeper.kek(&vault_id).is_none(), "its KEK is no use and is gone");
+    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({})).await;
+    assert_eq!(status, 409, "{why}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_browser_is_paired_while_the_vault_is_locked() {
+    use tterm_engine::crypto;
+    let cloud = Cloud::start().await;
+    let (a, keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    let id = "abcdefab-cdef-4abc-8def-0123456789ab";
+    let (pub_b, priv_b) = x25519_pair();
+    let commit = crypto::b64u(&crypto::commit_of(&pub_b));
+    cloud.st.lock().unwrap().pairings.insert(id.to_string(), json!({"id": id, "state": "waiting", "commit": commit, "_pubB": crypto::b64u(&pub_b)}));
+    // The page answers as soon as the request comes, the vault locked: the
+    // six digits, and no Touch ID for that.
+    let before = keeper.auths();
+    let (status, ans) = app_vault(&a.engine, "POST", &format!("/api/app/vault/pairings/{id}/answer"), Value::Null).await;
+    assert_eq!(status, 200, "{ans}");
+    assert_eq!(keeper.auths(), before);
+    // Asked again (the page shown twice), the same digits: pubA is posted
+    // once (the fake, as the core, takes an answer once).
+    let (status, again) = app_vault(&a.engine, "POST", &format!("/api/app/vault/pairings/{id}/answer"), Value::Null).await;
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["sas"], ans["sas"]);
+    // Allow: one Touch ID opens the vault and seals its key for the browser.
+    let (status, done) = app_vault(&a.engine, "POST", &format!("/api/app/vault/pairings/{id}/approve"), Value::Null).await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(keeper.auths(), before + 1, "one Touch ID");
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!(v["open"], true, "opened for it: {v}");
+    let pairing = cloud.st.lock().unwrap().pairings.get(id).cloned().unwrap();
+    assert_eq!(pairing["state"], "approved");
+    let pub_a = crypto::from_b64u(pairing["pubA"].as_str().unwrap()).unwrap();
+    let kek = crypto::pair_kek(&x25519_agree(&priv_b, &pub_a), &pub_a, &pub_b);
+    let vk = crypto::open_key(&kek, &crypto::from_b64u(pairing["sealed"].as_str().unwrap()).unwrap(), &crypto::pair_aad(id)).expect("the browser opens it");
+    assert_eq!(*vk, vault_key_of(&cloud, &keeper), "the vault's own key");
+    // Over: a second Allow is refused.
+    let (status, _) = app_vault(&a.engine, "POST", &format!("/api/app/vault/pairings/{id}/approve"), Value::Null).await;
+    assert_eq!(status, 409);
+}
+
+/// A key of the vault for the socket's checks: the asyncssh Ed25519 case of
+/// tests/userauth-vectors.json, sealed with the vault's key into the fake
+/// tTerm's vault. Its fingerprint, and a login it really signed.
+fn seal_vector_key(cloud: &Cloud, vk: &[u8; 32]) -> (String, Value) {
+    use tterm_engine::crypto;
+    let vectors: Value = serde_json::from_str(include_str!("userauth-vectors.json")).unwrap();
+    let case = vectors["cases"].as_array().unwrap().iter().find(|c| c["key"] == "id_ed25519" && c["source"].as_str().unwrap().starts_with("asyncssh")).unwrap().clone();
+    let plaintext = case["plaintext"].as_str().unwrap();
+    let fingerprint = tterm_engine::sshkeys::fingerprint(plaintext.as_bytes()).unwrap();
+    let key_id = uuid::Uuid::new_v4().to_string();
+    let sealed = crypto::seal(vk, plaintext.as_bytes(), &crypto::key_aad(&key_id));
+    let key = json!({"id": key_id, "name": "id_ed25519", "type": "ssh-ed25519", "publicKey": case["publicKey"], "fingerprint": fingerprint, "sealed": crypto::b64u(&sealed), "source": "file", "servers": []});
+    cloud.st.lock().unwrap().vault.as_mut().unwrap()["keys"].as_array_mut().unwrap().push(key);
+    (fingerprint, case)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_engine_signs_logins_on_the_socket_and_nothing_else() {
+    use tterm_engine::crypto;
+    let cloud = Cloud::start().await;
+    let (a, keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    let (fingerprint, case) = seal_vector_key(&cloud, &vault_key_of(&cloud, &keeper));
+    let login = case["data"].as_str().unwrap().to_string();
+    let arbitrary = crypto::b64u(b"an SSHSIG, a git commit, a challenge of anything");
+    let mut trailing = crypto::from_b64u(&login).unwrap();
+    trailing.push(0);
+    cloud.st.lock().unwrap().sign_requests = vec![
+        ("sign-any".into(), fingerprint.clone(), "ssh-ed25519".into(), arbitrary),
+        ("sign-trailing".into(), fingerprint.clone(), "ssh-ed25519".into(), crypto::b64u(&trailing)),
+        ("sign-alg".into(), fingerprint.clone(), "rsa-sha2-256".into(), login.clone()),
+        ("sign-login".into(), fingerprint.clone(), "ssh-ed25519".into(), login.clone()),
+    ];
+    // The page opens its socket and attaches nothing: the engine's socket
+    // on tTerm is up all the same. tTerm says vault.changed (the key added
+    // in a browser) and the engine reads the vault again: then it announces
+    // the key, and the page hears vault.changed after that.
+    let mut page = Page::new(&a.engine);
+    cloud.st.lock().unwrap().push.push(json!({"op": "vault.changed"}));
+    assert!(until(10, || cloud.st.lock().unwrap().signed.len() >= 4).await, "the engine answered: {:?}", cloud.st.lock().unwrap().signed);
+    let signed = cloud.st.lock().unwrap().signed.clone();
+    let by_id = |id: &str| signed.iter().find(|m| m["id"] == id).cloned().unwrap();
+    assert_eq!(by_id("sign-any")["op"], "vault.unable", "not a login");
+    assert_eq!(by_id("sign-trailing")["op"], "vault.unable", "bytes after the login");
+    assert_eq!(by_id("sign-alg")["op"], "vault.unable", "another algorithm than the login's");
+    let ok = by_id("sign-login");
+    assert_eq!(ok["op"], "vault.signed", "{ok}");
+    let sig = crypto::from_b64u(ok["sig"].as_str().unwrap()).unwrap();
+    verify_ed25519(case["publicKey"].as_str().unwrap(), &crypto::from_b64u(&login).unwrap(), &sig);
+    // The page never saw a vault.sign; it heard vault.changed.
+    assert!(page.until(5, |p| p.msgs.iter().any(|m| m["op"] == "vault.changed")).await, "{:?}", page.msgs);
+    assert!(!page.msgs.iter().any(|m| m["op"] == "vault.sign"), "the sign requests stayed in the engine");
+    // The page's own vault.can joins the engine's in what tTerm hears.
+    page.send(json!({"op": "vault.can", "keys": ["SHA256:the-pages-own"]})).await;
+    assert!(until(5, || cloud.st.lock().unwrap().cans.iter().any(|c| c.contains(&fingerprint) && c.contains(&"SHA256:the-pages-own".to_string()))).await, "{:?}", cloud.st.lock().unwrap().cans);
+    // Locked: the key is no longer announced.
+    app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    assert!(until(5, || cloud.st.lock().unwrap().cans.last().map(|c| !c.contains(&fingerprint)).unwrap_or(false)).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_browser_is_paired_from_the_mac() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    sign_in(&cloud, &a).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    // The new browser makes its X25519 pair and seeds a waiting pairing
+    // with its commit and the pubB it will reveal.
+    let id = "abcdefab-cdef-4abc-8def-abcdefabcdef";
+    let (pub_b, priv_b) = x25519_pair();
+    let commit = tterm_engine::crypto::b64u(&tterm_engine::crypto::commit_of(&pub_b));
+    cloud.st.lock().unwrap().pairings.insert(id.to_string(), json!({"id": id, "state": "waiting", "commit": commit, "_pubB": tterm_engine::crypto::b64u(&pub_b)}));
+    // The Mac answers: posts pubA, waits for pubB, returns the six digits.
+    let (status, ans) = app_vault(&a.engine, "POST", &format!("/api/app/vault/pairings/{id}/answer"), Value::Null).await;
+    assert_eq!(status, 200, "{ans}");
+    let sas = ans["sas"].as_str().unwrap();
+    assert_eq!(sas.len(), 7, "{sas}");
+    // Approve: the Mac seals the vault key for the browser.
+    let (status, done) = app_vault(&a.engine, "POST", &format!("/api/app/vault/pairings/{id}/approve"), Value::Null).await;
+    assert_eq!(status, 200, "{done}");
+    let pairing = cloud.st.lock().unwrap().pairings.get(id).cloned().unwrap();
+    assert_eq!(pairing["state"], "approved");
+    // The six digits match what the browser works out from both public keys.
+    let pub_a = tterm_engine::crypto::from_b64u(pairing["pubA"].as_str().unwrap()).unwrap();
+    assert_eq!(sas, tterm_engine::crypto::sas_of(&pub_a, &pub_b));
+    // The browser opens the sealed vault key with the shared secret.
+    let sealed = tterm_engine::crypto::from_b64u(pairing["sealed"].as_str().unwrap()).unwrap();
+    let shared = x25519_agree(&priv_b, &pub_a);
+    let kek = tterm_engine::crypto::pair_kek(&shared, &pub_a, &pub_b);
+    let vk = tterm_engine::crypto::open_key(&kek, &sealed, &tterm_engine::crypto::pair_aad(id));
+    assert!(vk.is_some(), "the browser gets the vault key");
+}
+
+/// The fake ssh of the move checks: `ssh -G` is the real ssh's; a login is
+/// played as TTERM_FAKE_SSH_* say, and written down in the log: the
+/// arguments, what the askpass helper answered to a passphrase question and
+/// to two others it must refuse, and for `sh -s` the script runs here with
+/// the fake server's home as HOME.
+const FAKE_SSH: &str = r#"#!/bin/sh
+log="${TTERM_FAKE_SSH_LOG:-/dev/null}"
+for a in "$@"; do
+  if [ "$a" = "-G" ]; then exec "$TTERM_FAKE_SSH_REAL" "$@"; fi
+done
+printf 'ssh' >> "$log"; for a in "$@"; do printf ' [%s]' "$a" >> "$log"; done; printf '\n' >> "$log"
+key=""; verbose=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) shift; break ;;
+    -i) key="$2"; shift ;;
+    -v) verbose=1 ;;
+    -o|-F|-p|-l|-J|-E) shift ;;
+  esac
+  shift
+done
+alias="$1"; shift
+if [ -n "${SSH_ASKPASS:-}" ] && [ "${SSH_ASKPASS_REQUIRE:-}" = force ]; then
+  if answer=$("$SSH_ASKPASS" "Enter passphrase for key '$key': "); then printf 'askpass passphrase [%s]\n' "$answer" >> "$log"; else printf 'askpass passphrase refused\n' >> "$log"; fi
+  if answer=$("$SSH_ASKPASS" "deploy@$alias's password: "); then printf 'askpass password ANSWERED [%s]\n' "$answer" >> "$log"; else printf 'askpass password refused\n' >> "$log"; fi
+  if answer=$(SSH_ASKPASS_PROMPT=confirm "$SSH_ASKPASS" "Allow use of key $key?"); then printf 'askpass confirm ANSWERED [%s]\n' "$answer" >> "$log"; else printf 'askpass confirm refused\n' >> "$log"; fi
+fi
+if [ -n "${TTERM_FAKE_SSH_FAIL:-}" ]; then echo "deploy@$alias: Permission denied (publickey)." >&2; exit 255; fi
+if [ -n "$verbose" ] && [ -n "${TTERM_FAKE_SSH_FP:-}" ]; then
+  echo "debug1: Server accepts key: $key ED25519 $TTERM_FAKE_SSH_FP explicit" >&2
+fi
+if [ "${1:-}" = sh ] && [ "${2:-}" = -s ]; then
+  mkdir -p "$TTERM_FAKE_SSH_REMOTE"
+  HOME="$TTERM_FAKE_SSH_REMOTE" exec /bin/sh -s
+fi
+exit 0
+"#;
+
+/// A temp home with ~/.ssh for the move checks, the fake ssh, and the fake
+/// server's home; the environment the engine reads them from is put back as
+/// it was when this goes. Made under HOME_LOCK.
+struct SshLab {
+    root: PathBuf,
+    home: PathBuf,
+    remote: PathBuf,
+    log: PathBuf,
+    keygen: PathBuf,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+const LAB_VARS: [&str; 7] = ["TTERM_SSH_HOME", "TTERM_SSH", "TTERM_FAKE_SSH_REAL", "TTERM_FAKE_SSH_LOG", "TTERM_FAKE_SSH_REMOTE", "TTERM_FAKE_SSH_FP", "TTERM_FAKE_SSH_FAIL"];
+
+impl SshLab {
+    /// None where OpenSSH is not there to make keys and read configs.
+    fn new() -> Option<SshLab> {
+        let keygen = ssh_keygen()?;
+        let real = which("ssh", "TTERM_SSH")?;
+        let root = common::data_dir().join("sshlab");
+        let (home, remote, log) = (root.join("home"), root.join("server"), root.join("ssh.log"));
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let fake = root.join("fake-ssh");
+        std::fs::write(&fake, FAKE_SSH).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let saved = LAB_VARS.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        std::env::set_var("TTERM_SSH_HOME", &home);
+        std::env::set_var("TTERM_SSH", &fake);
+        std::env::set_var("TTERM_FAKE_SSH_REAL", &real);
+        std::env::set_var("TTERM_FAKE_SSH_LOG", &log);
+        std::env::set_var("TTERM_FAKE_SSH_REMOTE", &remote);
+        std::env::remove_var("TTERM_FAKE_SSH_FP");
+        std::env::remove_var("TTERM_FAKE_SSH_FAIL");
+        Some(SshLab { root, home, remote, log, keygen, saved })
+    }
+
+    /// An Ed25519 key in ~/.ssh, with the passphrase given ("" for none).
+    fn key(&self, name: &str, passphrase: &str) -> PathBuf {
+        let path = self.home.join(".ssh").join(name);
+        assert!(std::process::Command::new(&self.keygen).args(["-t", "ed25519", "-f"]).arg(&path).args(["-N", passphrase, "-C", "lab", "-q"]).status().unwrap().success());
+        path
+    }
+
+    fn write(&self, name: &str, text: &str) {
+        std::fs::write(self.home.join(".ssh").join(name), text).unwrap();
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn server_keys(&self) -> String {
+        std::fs::read_to_string(self.remote.join(".ssh").join("authorized_keys")).unwrap_or_default()
+    }
+
+    fn set(&self, var: &str, value: Option<&str>) {
+        match value {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+    }
+}
+
+impl Drop for SshLab {
+    fn drop(&mut self) {
+        for (k, v) in &self.saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+const LAB_HOST_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISERVERKEYEXAMPLE000000000000000000000000";
+
+/// Servers of the lab: web-01 and web-02 sign in with `key`, lab-box too
+/// but has no host key here.
+fn lab_config(lab: &SshLab, key: &std::path::Path) {
+    lab.write("config", &format!("Host web-01\n  HostName 203.0.113.9\n  User deploy\n  IdentityFile \"{k}\"\n\nHost web-02\n  HostName 203.0.113.10\n  User deploy\n  IdentityFile ~/.ssh/{n}\n\nHost lab-box\n  HostName 203.0.113.11\n  User root\n", k = key.display(), n = key.file_name().unwrap().to_string_lossy()));
+    lab.write("known_hosts", &format!("203.0.113.9 {LAB_HOST_KEY}\n203.0.113.10 {LAB_HOST_KEY}\n"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn moving_a_server_signs_in_with_its_key_then_seals_it_once() {
+    use tterm_engine::crypto;
+    let _home = HOME_LOCK.lock().await;
+    let Some(lab) = SshLab::new() else {
+        eprintln!("OpenSSH not found: skipping");
+        return;
+    };
+    let cloud = Cloud::start().await;
+    let (a, keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    // Not one of ssh's default names: lab-box (no IdentityFile) has no key.
+    let key_path = lab.key("work_key", "");
+    let pub_line = std::fs::read_to_string(key_path.with_extension("pub")).unwrap();
+    lab_config(&lab, &key_path);
+
+    // GET /api/app/ssh: the servers with their key, as ~/… the same way in
+    // identityFiles, keys[].path and key.
+    let (status, listed) = app_vault(&a.engine, "GET", "/api/app/ssh", Value::Null).await;
+    assert_eq!(status, 200, "{listed}");
+    let host = |alias: &str| listed["hosts"].as_array().unwrap().iter().find(|h| h["alias"] == alias).cloned().unwrap_or_else(|| panic!("{alias} listed: {listed}"));
+    let web = host("web-01");
+    assert_eq!((web["host"].clone(), web["user"].clone(), web["hostKeys"][0].clone()), (json!("203.0.113.9"), json!("deploy"), json!(LAB_HOST_KEY)));
+    assert_eq!(web["identityFiles"][0], "~/.ssh/work_key", "{web}");
+    assert_eq!(web["key"], "~/.ssh/work_key", "{web}");
+    assert_eq!(host("web-02")["key"], "~/.ssh/work_key");
+    assert_eq!(host("web-02")["identityFiles"][0], "~/.ssh/work_key");
+    assert!(host("lab-box")["key"].is_null(), "no key of its own here: {}", host("lab-box"));
+    let listed_key = listed["keys"].as_array().unwrap().iter().find(|k| k["path"] == "~/.ssh/work_key").cloned().expect("the key listed");
+    assert_eq!((listed_key["movable"].clone(), listed_key["type"].clone(), listed_key["encrypted"].clone()), (json!(true), json!("ssh-ed25519"), json!(false)));
+    let fingerprint = listed_key["fingerprint"].as_str().unwrap().to_string();
+    lab.set("TTERM_FAKE_SSH_FP", Some(&fingerprint));
+
+    // Move web-01 with its key ticked: a login with that key alone first,
+    // then the key sealed and uploaded, then the machine.
+    let body = json!({"project": "p1", "servers": [{"alias": "web-01", "method": "key"}], "keys": [{"path": "~/.ssh/work_key"}]});
+    let (status, moved) = app_vault(&a.engine, "POST", "/api/app/move", body).await;
+    assert_eq!(status, 200, "{moved}");
+    assert_eq!(moved["results"][0]["ok"], true, "{moved}");
+    let log = lab.log();
+    let login = log.lines().find(|l| l.contains("[web-01] [true]")).unwrap_or_else(|| panic!("a login: {log}"));
+    assert!(login.contains(&format!("[-i] [{}]", key_path.display())) && login.contains("[IdentitiesOnly=yes]") && login.contains("[BatchMode=yes]"), "{login}");
+    let vault = cloud.st.lock().unwrap().vault.clone().unwrap();
+    assert_eq!(vault["keys"].as_array().unwrap().len(), 1);
+    let key = vault["keys"][0].clone();
+    assert_eq!((key["type"].clone(), key["fingerprint"].clone(), key["source"].clone()), (json!("ssh-ed25519"), json!(fingerprint), json!("mac")));
+    assert_eq!(first_two(key["publicKey"].as_str().unwrap()), first_two(&pub_line));
+    let own = cloud.st.lock().unwrap().own[0].clone();
+    assert_eq!((own["method"].clone(), own["keyId"].clone()), (json!("key"), key["id"].clone()));
+    // The sealed box opens with the vault key to the key's plaintext.
+    let vk = vault_key_of(&cloud, &keeper);
+    let plain = crypto::open(&vk, &crypto::from_b64u(key["sealed"].as_str().unwrap()).unwrap(), &crypto::key_aad(key["id"].as_str().unwrap())).expect("opens");
+    assert_eq!(tterm_engine::sshkeys::fingerprint(&plain).as_deref(), Some(fingerprint.as_str()));
+
+    // web-02 has the same key: the vault's is used, nothing uploaded again.
+    let body = json!({"project": "p1", "servers": [{"alias": "web-02", "method": "key"}], "keys": []});
+    let (status, moved) = app_vault(&a.engine, "POST", "/api/app/move", body).await;
+    assert_eq!(status, 200, "{moved}");
+    assert_eq!(moved["results"][0]["ok"], true, "{moved}");
+    assert_eq!(cloud.st.lock().unwrap().vault.as_ref().unwrap()["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(cloud.st.lock().unwrap().own[1]["keyId"], key["id"]);
+
+    // The engine signs a login with the moved key on the page's socket.
+    let blob = base64_decode(pub_line.split_whitespace().nth(1).unwrap());
+    let data = userauth(&[7u8; 32], "deploy", "ssh-ed25519", &blob);
+    cloud.st.lock().unwrap().sign_requests = vec![("sign-1".into(), fingerprint.clone(), "ssh-ed25519".into(), crypto::b64u(&data))];
+    let mut page = Page::new(&a.engine);
+    assert!(until(10, || !cloud.st.lock().unwrap().signed.is_empty()).await, "the engine answered the sign request");
+    let signed = cloud.st.lock().unwrap().signed[0].clone();
+    assert_eq!((signed["op"].clone(), signed["id"].clone()), (json!("vault.signed"), json!("sign-1")), "{signed}");
+    verify_ed25519(&pub_line, &data, &crypto::from_b64u(signed["sig"].as_str().unwrap()).unwrap());
+    page.until(1, |_| false).await;
+    assert!(!page.msgs.iter().any(|m| m["op"] == "vault.sign"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_server_moves_only_as_the_person_said() {
+    let _home = HOME_LOCK.lock().await;
+    let Some(lab) = SshLab::new() else { return };
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    sign_in(&cloud, &a).await;
+    let move_web = |keys: Value| json!({"project": "p1", "servers": [{"alias": "web-01", "method": "key"}], "keys": keys});
+    let key_path = lab.key("id_ed25519", "");
+    lab_config(&lab, &key_path);
+    // The vault locked: a key server waits for it.
+    let (_, moved) = app_vault(&a.engine, "POST", "/api/app/move", move_web(json!([{"path": "~/.ssh/id_ed25519"}]))).await;
+    assert_eq!(moved["results"][0]["ok"], false, "{moved}");
+    assert!(moved["results"][0]["error"].as_str().unwrap().contains("Open your vault"), "{moved}");
+    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    // Its key not ticked: not moved, nothing uploaded, no login.
+    let (_, moved) = app_vault(&a.engine, "POST", "/api/app/move", move_web(json!([]))).await;
+    assert_eq!(moved["results"][0]["ok"], false, "{moved}");
+    assert!(moved["results"][0]["error"].as_str().unwrap().contains("not ticked"), "{moved}");
+    assert!(!lab.log().contains("[true]"), "no login: {}", lab.log());
+    // The login fails: nothing is saved.
+    lab.set("TTERM_FAKE_SSH_FAIL", Some("1"));
+    let (_, moved) = app_vault(&a.engine, "POST", "/api/app/move", move_web(json!([{"path": "~/.ssh/id_ed25519"}]))).await;
+    assert_eq!(moved["results"][0]["ok"], false, "{moved}");
+    assert!(moved["results"][0]["error"].as_str().unwrap().contains("Permission denied"), "{moved}");
+    lab.set("TTERM_FAKE_SSH_FAIL", None);
+    // The server let it in with another key: not this one's to move.
+    lab.set("TTERM_FAKE_SSH_FP", Some("SHA256:anotherkeyaltogether"));
+    let (_, moved) = app_vault(&a.engine, "POST", "/api/app/move", move_web(json!([{"path": "~/.ssh/id_ed25519"}]))).await;
+    assert_eq!(moved["results"][0]["ok"], false, "{moved}");
+    assert!(moved["results"][0]["error"].as_str().unwrap().contains("another key"), "{moved}");
+    lab.set("TTERM_FAKE_SSH_FP", None);
+    // A server with no host key here is not moved.
+    let (_, moved) = app_vault(&a.engine, "POST", "/api/app/move", json!({"project": "p1", "servers": [{"alias": "lab-box", "method": "key"}], "keys": []})).await;
+    assert!(moved["results"][0]["error"].as_str().unwrap().contains("host key"), "{moved}");
+    {
+        let st = cloud.st.lock().unwrap();
+        assert!(st.own.is_empty(), "nothing saved");
+        assert!(st.vault.as_ref().unwrap()["keys"].as_array().unwrap().is_empty(), "no key uploaded");
+    }
+    // tTerm does not save the server: the key uploaded for it goes again.
+    cloud.st.lock().unwrap().own_refuse = Some((422, "The server sent no host key tTerm could read.".into()));
+    let (_, moved) = app_vault(&a.engine, "POST", "/api/app/move", move_web(json!([{"path": "~/.ssh/id_ed25519"}]))).await;
+    assert_eq!(moved["results"][0]["ok"], false, "{moved}");
+    assert!(moved["results"][0]["error"].as_str().unwrap().contains("no host key tTerm could read"), "{moved}");
+    let st = cloud.st.lock().unwrap();
+    assert_eq!(st.deleted_keys.len(), 1, "the key went out again");
+    assert!(st.vault.as_ref().unwrap()["keys"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_passphrase_answers_only_the_passphrase_question() {
+    let _home = HOME_LOCK.lock().await;
+    let Some(lab) = SshLab::new() else { return };
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    sign_in(&cloud, &a).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    let key_path = lab.key("id_ed25519", "open sesame");
+    lab_config(&lab, &key_path);
+    let (_, listed) = app_vault(&a.engine, "GET", "/api/app/ssh", Value::Null).await;
+    let k = listed["keys"].as_array().unwrap().iter().find(|k| k["path"] == "~/.ssh/id_ed25519").cloned().unwrap();
+    assert_eq!(k["encrypted"], true, "{k}");
+    // Without it: the key cannot be read into the vault.
+    let move_web = |keys: Value| json!({"project": "p1", "servers": [{"alias": "web-01", "method": "key"}], "keys": keys});
+    let (_, moved) = app_vault(&a.engine, "POST", "/api/app/move", move_web(json!([{"path": "~/.ssh/id_ed25519"}]))).await;
+    assert_eq!(moved["results"][0]["ok"], false, "{moved}");
+    // With it: ssh's passphrase question gets it through the helper; a
+    // password or a confirmation question gets nothing.
+    let (_, moved) = app_vault(&a.engine, "POST", "/api/app/move", move_web(json!([{"path": "~/.ssh/id_ed25519", "passphrase": "open sesame"}]))).await;
+    assert_eq!(moved["results"][0]["ok"], true, "{moved}");
+    let log = lab.log();
+    assert!(log.contains("askpass passphrase [open sesame]"), "{log}");
+    assert!(log.contains("askpass password refused"), "{log}");
+    assert!(log.contains("askpass confirm refused"), "{log}");
+    assert!(!log.contains("ANSWERED"), "{log}");
+    let login = log.lines().rev().find(|l| l.contains("[web-01] [true]")).unwrap();
+    assert!(login.contains("[BatchMode=no]") && login.contains("[PasswordAuthentication=no]") && login.contains("[KbdInteractiveAuthentication=no]") && login.contains("[StrictHostKeyChecking=yes]"), "{login}");
+    assert!(!login.contains("open sesame"), "the passphrase is in no argument: {login}");
+    assert_eq!(cloud.st.lock().unwrap().vault.as_ref().unwrap()["keys"][0]["fingerprint"], k["fingerprint"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn let_tterm_in_adds_its_line_and_takes_it_off_if_not_saved() {
+    let _home = HOME_LOCK.lock().await;
+    let Some(lab) = SshLab::new() else { return };
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    sign_in(&cloud, &a).await;
+    // The vault is not needed for it: none is made.
+    let key_path = lab.key("id_ed25519", "");
+    lab_config(&lab, &key_path);
+    // The server's authorized_keys, its last line without a newline.
+    std::fs::create_dir_all(lab.remote.join(".ssh")).unwrap();
+    std::fs::write(lab.remote.join(".ssh").join("authorized_keys"), "ssh-ed25519 AAAAexisting someone@laptop").unwrap();
+    let move_cert = |alias: &str| json!({"project": "p1", "servers": [{"alias": alias, "method": "cert"}], "keys": []});
+    let (status, moved) = app_vault(&a.engine, "POST", "/api/app/move", move_cert("web-01")).await;
+    assert_eq!(status, 200, "{moved}");
+    assert_eq!(moved["results"][0]["ok"], true, "{moved}");
+    let own = cloud.st.lock().unwrap().own[0].clone();
+    assert_eq!(own["method"], "cert");
+    let line1 = "cert-authority,principals=\"m-1\" ssh-ed25519 AAAACA tterm-web ca-1";
+    assert_eq!(lab.server_keys(), format!("ssh-ed25519 AAAAexisting someone@laptop\n{line1}\n"), "added on a line of its own");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(lab.remote.join(".ssh").join("authorized_keys")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    // tTerm does not save the next one: its line goes off again, the rest
+    // stays as it was.
+    cloud.st.lock().unwrap().own_refuse = Some((422, "The server did not accept tTerm's certificate.".into()));
+    let (_, moved) = app_vault(&a.engine, "POST", "/api/app/move", move_cert("web-02")).await;
+    assert_eq!(moved["results"][0]["ok"], false, "{moved}");
+    assert!(moved["results"][0]["error"].as_str().unwrap().contains("did not accept"), "{moved}");
+    assert_eq!(lab.server_keys(), format!("ssh-ed25519 AAAAexisting someone@laptop\n{line1}\n"), "m-2's line is off again");
+    assert_eq!(cloud.st.lock().unwrap().own.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mac_server_adds_a_via_machine() {
+    // The move reads the server's settings with ssh -G: in the lab's home,
+    // never the real ~/.ssh.
+    let _home = HOME_LOCK.lock().await;
+    let Some(lab) = SshLab::new() else { return };
+    lab.write("config", "Host lab\n  HostName 192.168.1.20\n  User pi\n");
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    sign_in(&cloud, &a).await;
+    // No vault, none open: a server through this Mac needs none.
+    let body = json!({"project": "p1", "servers": [{"alias": "lab", "method": "mac"}], "keys": []});
+    let (status, moved) = app_vault(&a.engine, "POST", "/api/app/move", body).await;
+    assert_eq!(status, 200, "{moved}");
+    assert_eq!(moved["results"][0]["ok"], true, "{moved}");
+    let own = cloud.st.lock().unwrap().own[0].clone();
+    assert_eq!(own["method"], "mac");
+    assert_eq!(own["target"], "lab");
+    assert!(own["jump"].is_null(), "no bastion for a server through the Mac");
+    // The via is this Mac as a machine of the account (the computers/this
+    // tTerm answered), not the engine's own id.
+    let here = a.engine.cloud.as_ref().unwrap().here().expect("this Mac is known to tTerm now");
+    assert_eq!(own["via"], here.id.to_string());
+    assert!(cloud.st.lock().unwrap().machines.iter().any(|m| m["id"] == own["via"] && m["kind"] == "computer"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reachable_asks_the_core() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    sign_in(&cloud, &a).await;
+    cloud.st.lock().unwrap().reachable_ok = true;
+    let (status, r) = app_vault(&a.engine, "POST", "/api/app/ssh/reachable", json!({"host": "198.51.100.2", "port": 22})).await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["ok"], true);
+}
+
+/// The signing input of a login (RFC 4252 §7), as a client writes it.
+fn userauth(session: &[u8], user: &str, alg: &str, blob: &[u8]) -> Vec<u8> {
+    let string = |out: &mut Vec<u8>, v: &[u8]| {
+        out.extend_from_slice(&(v.len() as u32).to_be_bytes());
+        out.extend_from_slice(v);
+    };
+    let mut out = Vec::new();
+    string(&mut out, session);
+    out.push(50);
+    string(&mut out, user.as_bytes());
+    string(&mut out, b"ssh-connection");
+    string(&mut out, b"publickey");
+    out.push(1);
+    string(&mut out, alg.as_bytes());
+    string(&mut out, blob);
+    out
+}
+
+/// An Ed25519 raw signature verified against an OpenSSH public line.
+fn verify_ed25519(public_openssh: &str, data: &[u8], sig: &[u8]) {
+    let parts: Vec<&str> = public_openssh.split_whitespace().collect();
+    let blob = base64_decode(parts[1]);
+    // ssh-ed25519 blob: 4+len "ssh-ed25519", 4+len key(32).
+    let key = &blob[blob.len() - 32..];
+    let public = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key);
+    public.verify(data, sig).expect("the signature verifies");
+}
+
+fn base64_decode(s: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+}
+
+/// An X25519 key pair and agreement for the browser side of a pairing,
+/// through the engine's crypto (its test seam).
+fn x25519_pair() -> ([u8; 32], Vec<u8>) {
+    // Use a fixed seed so the browser side is reproducible.
+    let seed: Vec<u8> = (0..32u8).collect();
+    let pairer = tterm_engine::crypto::pairer_from_seed(&seed).unwrap();
+    (pairer.public, seed)
+}
+
+fn x25519_agree(priv_b: &[u8], pub_a: &[u8]) -> Vec<u8> {
+    let pairer = tterm_engine::crypto::pairer_from_seed(priv_b).unwrap();
+    pairer.agree(pub_a).unwrap().as_ref().to_vec()
+}
+
+fn ssh_keygen() -> Option<std::path::PathBuf> {
+    which("ssh-keygen", "TTERM_SSH_KEYGEN")
+}
+
+fn which(name: &str, env: &str) -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os(env) {
+        let p = std::path::PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for dir in std::env::var("PATH").unwrap_or_default().split(':') {
+        let p = std::path::Path::new(dir).join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn first_two(line: &str) -> String {
+    line.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
 }

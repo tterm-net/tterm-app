@@ -1,0 +1,49 @@
+{
+ "about": "Test vectors for tTerm vault v1 (vault-design.md). All binary as base64url without padding. box = nonce(12) || ciphertext || tag(16), AES-256-GCM.",
+ "vk": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+ "nonce": "BwcHBwcHBwcHBwcH",
+ "key": {
+  "id": "6f1c2a3e-4b5d-4e6f-8a9b-0c1d2e3f4a5b",
+  "aad": "tterm/vault/key/v1/6f1c2a3e-4b5d-4e6f-8a9b-0c1d2e3f4a5b",
+  "plaintext": "{\"v\":1,\"type\":\"ssh-ed25519\",\"jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg\",\"d\":\"CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk\"},\"comment\":\"denis@mac\"}",
+  "sealed": "BwcHBwcHBwcHBwcHdEjQflU--9ay5GPlomvW6NI0oBbsxbQsz4J81ia0RXAFfopc6jSNsDjc7raSNfUE2DrFa--DRG-v3dTTVJqv0j2HyhDWmkmqA51GJ5-yZLHpCzhu7-1mXN1gL2deeGP5i7fY4u88WP42OJBWqaiRc4cT6hQXYUE-jPLvk-V4yy48y4dem-rP_kx8fkyzndTDXwJ0ieJjwAiFELycTVyD-ukW69s6oxYXMOUeGmWohxPQBdjawiEU3Q-O3OKBR4JYIV4hJNwmRcoKPA",
+  "openssh_public": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP0XJDhaoMdbZPt4zWAvodmR/ev3axPFjtcC6sg16fYY denis@mac"
+ },
+ "prf_lock": {
+  "lock_id": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+  "prf_output": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI",
+  "hkdf_salt": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "info": "tterm/vault/prf/v1",
+  "kek": "0TeHp8CIyP1IL5Isa6Bsmq9o5HUiE_86BZF5oBwiVJc",
+  "aad": "tterm/vault/lock/v1/1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+  "wrap": "BwcHBwcHBwcHBwcHje66oA4C4dKrkwWiHK9nUtVT5aP_YmgnIK8kaxhCPzJLO9Mn290KVvR_icAhG9ZG"
+ },
+ "recovery": {
+  "vault_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+  "code": "K7QF-29XM-PL4D-8VHT-R2NC-6WJB",
+  "normalized": "K7QF29XMP14D8VHTR2NC6WJB",
+  "salt": "BQUFBQUFBQUFBQUFBQUFBQ",
+  "info": "tterm/vault/recovery/v1",
+  "kek": "iNW0hFBLej5EpiSPRT6q43668nJPOpVNA2ZjP6lX-WI",
+  "aad": "tterm/vault/recovery/v1/0f0e0d0c-0b0a-4908-8706-050403020100",
+  "wrap": "BwcHBwcHBwcHBwcHQ6eN65JwQCjx-uIb7sfrATrpPwUy2kgZxNW6vG-Uqp3nSUdtmwNpPUnGP_lKH5y-"
+ },
+ "pairing": {
+  "id": "abcdefab-cdef-4abc-8def-abcdefabcdef",
+  "privA": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+  "privB": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+  "pubA": "pOCSkrZRwni5dyxWn1-puxPZBrRqtoyd-dwrRAn4ogk",
+  "pubB": "zo060cy2M-x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk",
+  "commit": "wWepxcftmSvHKdkjEuVp6LOXqL-orNGyCDwfZ964lxM",
+  "sas": "517 230",
+  "shared": "LtdqtUmx5zwDHrSclEjweYrqgbaYJ5oMPcPkn7_EuVM",
+  "kek": "t4Ak0_narDcCtxm7FBel3H_EUDjCgRiLzOalDhMiWp4",
+  "aad": "tterm/vault/pair/v1/abcdefab-cdef-4abc-8def-abcdefabcdef",
+  "sealed": "BwcHBwcHBwcHBwcHJZjGL0sHLVwMaa8JvbwVxWxHXXMzcQrZdbHj2-78j9g2MhDI4iKyTUkgW7S6mx9e"
+ },
+ "signature": {
+  "type": "ssh-ed25519",
+  "data": "c2Vzc2lvbi1pZC1hbmQtdXNlcmF1dGgtcmVxdWVzdA",
+  "raw_sig": "61ca-LF5ORwc8UnOqmY5zTl1v8qTGzfzZUZXZO3T5bvGczN56xrEgeoyNY7onxsQBjv8Jy-J1MscgixTB2hKCw"
+ }
+}

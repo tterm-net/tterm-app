@@ -34,6 +34,8 @@ pub mod blocks;
 #[cfg(feature = "cloud")]
 pub mod cloud_api;
 pub mod complete;
+#[cfg(feature = "cloud")]
+pub mod crypto;
 pub mod danger;
 pub mod hosted;
 pub mod link;
@@ -52,6 +54,10 @@ pub mod search;
 pub mod settings;
 pub mod shell;
 pub mod socket;
+#[cfg(feature = "cloud")]
+pub mod ssh;
+#[cfg(feature = "cloud")]
+pub mod sshkeys;
 pub mod store;
 pub mod terminals;
 #[cfg(feature = "cloud")]
@@ -60,6 +66,8 @@ pub mod update;
 pub mod upstream;
 #[cfg(feature = "cloud")]
 pub mod upstream_socket;
+#[cfg(feature = "cloud")]
+pub mod vault;
 
 use serde_json::{json, Value};
 use settings::Settings;
@@ -109,6 +117,10 @@ pub struct Engine {
     /// tTerm for Mac updating itself (from 0.5.0).
     #[cfg(feature = "cloud")]
     pub updates: update::Updates,
+    /// The vault of SSH keys (from 0.7.0): the app's, Some once there is a
+    /// keychain and LocalAuthentication to reach (with_cloud).
+    #[cfg(feature = "cloud")]
+    pub vault: Option<Arc<vault::Vault>>,
     /// The system's language, when it is one of the twelve (from 0.6.0).
     pub system_language: Option<&'static str>,
     /// The language the app's own words are in now (language_now): the app
@@ -132,11 +144,13 @@ impl Engine {
     /// 0.3.0): `host` keeps its key and opens the browser, `env_file` is the
     /// agent's settings, where this computer's own key is.
     #[cfg(feature = "cloud")]
-    pub fn with_cloud(data_dir: &Path, cloud: &str, host: Arc<dyn account::Host>, env_file: &Path) -> std::io::Result<Arc<Self>> {
+    pub fn with_cloud(data_dir: &Path, cloud: &str, host: Arc<dyn account::Host>, vault_host: Arc<dyn vault::Keeper>, env_file: &Path) -> std::io::Result<Arc<Self>> {
         let mut engine = Self::made(data_dir)?;
+        let label = vault_label(&engine.machine_name);
         engine.cloud = Some(account::Account::new(upstream::Cloud::new(cloud), host, data_dir, env_file));
         engine.reach = reach::Reach::new(env_file);
         engine.updates = update::Updates::new(update::Config::app(data_dir));
+        engine.vault = Some(Arc::new(vault::Vault::new(vault_host, label)));
         Ok(Arc::new(engine))
     }
 
@@ -177,6 +191,8 @@ impl Engine {
             reach: reach::Reach::new(&pty::home_dir().join(".tterm-web").join("env")),
             #[cfg(feature = "cloud")]
             updates: update::Updates::none(data_dir),
+            #[cfg(feature = "cloud")]
+            vault: None,
             system_language,
             language,
         })
@@ -513,6 +529,13 @@ impl Engine {
     pub fn legal_json(&self) -> Value {
         json!({"terms": TERMS_URL, "privacy": PRIVACY_URL, "support": SUPPORT})
     }
+}
+
+/// The label of this Mac's vault lock, as the contract has it: "tTerm for
+/// Mac on MacBook-Pro-Denis".
+#[cfg(feature = "cloud")]
+fn vault_label(machine: &str) -> String {
+    format!("{} on {}", account::app_title(account::app_name()), machine)
 }
 
 /// The app's folder, for the person alone: it keeps what their commands

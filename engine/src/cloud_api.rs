@@ -61,6 +61,13 @@ pub async fn route(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], 
             let saved = engine.save_settings(|s| s.welcome_seen = true);
             return Some(if saved.is_ok() { Response::empty(204) } else { Response::error(500, "Could not save the settings on this computer.") });
         }
+        // The vault of SSH keys (from 0.7.0), answered by the engine with
+        // the keychain, LocalAuthentication and tTerm (vault.rs). Its status
+        // answers signed in or not; the rest says to sign in first.
+        (_, ["api", "app", "vault", ..]) | (_, ["api", "app", "ssh", ..]) | (_, ["api", "app", "move", ..]) => {
+            return Some(vault(engine, &method, &parts[2..], body).await);
+        }
+
         ("GET", ["api", "app", "this-computer"]) => return Some(Response::json(200, engine.reach.json(engine))),
         ("PUT", ["api", "app", "this-computer"]) => {
             let Some(open) = serde_json::from_slice::<Value>(body).ok().and_then(|b| b.get("open").and_then(Value::as_bool)) else {
@@ -96,6 +103,7 @@ pub async fn route(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], 
             Some(answer)
         }
         ("POST", ["api", "auth", "signout"]) => {
+            forget_vault(engine).await;
             account.sign_out().await;
             engine.align_terminals();
             engine.reach.look_again();
@@ -104,6 +112,7 @@ pub async fn route(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], 
         ("POST", ["api", "auth", "signout-everywhere"]) => {
             let answer = proxy(&account, &method, path, body, flags).await;
             if answer.status == 200 {
+                forget_vault(engine).await;
                 account.forget_here().await;
                 engine.align_terminals();
                 engine.reach.look_again();
@@ -114,6 +123,7 @@ pub async fn route(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], 
             let answer = proxy(&account, &method, path, body, flags).await;
             let ours = account.device_id().map(|d| d == *id).unwrap_or(false);
             if answer.status == 200 && ours {
+                forget_vault(engine).await;
                 account.forget_here().await;
                 engine.align_terminals();
                 engine.reach.look_again();
@@ -218,6 +228,104 @@ fn update(engine: &Arc<Engine>, method: &str, rest: &[&str], body: &[u8]) -> Res
         }
         _ => Response::error(404, "No such request."),
     }
+}
+
+/// Sign out locks the vault and forgets its KEK, so nothing left on this
+/// Mac could open it without the browser's say.
+async fn forget_vault(engine: &Arc<Engine>) {
+    if let Some(v) = engine.vault.clone() {
+        v.on_sign_out().await;
+    }
+}
+
+/// The vault's local API (from 0.7.0): `/api/app/vault*`, `/api/app/ssh*`
+/// and `/api/app/move`, answered by the engine's vault (vault.rs). `rest`
+/// is the path after `/api/app/`.
+async fn vault(engine: &Arc<Engine>, method: &str, rest: &[&str], body: &[u8]) -> Response {
+    let Some(v) = engine.vault.clone() else {
+        return Response::error(409, "This build has no vault.");
+    };
+    let done = |r: Result<Value, crate::vault::Failed>| match r {
+        Ok(value) => Response::json(200, value),
+        Err(f) => failed(f),
+    };
+    let field = |key: &str| serde_json::from_slice::<Value>(body).ok().and_then(|b| b.get(key).and_then(Value::as_str).map(str::to_string));
+    match (method, rest) {
+        ("GET", ["vault"]) => Response::json(200, v.status_json(engine).await),
+        ("POST", ["vault", "create"]) => done(v.create(engine).await),
+        // With `recoveryCode`: a vault made in a browser, which this Mac has
+        // no lock of yet; it gets one (vault.rs).
+        ("POST", ["vault", "open"]) => done(v.open(engine, field("recoveryCode").as_deref()).await),
+        ("POST", ["vault", "lock"]) => Response::json(200, v.lock()),
+        ("POST", ["vault", "recovery"]) => done(v.new_recovery_code(engine).await),
+        ("POST", ["vault", "pairings", id, "answer"]) => done(v.pairing_answer(engine, id).await),
+        ("POST", ["vault", "pairings", id, "approve"]) => done(v.pairing_approve(engine, id).await),
+        ("POST", ["vault", "pairings", id, "deny"]) => done(v.pairing_deny(engine, id).await),
+        ("GET", ["ssh"]) => Response::json(200, v.ssh_json(engine).await),
+        ("POST", ["ssh", "try"]) => {
+            let Some(alias) = field("alias") else { return Response::error(422, "Say which server: alias.") };
+            done(v.ssh_try(engine, &alias, field("passphrase").as_deref()).await)
+        }
+        ("POST", ["ssh", "reachable"]) => reachable(engine, body).await,
+        ("POST", ["move"]) => move_to_cloud(engine, &v, body).await,
+        _ => Response::error(404, "No such request."),
+    }
+}
+
+/// `POST /api/app/ssh/reachable`: asks tTerm whether the core can reach a
+/// host and port (its `POST /api/machines/reachable`).
+async fn reachable(engine: &Arc<Engine>, body: &[u8]) -> Response {
+    let Some(account) = engine.cloud.clone() else { return Response::error(409, "Sign in to tTerm first.") };
+    let b: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let (Some(host), Some(port)) = (b.get("host").and_then(Value::as_str), b.get("port").and_then(Value::as_i64)) else {
+        return Response::error(422, "Say host and port.");
+    };
+    let ask = json!({"host": host, "port": port});
+    match account.call("POST", "/api/machines/reachable", Some(ask.to_string().as_bytes()), false).await {
+        Ok(answer) => Response { status: answer.status, content_type: "application/json", body: answer.body },
+        Err(Trouble::SignedOut) => signed_out(),
+        Err(Trouble::Offline) => Response::error(503, OFFLINE),
+    }
+}
+
+/// `POST /api/app/move`: the servers and keys in the body to the vault's
+/// move (vault.rs).
+async fn move_to_cloud(engine: &Arc<Engine>, v: &Arc<crate::vault::Vault>, body: &[u8]) -> Response {
+    let b: Value = match serde_json::from_slice(body) {
+        Ok(b) => b,
+        Err(_) => return Response::error(422, "That is not JSON."),
+    };
+    let Some(project) = b.get("project").and_then(Value::as_str) else {
+        return Response::error(422, "Say which project the servers go to.");
+    };
+    let servers: Vec<(String, String)> = b["servers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| Some((s.get("alias")?.as_str()?.to_string(), s.get("method")?.as_str()?.to_string())))
+        .collect();
+    if servers.is_empty() {
+        return Response::error(422, "Choose at least one server to move.");
+    }
+    let keys: Vec<(String, Option<String>)> = b["keys"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|k| Some((k.get("path")?.as_str()?.to_string(), k.get("passphrase").and_then(Value::as_str).map(str::to_string))))
+        .collect();
+    match v.move_to_cloud(engine, project, &servers, &keys).await {
+        Ok(value) => Response::json(200, value),
+        Err(f) => failed(f),
+    }
+}
+
+/// A vault request that did not go through, as the page reads it: tTerm's
+/// session over is the sign-out every other request answers with.
+fn failed(f: crate::vault::Failed) -> Response {
+    if f.signed_out {
+        return signed_out();
+    }
+    Response::error(f.status, &f.message)
 }
 
 /// Whether the terminal is this computer's: running in this app, or kept

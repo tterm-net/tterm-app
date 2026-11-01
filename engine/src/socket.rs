@@ -58,18 +58,22 @@ impl PageSocket {
     /// receiver, in order.
     pub fn new(engine: Arc<Engine>) -> (Arc<PageSocket>, mpsc::Receiver<Outgoing>) {
         let (out, rx) = mpsc::channel(OUTBOX);
-        (
-            Arc::new(PageSocket {
-                engine,
-                out,
-                watchers: Mutex::new(Some(HashMap::new())),
-                #[cfg(feature = "cloud")]
-                relay: std::sync::Mutex::new(None),
-                #[cfg(feature = "cloud")]
-                gone: std::sync::atomic::AtomicBool::new(false),
-            }),
-            rx,
-        )
+        let socket = Arc::new(PageSocket {
+            engine,
+            out,
+            watchers: Mutex::new(Some(HashMap::new())),
+            #[cfg(feature = "cloud")]
+            relay: std::sync::Mutex::new(None),
+            #[cfg(feature = "cloud")]
+            gone: std::sync::atomic::AtomicBool::new(false),
+        });
+        // Signed in (from 0.7.0): the page's socket on tTerm opens with it,
+        // channels or not, for the vault's messages and its signing.
+        #[cfg(feature = "cloud")]
+        if let Some(relay) = socket.cloud_relay() {
+            relay.start();
+        }
+        (socket, rx)
     }
 
     async fn json(&self, message: Value) {
@@ -108,6 +112,15 @@ impl PageSocket {
             self.json(json!({"op": "error", "message": "Not understood."})).await;
             return;
         };
+        // The page's own vault messages, with no channel (from 0.7.0): to
+        // tTerm, through the relay, where the engine's own vault joins them.
+        #[cfg(feature = "cloud")]
+        if msg.get("ch").is_none() && op.starts_with("vault.") {
+            if let Some(relay) = self.cloud_relay() {
+                relay.page_vault(text, &msg);
+            }
+            return;
+        }
         let ch = msg.get("ch").and_then(Value::as_u64).unwrap_or(0) as u32;
         if op == "attach" {
             self.attach(ch, &msg).await;
@@ -211,19 +224,27 @@ impl PageSocket {
     /// when the app is not signed in.
     #[cfg(feature = "cloud")]
     fn cloud_attach(&self, ch: u32, msg: &Value) -> bool {
-        let Some(account) = self.engine.cloud.clone().filter(|a| a.signed_in()) else { return false };
-        let relay = {
-            let mut relay = self.relay.lock().unwrap();
-            // Looked at under the relay's lock, which close() takes after
-            // saying the page went: an attach on its way when the page went
-            // makes no relay that nothing would ever close.
-            if self.gone.load(std::sync::atomic::Ordering::SeqCst) {
-                return true;
-            }
-            relay.get_or_insert_with(|| crate::upstream_socket::Relay::new(account, self.out.clone())).clone()
-        };
+        if !self.engine.cloud.as_ref().map(|a| a.signed_in()).unwrap_or(false) {
+            return false;
+        }
+        // The page went meanwhile: nothing is made, and the attach is done.
+        let Some(relay) = self.cloud_relay() else { return true };
         relay.attach(ch, msg);
         true
+    }
+
+    /// The page's relay to tTerm, made once while the app is signed in;
+    /// None when it is not, or the page went. Looked at under the relay's
+    /// lock, which close() takes after saying the page went: nothing on its
+    /// way when the page went makes a relay that nothing would ever close.
+    #[cfg(feature = "cloud")]
+    fn cloud_relay(&self) -> Option<Arc<crate::upstream_socket::Relay>> {
+        let account = self.engine.cloud.clone().filter(|a| a.signed_in())?;
+        let mut relay = self.relay.lock().unwrap();
+        if self.gone.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        Some(relay.get_or_insert_with(|| crate::upstream_socket::Relay::new(account, self.engine.clone(), self.out.clone())).clone())
     }
 
     /// The page went: its watchers stop, the terminals go on, and nothing

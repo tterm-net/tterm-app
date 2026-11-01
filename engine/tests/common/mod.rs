@@ -11,6 +11,70 @@ use tterm_engine::socket::PageSocket;
 use tterm_engine::terminals::Outgoing;
 use tterm_engine::{api, Engine};
 
+/// A stand-in for the app's keychain and LocalAuthentication (the `cloud`
+/// feature's vault), so the engine's vault runs in the checks on Linux (no
+/// Mac): the KEK in memory, the gate always open unless a check turns
+/// `auth_fails` on. `available` says a vault lock is possible here, as a Mac
+/// would.
+#[cfg(feature = "cloud")]
+#[allow(unused_imports)]
+pub use keeper::TestKeeper;
+
+#[cfg(feature = "cloud")]
+mod keeper {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tterm_engine::vault::Keeper;
+
+    #[derive(Default)]
+    pub struct TestKeeper {
+        keks: Mutex<HashMap<String, Vec<u8>>>,
+        pub auth_fails: AtomicBool,
+        pub auths: AtomicUsize,
+    }
+
+    impl TestKeeper {
+        pub fn new() -> Arc<TestKeeper> {
+            Arc::new(TestKeeper::default())
+        }
+
+        /// The KEK kept for `vault_id`, if any.
+        pub fn kek(&self, vault_id: &str) -> Option<Vec<u8>> {
+            self.keks.lock().unwrap().get(vault_id).cloned()
+        }
+
+        pub fn auths(&self) -> usize {
+            self.auths.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Keeper for TestKeeper {
+        fn available(&self) -> bool {
+            true
+        }
+        fn authenticate(&self, _reason: &str) -> Result<(), String> {
+            self.auths.fetch_add(1, Ordering::SeqCst);
+            if self.auth_fails.load(Ordering::SeqCst) {
+                Err("the person cancelled".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn save_kek(&self, vault_id: &str, kek: &[u8]) -> Result<(), String> {
+            self.keks.lock().unwrap().insert(vault_id.to_string(), kek.to_vec());
+            Ok(())
+        }
+        fn load_kek(&self, vault_id: &str) -> Result<Option<Vec<u8>>, String> {
+            Ok(self.keks.lock().unwrap().get(vault_id).cloned())
+        }
+        fn delete_kek(&self, vault_id: &str) -> Result<(), String> {
+            self.keks.lock().unwrap().remove(vault_id);
+            Ok(())
+        }
+    }
+}
+
 /// Tests that flood a shell or count CPU time take turns: CPU time is the
 /// whole test process's.
 pub static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());

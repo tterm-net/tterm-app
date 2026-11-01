@@ -11,7 +11,7 @@ repository.workspace = true
 # tTerm Web in the cloud, for the app (from 0.3.0): signing in with the
 # browser, the page's requests and its socket to app.tterm.net. The agent
 # has no need of it, and builds without it.
-cloud = ["dep:reqwest", "dep:ring"]
+cloud = ["dep:reqwest", "dep:ring", "dep:zeroize", "dep:ssh-key", "dep:num-bigint"]
 
 [dependencies]
 base64 = "0.22"
@@ -34,6 +34,15 @@ uuid = { version = "1", features = ["v4", "serde"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"], optional = true }
 ring = { version = "0.17", optional = true }
+# The vault (from 0.7.0, with `cloud`): its keys wiped from memory when
+# let go (zeroize); its boxes and derived keys are ring's (crypto.rs).
+# The person's SSH keys read from ~/.ssh as OpenSSH writes them, those with
+# a passphrase too (ssh-key, RustCrypto's: only its parsing and OpenSSH's
+# own encryption, none of its signing, which ring does); the numbers of an
+# RSA key's JWK that the OpenSSH form does not carry (num-bigint).
+zeroize = { version = "1", optional = true }
+ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ecdsa", "encryption", "rsa"], optional = true }
+num-bigint = { version = "0.4", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "__rustls-tls"] }
@@ -41,6 +50,10 @@ webpki-roots = "1"
 
 [dev-dependencies]
 libc = "0.2"
+# The vault's checks (tests/vaultkeys.rs) read back the public half of keys
+# and verify raw signatures; ring is the cloud feature's already.
+ring = "0.17"
+ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ecdsa"] }
 # The checks' tTerm Web in the cloud, for the cloud feature (tests/cloud.rs),
 # and the hub of the link's checks (tests/link.rs).
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
