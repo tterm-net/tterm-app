@@ -107,13 +107,27 @@ impl Cloud {
 
     /// The same, with a body of another type than JSON (a photo).
     pub async fn send_as(&self, method: &str, path: &str, body: Option<&[u8]>, body_type: &str, cookie: Option<&str>, background: bool) -> Result<Answer, Unreachable> {
+        self.request(method, path, body, body_type, cookie, background, true).await
+    }
+
+    /// The page's JSON posted there as it is, with no session and no Origin
+    /// (from 0.8.0): Write to support before signing in, which tTerm takes
+    /// from someone not signed in (support.py there, with the address the
+    /// person typed). Only the header the core wants on what changes
+    /// something goes with it.
+    pub async fn post_as_is(&self, path: &str, body: &[u8]) -> Result<Answer, Unreachable> {
+        self.request("POST", path, Some(body), "application/json", None, false, false).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request(&self, method: &str, path: &str, body: Option<&[u8]>, body_type: &str, cookie: Option<&str>, background: bool, origin: bool) -> Result<Answer, Unreachable> {
         let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| Unreachable(format!("no such method: {method}")))?;
         let mut request = self
             .http
             .request(method.clone(), format!("{}{}", self.base, path))
             .header("accept", "application/json")
             .header("x-tterm", "1");
-        if method != reqwest::Method::GET && method != reqwest::Method::HEAD {
+        if origin && method != reqwest::Method::GET && method != reqwest::Method::HEAD {
             request = request.header("origin", &self.base);
         }
         if let Some(body) = body {

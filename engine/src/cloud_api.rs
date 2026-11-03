@@ -7,7 +7,10 @@
 //! with the browser (`/api/auth/link`), the welcome of the first start
 //! (`/api/app/welcome`), This computer in Settings (`/api/app/this-computer`,
 //! from 0.4.0: reach.rs), the app's updates (`/api/app/update`, from 0.5.0:
-//! update.rs), and Sign out, which forgets the app's key too.
+//! update.rs), and Sign out, which forgets the app's key too. Write to
+//! support before signing in (`POST /api/support`, from 0.8.0) goes to tTerm
+//! as the page wrote it, with no session: tTerm takes it from someone not
+//! signed in, with the address they typed.
 //! `/api/state` is tTerm's, with this computer's machine marked `here` and
 //! this app's terminals with the rest (account::merge_state); when tTerm
 //! cannot be reached, it is what tTerm said last, with `"offline": true`,
@@ -21,6 +24,7 @@ use crate::{names, Engine};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// What a request that needs tTerm gets while it cannot be reached.
 pub const OFFLINE: &str = "No connection to tTerm. This computer works as usual; the rest comes back with the connection.";
@@ -67,6 +71,11 @@ pub async fn route(engine: &Arc<Engine>, method: &str, path: &str, body: &[u8], 
         (_, ["api", "app", "vault", ..]) | (_, ["api", "app", "ssh", ..]) | (_, ["api", "app", "move", ..]) => {
             return Some(vault(engine, &method, &parts[2..], body).await);
         }
+
+        // Write to support before signing in (from 0.8.0, the page of tTerm
+        // Web 0.1.25): the page's message goes to tTerm as it is, with no
+        // session; signed in, it goes as the rest of /api/* below.
+        ("POST", ["api", "support"]) if !account.signed_in() => return Some(support(&account, body).await),
 
         ("GET", ["api", "app", "this-computer"]) => return Some(Response::json(200, engine.reach.json(engine))),
         ("PUT", ["api", "app", "this-computer"]) => {
@@ -250,14 +259,19 @@ async fn vault(engine: &Arc<Engine>, method: &str, rest: &[&str], body: &[u8]) -
         Err(f) => failed(f),
     };
     let field = |key: &str| serde_json::from_slice::<Value>(body).ok().and_then(|b| b.get(key).and_then(Value::as_str).map(str::to_string));
+    // The vault password (from 0.8.0), in memory that is wiped when done.
+    let password = || password_of(body);
     match (method, rest) {
         ("GET", ["vault"]) => Response::json(200, v.status_json(engine).await),
-        ("POST", ["vault", "create"]) => done(v.create(engine).await),
-        // With `recoveryCode`: a vault made in a browser, which this Mac has
-        // no lock of yet; it gets one (vault.rs).
-        ("POST", ["vault", "open"]) => done(v.open(engine, field("recoveryCode").as_deref()).await),
+        // A new vault, with the password the person made up: no Touch ID.
+        ("POST", ["vault", "create"]) => done(v.create(engine, password().as_deref().map(String::as_str)).await),
+        // With `password`: a Mac with no lock of the vault yet (a second
+        // Mac, a vault made in a browser); with `recoveryCode`, the same for
+        // a vault that has no password yet. It gets its own lock (vault.rs).
+        ("POST", ["vault", "open"]) => done(v.open(engine, password().as_deref().map(String::as_str), field("recoveryCode").as_deref()).await),
         ("POST", ["vault", "lock"]) => Response::json(200, v.lock()),
-        ("POST", ["vault", "recovery"]) => done(v.new_recovery_code(engine).await),
+        // A new vault password, with Touch ID.
+        ("POST", ["vault", "password"]) => done(v.set_password(engine, password().as_deref().map(String::as_str)).await),
         ("POST", ["vault", "pairings", id, "answer"]) => done(v.pairing_answer(engine, id).await),
         ("POST", ["vault", "pairings", id, "approve"]) => done(v.pairing_approve(engine, id).await),
         ("POST", ["vault", "pairings", id, "deny"]) => done(v.pairing_deny(engine, id).await),
@@ -320,12 +334,29 @@ async fn move_to_cloud(engine: &Arc<Engine>, v: &Arc<crate::vault::Vault>, body:
 }
 
 /// A vault request that did not go through, as the page reads it: tTerm's
-/// session over is the sign-out every other request answers with.
+/// session over is the sign-out every other request answers with; a wrong
+/// password's tries left, and a pause's end, go next to the sentence.
 fn failed(f: crate::vault::Failed) -> Response {
     if f.signed_out {
         return signed_out();
     }
-    Response::error(f.status, &f.message)
+    let mut answer = json!({"error": f.message});
+    if let Some(Value::Object(more)) = f.more {
+        for (key, value) in more.into_iter().filter(|(key, _)| key != "error") {
+            answer[key.as_str()] = value;
+        }
+    }
+    Response::json(f.status, answer)
+}
+
+/// The password of a vault request, taken out of its body into memory that
+/// is wiped when let go; None when it has none.
+fn password_of(body: &[u8]) -> Option<Zeroizing<String>> {
+    let mut b = serde_json::from_slice::<Value>(body).ok()?;
+    match b.get_mut("password").map(Value::take) {
+        Some(Value::String(password)) => Some(Zeroizing::new(password)),
+        _ => None,
+    }
 }
 
 /// Whether the terminal is this computer's: running in this app, or kept
@@ -366,6 +397,22 @@ async fn search(engine: &Arc<Engine>, account: &Arc<Account>, path: &str, flags:
         },
         Ok(Err(Trouble::SignedOut)) => signed_out(),
         _ => Response::json(200, local),
+    }
+}
+
+/// Write to support from someone not signed in (from 0.8.0): the page's
+/// JSON posted to tTerm as it is, with no session and no Origin, and tTerm's
+/// answer given back as it is: 200 with where the answer goes, and 422, 429
+/// and 503 with tTerm's words (support.py there, which takes the address
+/// typed and keeps its own limits). tTerm out of reach: 503 with ours, and
+/// the page gives support's address to write to.
+async fn support(account: &Account, body: &[u8]) -> Response {
+    match account.cloud.post_as_is("/api/support", body).await {
+        Ok(answer) => Response { status: answer.status, content_type: content_type(&answer.content_type), body: answer.body },
+        Err(why) => {
+            eprintln!("tterm: write to support: {}", why.0);
+            Response::error(503, OFFLINE)
+        }
     }
 }
 

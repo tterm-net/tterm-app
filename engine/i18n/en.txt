@@ -112,7 +112,6 @@ update.not_saved = Could not save the settings on this computer.
 # in ja, ko and tr the string comes last, after a colon (ja …次の操作を実行し
 # ようとしています: …, tr … şu işlemi yapmaya çalışıyor: …): a noun phrase.
 vault.reason_open = open your tTerm vault
-vault.reason_create = make your tTerm vault
 vault.reason_lock = let this Mac open your tTerm vault
 vault.reason_approve = let a new browser open your tTerm vault
-vault.reason_recovery = make a new recovery code for your tTerm vault
+vault.reason_password = set a new password for your tTerm vault

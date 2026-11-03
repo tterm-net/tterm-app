@@ -130,6 +130,12 @@ Without a connection, this computer's alone. A photo set in tTerm Web shows
 in the window too: the page fetches it through the app, which carries
 pictures as pictures.
 
+**Write to support works before signing in too** (from 0.8.0, with the
+menu of tTerm Web 0.1.25: Get help › Write to support): the window asks for
+the address to answer to, and the engine passes the message on to tTerm Web
+as the page wrote it, with no session, so tTerm takes it from someone not
+signed in; signed in, it goes in the account's session, as the rest.
+
 **Notes made before signing in stay on this computer too,** in the same
 file, until you delete them, or sign in: then they go to Personal in tTerm
 Web, folder by folder, each deleted here once it is there. They are kept as
@@ -205,7 +211,13 @@ The crypto (`engine/src/crypto.rs`) is the contract's exactly, so that a
 browser's WebCrypto and this engine produce the same bytes: a box is
 AES-256-GCM with a random nonce (`nonce || ciphertext || tag`), keys are
 HKDF-SHA256, a new browser and this Mac agree with X25519, and each box
-says what it is for in its additional data. A vault key (32 random bytes)
+says what it is for in its additional data. The vault password (from
+0.8.0) is taken in Unicode NFC and stretched with Argon2id (64 MiB, three
+passes; RustCrypto's `argon2`, off the async threads), and HKDF of that
+makes the key its wrap of the vault key opens with and a proof: tTerm keeps
+only the proof's hash and hands the wrap out for the right proof alone,
+pausing the tries after ten wrong ones in an hour and thirty in a day, so
+the password is guessed at tTerm or not at all. A vault key (32 random bytes)
 encrypts each SSH key; the vault key itself is kept wrapped for each way of
 opening it (a *lock*). On this Mac the lock is a key in the keychain
 (service `net.tterm.desktop.vault`), read only after a LocalAuthentication
@@ -217,10 +229,13 @@ until tTerm has one, the item is in the login keychain, and the check is a
 gate in the app run before a normal item is read: it guards against someone
 at the keyboard, not against other programs of the same user. With a
 Developer ID the vault key moves into the Secure Enclave with no new vault.
-A recovery code (shown once) is a third way in; a vault made in a browser
-opens on this Mac once with it, and then has this Mac's own lock. While the
-app runs the vault key stays in the engine's memory, until Lock or sign out;
-sign out forgets the keychain item too.
+The vault password, made up when the vault is made (no Touch ID then), is
+the way in from any browser with no Mac; a Mac with no lock of its own (a
+second Mac, a vault made in a browser) opens the vault once with it and
+then has this Mac's own lock, and a new password is set with Touch ID. A
+vault made before 0.8.0 keeps its recovery code until its first password.
+While the app runs the vault key stays in the engine's memory, until Lock or
+sign out; sign out forgets the keychain item too.
 
 The keys themselves (`engine/src/sshkeys.rs`) are read from `~/.ssh` as
 OpenSSH writes them, encrypted keys too (the passphrase given once), into
@@ -366,7 +381,10 @@ update in the top bar and on a card above the account, and in Settings →
 Updates. Restart asks first when terminals of this Mac would end, with the
 question of Quit; tTerm's menu and its icon in the menu bar have Restart to
 Update too. A version ready that is no longer the newest GitHub lists (made
-a pre-release, or deleted) is not ready any more, and does not go in.
+a pre-release, or deleted) is not ready any more, and does not go in. What's
+new, there and after the restart, opens that version's entry in the
+documentation, in the app's language (from 0.8.0: docs.tterm.net, What's
+new › tTerm for Mac); the release here keeps the technical details.
 
 The new version goes in place in one step: the two folders swap
 (`renamex_np` with `RENAME_SWAP`), so the app's place never holds half an

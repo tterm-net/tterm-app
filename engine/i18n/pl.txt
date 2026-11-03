@@ -112,7 +112,6 @@ update.not_saved = Nie udało się zapisać ustawień na tym komputerze.
 # in ja, ko and tr the string comes last, after a colon (ja …次の操作を実行し
 # ようとしています: …, tr … şu işlemi yapmaya çalışıyor: …): a noun phrase.
 vault.reason_open = otworzyć sejf tTerm
-vault.reason_create = utworzyć sejf tTerm
 vault.reason_lock = pozwolić temu Macowi otworzyć sejf tTerm
 vault.reason_approve = pozwolić nowej przeglądarce otworzyć sejf tTerm
-vault.reason_recovery = wygenerować nowy kod odzyskiwania sejfu tTerm
+vault.reason_password = ustawić nowe hasło do sejfu tTerm

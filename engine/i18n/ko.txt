@@ -112,7 +112,6 @@ update.not_saved = 이 컴퓨터에 설정을 저장하지 못했어요.
 # in ja, ko and tr the string comes last, after a colon (ja …次の操作を実行し
 # ようとしています: …, tr … şu işlemi yapmaya çalışıyor: …): a noun phrase.
 vault.reason_open = tTerm 보관함 잠금 해제
-vault.reason_create = tTerm 보관함 생성
 vault.reason_lock = 이 Mac에서 tTerm 보관함을 열도록 허용
 vault.reason_approve = 새 브라우저에서 tTerm 보관함을 열도록 허용
-vault.reason_recovery = tTerm 보관함의 새 복구 코드 생성
+vault.reason_password = tTerm 보관함에 새 비밀번호 설정

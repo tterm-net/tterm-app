@@ -95,7 +95,8 @@ struct Fake {
     /// The page's socket is refused (403), as a proxy that lets no socket
     /// by would.
     no_sockets: bool,
-    /// Requests that take their time, by path, in milliseconds.
+    /// Requests that take their time, in milliseconds: by path, or by
+    /// method and path ("POST /api/vault") for one method alone.
     slow: HashMap<String, u64>,
     /// So many saves of a note are refused (422) before they are taken.
     refuse_saves: usize,
@@ -145,6 +146,20 @@ struct Fake {
     deleted_keys: Vec<String>,
     locks_added: usize,
     own_refuse: Option<(u16, String)>,
+    /// The vault password (0.8.0) as the core keeps it: SHA-256 of the proof
+    /// (never the proof), the wrap it hands out for the right one, and the
+    /// wrong ones since the last right one; the bodies of POST /api/vault
+    /// and of each PUT /api/vault/password, as tTerm got them.
+    password_check: Option<[u8; 32]>,
+    password_wrap: Option<String>,
+    password_wrong: u32,
+    vault_posted: Option<Value>,
+    password_puts: Vec<Value>,
+    /// Write to support with no session (0.8.0): the headers and the body
+    /// of each, as tTerm got them, and its answer to the next one, if not
+    /// that it went.
+    support: Vec<(HashMap<String, String>, Vec<u8>)>,
+    support_answer: Option<(u16, Value)>,
 }
 
 impl Fake {
@@ -320,7 +335,10 @@ async fn serve(mut stream: TcpStream, st: Arc<Mutex<Fake>>, base: String, drops:
         }
         let (status, answer) = answer(&st, &base, &method, &path, &headers, &body);
         // An answer made, and slow to arrive: as over a slow network.
-        let slow = st.lock().unwrap().slow.get(&path).copied();
+        let slow = {
+            let st = st.lock().unwrap();
+            st.slow.get(&format!("{method} {path}")).or_else(|| st.slow.get(&path)).copied()
+        };
         if let Some(ms) = slow {
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
@@ -382,6 +400,16 @@ fn answer(st: &Arc<Mutex<Fake>>, base: &str, method: &str, path: &str, headers: 
         }
         st.photo = Some((kind, body.to_vec()));
         return (200, json!({"photo": "/api/photos/u1?v=1"}));
+    }
+    // Write to support from someone not signed in (tTerm Web 0.1.25): the
+    // address typed is where the answer goes, and no copy goes to it.
+    if (method, path) == ("POST", "/api/support") && headers.get("cookie").is_none() {
+        st.support.push((headers.clone(), body.to_vec()));
+        if let Some(answer) = st.support_answer.take() {
+            return answer;
+        }
+        let email = serde_json::from_slice::<Value>(body).ok().and_then(|b| b.get("email").and_then(Value::as_str).map(str::to_string));
+        return (200, json!({"sent": true, "email": email, "copy": false}));
     }
     let body: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let text = |k: &str| body.get(k).and_then(Value::as_str).unwrap_or("").to_string();
@@ -449,22 +477,81 @@ fn answer(st: &Arc<Mutex<Fake>>, base: &str, method: &str, path: &str, headers: 
             if st.vault.is_some() {
                 return (409, json!({"error": "a vault exists already"}));
             }
+            st.vault_posted = Some(body.clone());
+            // With a password (0.8.0), or with a recovery code as tTerm for
+            // Mac 0.7.x makes it: one of the two, not both.
+            let with_code = body.get("recoverySalt").is_some() || body.get("recoveryWrap").is_some();
+            if body["password"].is_object() == with_code {
+                return (422, json!({"error": "A vault comes with a password or a recovery code."}));
+            }
+            let mut password = Value::Null;
+            if body["password"].is_object() {
+                match password_kept(&body["password"]) {
+                    Ok((shown, check, wrap)) => {
+                        (password, st.password_check, st.password_wrap, st.password_wrong) = (shown, Some(check), Some(wrap), 0);
+                    }
+                    Err(why) => return (422, json!({"error": why})),
+                }
+            }
             // A browser makes it with no lock (vault.py create_vault).
             let lock = &body["lock"];
             let locks = if lock.is_object() { json!([{"id": lock["id"], "kind": lock["kind"], "label": lock["label"], "wrap": lock["wrap"], "thisDevice": true}]) } else { json!([]) };
             let vault = json!({
                 "id": text("id"),
                 "prfSalt": "AAAA",
-                "recoverySalt": text("recoverySalt"),
-                "recoveryWrap": text("recoveryWrap"),
+                "password": password,
+                "recoveryAt": if with_code { json!("2026-11-02T10:00:00Z") } else { Value::Null },
+                "recoverySalt": body.get("recoverySalt").cloned().unwrap_or(Value::Null),
+                "recoveryWrap": body.get("recoveryWrap").cloned().unwrap_or(Value::Null),
                 "locks": locks,
                 "keys": [],
             });
             st.vault = Some(vault.clone());
             (201, json!({"vault": vault}))
         }
+        // The password's proof for its wrap (0.8.0), as the core checks it:
+        // against the SHA-256 it keeps, in constant time; 403 with the tries
+        // left; after 10 wrong ones every try is paused, the right one too.
+        ("POST", "/api/vault/password/open") => {
+            if st.vault.is_none() {
+                return (404, json!({"error": "This account has no vault."}));
+            }
+            let (Some(check), Some(wrap)) = (st.password_check, st.password_wrap.clone()) else {
+                return (404, json!({"error": "This vault has no password."}));
+            };
+            if st.password_wrong >= 10 {
+                return (429, json!({"error": "Too many wrong passwords.", "paused": true, "retryAt": "2026-11-02T13:00:00Z"}));
+            }
+            let auth = tterm_engine::crypto::from_b64u(&text("auth")).unwrap_or_default();
+            if auth.len() == 32 && tterm_engine::crypto::same(&tterm_engine::crypto::password_check(&auth), &check) {
+                st.password_wrong = 0;
+                return (200, json!({"wrap": wrap}));
+            }
+            st.password_wrong += 1;
+            (403, json!({"error": "That password does not open your vault.", "wrong": true, "left": 10 - st.password_wrong}))
+        }
+        // A new password in place of the one there is (or the first: the
+        // recovery code is forgotten in the same step).
+        ("PUT", "/api/vault/password") => {
+            if st.vault.is_none() {
+                return (404, json!({"error": "This account has no vault."}));
+            }
+            let (shown, check, wrap) = match password_kept(&body) {
+                Ok(kept) => kept,
+                Err(why) => return (422, json!({"error": why})),
+            };
+            st.password_puts.push(body.clone());
+            (st.password_check, st.password_wrap, st.password_wrong) = (Some(check), Some(wrap), 0);
+            let v = st.vault.as_mut().unwrap();
+            v["password"] = shown;
+            for gone in ["recoverySalt", "recoveryWrap", "recoveryAt"] {
+                v[gone] = Value::Null;
+            }
+            (200, json!({"vault": st.vault.clone()}))
+        }
         ("GET", "/api/vault/recovery") => match st.vault.as_ref() {
-            Some(v) => (200, json!({"recoverySalt": v["recoverySalt"], "recoveryWrap": v["recoveryWrap"]})),
+            Some(v) if v["recoveryWrap"].is_string() => (200, json!({"recoverySalt": v["recoverySalt"], "recoveryWrap": v["recoveryWrap"]})),
+            Some(_) => (404, json!({"error": "This vault has no recovery code."})),
             None => (404, json!({"error": "This account has no vault."})),
         },
         ("POST", "/api/vault/locks") => {
@@ -481,6 +568,9 @@ fn answer(st: &Arc<Mutex<Fake>>, base: &str, method: &str, path: &str, headers: 
             (201, json!({"vault": st.vault.clone()}))
         }
         ("PUT", "/api/vault/recovery") => {
+            if st.password_check.is_some() {
+                return (409, json!({"error": "This vault has a password: it has no recovery code any more."}));
+            }
             if let Some(v) = st.vault.as_mut() {
                 v["recoverySalt"] = json!(text("recoverySalt"));
                 v["recoveryWrap"] = json!(text("recoveryWrap"));
@@ -585,6 +675,26 @@ fn answer(st: &Arc<Mutex<Fake>>, base: &str, method: &str, path: &str, headers: 
         }
         (m, p) => (200, json!({"method": m, "path": p})),
     }
+}
+
+/// A vault password as the core takes it (`POST /api/vault`'s `password`,
+/// `PUT /api/vault/password`): a salt of 16 bytes, Argon2id within the
+/// core's bounds, a proof of 32 bytes and a wrap of 60. What the vault then
+/// shows of it (no wrap, no proof), and what the core keeps: the proof's
+/// SHA-256, never the proof, and the wrap. Err with the core's sentence.
+fn password_kept(p: &Value) -> Result<(Value, [u8; 32], String), String> {
+    use tterm_engine::crypto;
+    let bytes = |k: &str, n: usize| p[k].as_str().and_then(crypto::from_b64u).filter(|b| b.len() == n);
+    let (Some(salt), Some(auth), Some(_)) = (bytes("salt", 16), bytes("auth", 32), bytes("wrap", 60)) else {
+        return Err("The password's salt, proof or wrap is not as it should be.".into());
+    };
+    let kdf = &p["kdf"];
+    let within = |k: &str, low: u64, high: u64| kdf[k].as_u64().map(|n| (low..=high).contains(&n)).unwrap_or(false);
+    if kdf["alg"] != "argon2id" || !within("m", 65536, 1_048_576) || !within("t", 3, 10) || !within("p", 1, 4) {
+        return Err("The password's settings are not ones tTerm takes.".into());
+    }
+    let shown = json!({"salt": crypto::b64u(&salt), "kdf": {"alg": "argon2id", "m": kdf["m"], "t": kdf["t"], "p": kdf["p"]}, "setAt": "2026-11-02T12:00:00Z"});
+    Ok((shown, crypto::password_check(&auth), p["wrap"].as_str().unwrap_or_default().to_string()))
 }
 
 /// The vault's pairings in the fake tTerm: the new browser (the test) seeds
@@ -1131,6 +1241,64 @@ async fn requests_go_to_tterm_in_the_apps_session() {
     assert_eq!(status, 403);
     let (status, _) = request(&a.engine, "DELETE", "/api/machines/s1", Value::Null).await;
     assert_eq!(status, 200);
+}
+
+/// Write to support before signing in (0.8.0, the page of tTerm Web 0.1.25):
+/// the page's message goes to tTerm as it is, with the header the core
+/// wants and no session, Origin or background mark, and tTerm's answer comes
+/// back as it is, its refusals too; with tTerm out of reach, 503 and words of
+/// the engine's, so the page gives support's address. Signed in, it goes in
+/// the app's session, as the rest of /api/* does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_to_support_before_signing_in_goes_to_tterm_as_it_is() {
+    let cloud = Cloud::start().await;
+    let a = app(&cloud).await;
+    let raw = "{\"text\":\"Не  открывается\\nтерминал 🙂\",\"details\":\"tTerm for Mac 0.8.0 · macOS · not signed in\",  \"email\":\"anna@example.com\"}";
+    let r = tterm_engine::api::handle(&a.engine, "POST", "/api/support", raw.as_bytes()).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.content_type, "application/json");
+    assert_eq!(serde_json::from_slice::<Value>(&r.body).unwrap(), json!({"sent": true, "email": "anna@example.com", "copy": false}));
+    {
+        let st = cloud.st.lock().unwrap();
+        assert_eq!(st.support.len(), 1);
+        let (h, body) = &st.support[0];
+        assert_eq!(body.as_slice(), raw.as_bytes(), "the body as the page wrote it");
+        assert_eq!(h.get("x-tterm").map(String::as_str), Some("1"));
+        assert_eq!(h.get("content-type").map(String::as_str), Some("application/json"));
+        for none in ["origin", "cookie", "x-tterm-background"] {
+            assert!(!h.contains_key(none), "{none}: {h:?}");
+        }
+    }
+    // tTerm's refusals, as it gave them: the limit an hour, its words on
+    // what it cannot take, an email that did not go.
+    for (status, answer) in [
+        (429, json!({"error": "Three messages an hour from one network: write again later, or to support@tterm.net."})),
+        (422, json!({"error": "This does not look like an email address."})),
+        (503, json!({"error": "The message did not go. Write to support@tterm.net."})),
+    ] {
+        cloud.st.lock().unwrap().support_answer = Some((status, answer.clone()));
+        let (got, back) = request(&a.engine, "POST", "/api/support", json!({"text": "Hi", "details": null, "email": "a@b.c"})).await;
+        assert_eq!((got, back), (status, answer));
+    }
+    assert_eq!(cloud.st.lock().unwrap().support.len(), 4);
+    // Signed in: in the app's session, with the rest.
+    sign_in(&cloud, &a).await;
+    let (status, got) = request(&a.engine, "POST", "/api/support", json!({"text": "Hi", "details": null})).await;
+    assert_eq!((status, got), (200, json!({"method": "POST", "path": "/api/support"})));
+    {
+        let st = cloud.st.lock().unwrap();
+        assert_eq!(st.support.len(), 4, "not as someone not signed in");
+        let (_, _, h) = st.requests.iter().rev().find(|(m, p, _)| m == "POST" && p == "/api/support").unwrap();
+        assert!(h.get("cookie").map(|c| c.contains("tterm-session=")).unwrap_or(false), "{h:?}");
+        assert_eq!(h.get("origin"), Some(&cloud.base));
+    }
+    // Signed out, with tTerm out of reach: the engine's words, 503.
+    let (status, _) = request(&a.engine, "POST", "/api/auth/signout", json!({})).await;
+    assert_eq!(status, 200);
+    cloud.stop();
+    let (status, got) = request(&a.engine, "POST", "/api/support", json!({"text": "Hi", "details": null, "email": "a@b.c"})).await;
+    assert_eq!(status, 503, "{got}");
+    assert_eq!(got["error"], tterm_engine::cloud_api::OFFLINE);
 }
 
 /// The language (0.6.0): chosen before signing in, kept on this computer and
@@ -2442,50 +2610,251 @@ async fn app_vault(e: &Arc<Engine>, method: &str, path: &str, body: Value) -> (u
     request(e, method, path, body).await
 }
 
+/// The checks' vault password (0.8.0), and another one.
+const PASSWORD: &str = "correct horse battery staple";
+const ANOTHER: &str = "Tr0ub4dor & 3 by the sea, été";
+
+/// A new vault with the checks' password, as Move to cloud makes it.
+async fn create_vault(e: &Arc<Engine>) {
+    let (status, made) = app_vault(e, "POST", "/api/app/vault/create", json!({"password": PASSWORD})).await;
+    assert_eq!(status, 200, "{made}");
+}
+
+/// The words of a Touch ID question, as the engine says them now.
+fn reason(e: &Arc<Engine>, key: &'static str) -> String {
+    tterm_engine::say::say(e.language_now(), key)
+}
+
+/// Another Mac of the same account: an app of its own, signed in.
+async fn second_mac(cloud: &Cloud) -> (App, Arc<common::TestKeeper>) {
+    let (b, keeper) = app_kept(cloud).await;
+    sign_in(cloud, &b).await;
+    (b, keeper)
+}
+
+/// The app's session ends in a browser (Devices › Forget), the app finds
+/// out at its next call to tTerm, and the person signs in again: two epochs
+/// on, while a vault request of the first one waits. The vault is not told
+/// (no Sign out here), as when it happens while the request waits.
+async fn signed_in_again(cloud: &Cloud, a: &App) {
+    let before = a.engine.cloud.as_ref().unwrap().epoch_now();
+    cloud.forget_devices();
+    let (status, got) = request(&a.engine, "GET", "/api/account", Value::Null).await;
+    assert_eq!((status, got["signedOut"].clone()), (401, json!(true)), "{got}");
+    sign_in(cloud, a).await;
+    assert!(a.engine.cloud.as_ref().unwrap().epoch_now() >= before + 2, "signed out, and in again");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_vault_is_created_opened_and_locked() {
+async fn the_vault_is_created_with_its_password_opened_and_locked() {
+    use tterm_engine::crypto;
     let cloud = Cloud::start().await;
-    let a = app(&cloud).await;
+    let (a, keeper) = app_kept(&cloud).await;
     sign_in(&cloud, &a).await;
     // Before: a Mac can hold a vault, none exists, it is not open.
     let (status, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
     assert_eq!(status, 200, "{v}");
-    assert_eq!(v["available"], true);
-    assert_eq!(v["exists"], false);
-    assert_eq!(v["open"], false);
-    // Create: a recovery code once, the vault held open, the KEK kept.
-    let (status, made) = app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
-    assert_eq!(status, 200, "{made}");
-    let code = made["recoveryCode"].as_str().unwrap();
-    assert_eq!(code.split('-').count(), 6, "{code}");
-    assert!(cloud.st.lock().unwrap().vault.is_some(), "tTerm has the vault");
+    assert_eq!((v["available"].clone(), v["exists"].clone(), v["open"].clone()), (json!(true), json!(false), json!(false)), "{v}");
+    // The tTerm Web it is signed in to, as a browser's address bar has it:
+    // Move to cloud's result says to open it from another computer.
+    assert_eq!(v["web"], json!(cloud.base.trim_start_matches("http://")), "{v}");
+    // No password, one that is no text, or one under 12 characters: 422
+    // with a sentence, and nothing made.
+    for body in [Value::Null, json!({"password": 123456789012u64}), json!({"password": "eleven char"})] {
+        let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/create", body).await;
+        assert_eq!(status, 422, "{why}");
+        assert!(why["error"].as_str().unwrap().contains("12 characters"), "{why}");
+    }
+    assert!(cloud.st.lock().unwrap().vault.is_none(), "no vault made");
+    // Made with the password the person has just made up: no Touch ID for
+    // it, no recovery code, the vault held open.
+    let (status, made) = app_vault(&a.engine, "POST", "/api/app/vault/create", json!({"password": PASSWORD})).await;
+    assert_eq!((status, made.clone()), (200, json!({"open": true})), "{made}");
+    assert!(keeper.reasons_since(0).is_empty(), "no Touch ID when the vault is made: {:?}", keeper.reasons_since(0));
+    // What tTerm got: the password's salt, settings, proof and wrap, this
+    // Mac's lock, and no recovery code.
+    let posted = cloud.st.lock().unwrap().vault_posted.clone().unwrap();
+    let vault_id = posted["id"].as_str().unwrap().to_string();
+    assert!(uuid::Uuid::parse_str(&vault_id).is_ok(), "{posted}");
+    assert!(posted.get("recoverySalt").is_none() && posted.get("recoveryWrap").is_none(), "no recovery code: {posted}");
+    let password = &posted["password"];
+    let bytes = |v: &Value| crypto::from_b64u(v.as_str().unwrap()).unwrap();
+    assert_eq!(password["kdf"], json!({"alg": "argon2id", "m": 65536, "t": 3, "p": 1}), "{posted}");
+    assert_eq!((bytes(&password["salt"]).len(), bytes(&password["auth"]).len(), bytes(&password["wrap"]).len()), (16, 32, 60), "{posted}");
+    assert_eq!(password.as_object().unwrap().len(), 4, "salt, kdf, auth and wrap, nothing else: {password}");
+    assert_eq!((posted["lock"]["kind"].clone(), bytes(&posted["lock"]["wrap"]).len()), (json!("app"), 60), "{posted}");
+    // As the contract makes them: the proof and the KEK are the password's
+    // with that salt, and its wrap holds the vault key of this Mac's lock.
+    let salt = bytes(&password["salt"]);
+    let keys = crypto::password_keys(&crypto::password_text(PASSWORD).unwrap(), &salt, &crypto::Kdf::NEW).unwrap();
+    assert_eq!(bytes(&password["auth"]), keys.auth.as_slice(), "the proof");
+    let vk = crypto::open_key(&keys.kek, &bytes(&password["wrap"]), &crypto::password_aad(&vault_id)).expect("the password's wrap opens");
+    assert_eq!(*vk, vault_key_of(&cloud, &keeper), "one vault key");
+    // tTerm keeps the proof's SHA-256, never the proof, and shows the salt
+    // and the settings only.
+    let shown = cloud.st.lock().unwrap().vault.clone().unwrap();
+    let mut fields: Vec<&String> = shown["password"].as_object().unwrap().keys().collect();
+    fields.sort();
+    assert_eq!(fields, ["kdf", "salt", "setAt"], "{shown}");
+    assert_eq!(cloud.st.lock().unwrap().password_check, Some(crypto::password_check(keys.auth.as_ref())));
     let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
-    assert_eq!(v["exists"], true);
-    assert_eq!(v["open"], true, "create holds it open");
-    // Lock, then open again from the keychain and tTerm's wrap.
+    assert_eq!((v["exists"].clone(), v["open"].clone()), (json!(true), json!(true)), "create holds it open: {v}");
+    // Lock, then open again with Touch ID, from the keychain and tTerm's wrap.
     let (status, locked) = app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
-    assert_eq!(status, 200, "{locked}");
-    assert_eq!(locked["open"], false);
+    assert_eq!((status, locked["open"].clone()), (200, json!(false)), "{locked}");
     let (status, opened) = app_vault(&a.engine, "POST", "/api/app/vault/open", Value::Null).await;
-    assert_eq!(status, 200, "{opened}");
-    assert_eq!(opened["open"], true);
+    assert_eq!((status, opened["open"].clone()), (200, json!(true)), "{opened}");
+    assert_eq!(keeper.reasons_since(0), [reason(&a.engine, "vault.reason_open")]);
     // A second create is refused: one vault per account.
-    let (status, _) = app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    let (status, _) = app_vault(&a.engine, "POST", "/api/app/vault/create", json!({"password": PASSWORD})).await;
     assert_eq!(status, 409);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_new_recovery_code_replaces_the_old() {
+async fn no_recovery_codes_are_made_any_more() {
     let cloud = Cloud::start().await;
-    let a = app(&cloud).await;
+    let (a, keeper) = app_kept(&cloud).await;
     sign_in(&cloud, &a).await;
-    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
-    let first_salt = cloud.st.lock().unwrap().vault.as_ref().unwrap()["recoverySalt"].as_str().unwrap().to_string();
-    let (status, again) = app_vault(&a.engine, "POST", "/api/app/vault/recovery", Value::Null).await;
-    assert_eq!(status, 200, "{again}");
-    assert_eq!(again["recoveryCode"].as_str().unwrap().split('-').count(), 6);
-    let second_salt = cloud.st.lock().unwrap().vault.as_ref().unwrap()["recoverySalt"].as_str().unwrap().to_string();
-    assert_ne!(first_salt, second_salt, "a new salt and wrap");
+    create_vault(&a.engine).await;
+    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/recovery", Value::Null).await;
+    assert_eq!(status, 404, "{why}");
+    assert!(keeper.reasons_since(0).is_empty(), "no Touch ID for it");
+    assert_eq!(cloud.count("PUT", "/api/vault/recovery"), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_password_opens_the_vault_on_a_second_mac_then_touch_id_does() {
+    let cloud = Cloud::start().await;
+    let (a, a_keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    create_vault(&a.engine).await;
+    let (b, keeper) = second_mac(&cloud).await;
+    let (_, v) = app_vault(&b.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!((v["exists"].clone(), v["open"].clone()), (json!(true), json!(false)), "{v}");
+    // Touch ID opens nothing here yet: no lock of this Mac's, and the page
+    // is told to open it with the password.
+    let (status, why) = app_vault(&b.engine, "POST", "/api/app/vault/open", json!({})).await;
+    assert_eq!(status, 409, "{why}");
+    assert!(why["error"].as_str().unwrap().contains("vault password"), "{why}");
+    let asked = keeper.auths();
+    // A wrong one: 422 with the tries left, as tTerm counted it.
+    let (status, why) = app_vault(&b.engine, "POST", "/api/app/vault/open", json!({"password": ANOTHER})).await;
+    assert_eq!(status, 422, "{why}");
+    assert_eq!((why["wrong"].clone(), why["left"].clone()), (json!(true), json!(9)), "{why}");
+    assert!(!why["error"].as_str().unwrap().is_empty(), "{why}");
+    // One that is no vault's password (under 12): not tried, no try spent.
+    let (status, why) = app_vault(&b.engine, "POST", "/api/app/vault/open", json!({"password": "too short"})).await;
+    assert_eq!(status, 422, "{why}");
+    assert!(why.get("wrong").is_none(), "{why}");
+    assert_eq!((cloud.count("POST", "/api/vault/password/open"), cloud.st.lock().unwrap().password_wrong), (1, 1));
+    // The right one: open, with no Touch ID (the person has just typed the
+    // password), and this Mac has its own lock now.
+    let (status, opened) = app_vault(&b.engine, "POST", "/api/app/vault/open", json!({"password": PASSWORD})).await;
+    assert_eq!((status, opened.clone()), (200, json!({"open": true})), "{opened}");
+    assert_eq!(keeper.auths(), asked, "no Touch ID with the password");
+    {
+        let st = cloud.st.lock().unwrap();
+        assert_eq!((st.locks_added, st.password_wrong), (1, 0), "its own lock; the count starts again");
+    }
+    assert_eq!(vault_key_of(&cloud, &keeper), vault_key_of(&cloud, &a_keeper), "the same vault key");
+    // Locked, Touch ID alone opens it here now.
+    app_vault(&b.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    let (status, opened) = app_vault(&b.engine, "POST", "/api/app/vault/open", json!({})).await;
+    assert_eq!(status, 200, "{opened}");
+    assert_eq!(keeper.reasons_since(asked), [reason(&b.engine, "vault.reason_open")]);
+    // Ten wrong ones in a row and tTerm pauses the tries, the right one's
+    // too, saying until when; Touch ID opens it all the same.
+    app_vault(&b.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    for left in (0..10).rev() {
+        let (status, why) = app_vault(&b.engine, "POST", "/api/app/vault/open", json!({"password": ANOTHER})).await;
+        assert_eq!((status, why["wrong"].clone(), why["left"].clone()), (422, json!(true), json!(left)), "{why}");
+    }
+    for typed in [ANOTHER, PASSWORD] {
+        let (status, why) = app_vault(&b.engine, "POST", "/api/app/vault/open", json!({"password": typed})).await;
+        assert_eq!(status, 429, "{why}");
+        assert_eq!((why["paused"].clone(), why["retryAt"].clone()), (json!(true), json!("2026-11-02T13:00:00Z")), "{why}");
+        assert!(!why["error"].as_str().unwrap().is_empty() && why.get("wrong").is_none(), "{why}");
+    }
+    let (_, v) = app_vault(&b.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!(v["open"], false, "{v}");
+    let (status, opened) = app_vault(&b.engine, "POST", "/api/app/vault/open", json!({})).await;
+    assert_eq!(status, 200, "{opened}");
+    assert_eq!(cloud.st.lock().unwrap().locks_added, 1, "its lock stays the one");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_password_replaces_the_old_with_touch_id() {
+    let cloud = Cloud::start().await;
+    let (a, keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    create_vault(&a.engine).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    let first_salt = cloud.st.lock().unwrap().vault.as_ref().unwrap()["password"]["salt"].clone();
+    // Under 12 characters: refused before Touch ID is asked.
+    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/password", json!({"password": "short one"})).await;
+    assert_eq!(status, 422, "{why}");
+    assert!(why["error"].as_str().unwrap().contains("12 characters"), "{why}");
+    assert_eq!(keeper.auths(), 0);
+    // Touch ID refused: 403, and the password stays as it was.
+    keeper.auth_fails.store(true, Ordering::SeqCst);
+    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/password", json!({"password": ANOTHER})).await;
+    assert_eq!(status, 403, "{why}");
+    assert!(why["error"].as_str().unwrap().contains("Touch ID"), "{why}");
+    assert!(cloud.st.lock().unwrap().password_puts.is_empty());
+    keeper.auth_fails.store(false, Ordering::SeqCst);
+    // The new one: Touch ID once, in its own words, which also opens the
+    // locked vault; a new salt, the real settings, and nothing else.
+    let asked = keeper.auths();
+    let (status, done) = app_vault(&a.engine, "POST", "/api/app/vault/password", json!({"password": ANOTHER})).await;
+    assert_eq!((status, done.clone()), (200, json!({"ok": true})), "{done}");
+    assert_eq!(keeper.reasons_since(asked), [reason(&a.engine, "vault.reason_password")], "Touch ID once, for the password");
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!(v["open"], true, "opened for it: {v}");
+    let put = cloud.st.lock().unwrap().password_puts[0].clone();
+    assert_eq!(put["kdf"], json!({"alg": "argon2id", "m": 65536, "t": 3, "p": 1}), "{put}");
+    assert_eq!(put.as_object().unwrap().len(), 4, "salt, kdf, auth and wrap: {put}");
+    assert_ne!(put["salt"], first_salt, "a new salt");
+    // On another Mac the old password no longer opens the vault; the new one
+    // does, typed with its accent as one letter or as two.
+    let (b, _) = second_mac(&cloud).await;
+    let (status, why) = app_vault(&b.engine, "POST", "/api/app/vault/open", json!({"password": PASSWORD})).await;
+    assert_eq!((status, why["wrong"].clone()), (422, json!(true)), "{why}");
+    let decomposed = ANOTHER.replace('\u{e9}', "e\u{301}");
+    assert_ne!(decomposed, ANOTHER);
+    let (status, opened) = app_vault(&b.engine, "POST", "/api/app/vault/open", json!({"password": decomposed})).await;
+    assert_eq!(status, 200, "{opened}");
+    // Changed again on that Mac, with its own lock and Touch ID.
+    let (status, done) = app_vault(&b.engine, "POST", "/api/app/vault/password", json!({"password": PASSWORD})).await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(cloud.st.lock().unwrap().password_puts.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_password_of_an_old_vault_takes_its_recovery_codes_place() {
+    let cloud = Cloud::start().await;
+    let (a, keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    let code = "K7QF-29XM-PL4D-8VHT-R2NC-6WJB";
+    let vk = [9u8; 32];
+    cloud.st.lock().unwrap().vault = Some(browser_vault(&vk, code));
+    let (status, opened) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({"recoveryCode": code})).await;
+    assert_eq!(status, 200, "{opened}");
+    app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    // Its first password, with Touch ID once: tTerm forgets the code.
+    let asked = keeper.auths();
+    let (status, done) = app_vault(&a.engine, "POST", "/api/app/vault/password", json!({"password": PASSWORD})).await;
+    assert_eq!((status, done.clone()), (200, json!({"ok": true})), "{done}");
+    assert_eq!(keeper.reasons_since(asked), [reason(&a.engine, "vault.reason_password")]);
+    assert!(cloud.st.lock().unwrap().vault.as_ref().unwrap()["recoveryWrap"].is_null(), "the code is forgotten");
+    // Another Mac: the code is no way in now, the password is, to the same
+    // vault key the code opened.
+    let (b, b_keeper) = second_mac(&cloud).await;
+    let (status, why) = app_vault(&b.engine, "POST", "/api/app/vault/open", json!({"recoveryCode": code})).await;
+    assert_eq!(status, 409, "{why}");
+    assert!(why["error"].as_str().unwrap().contains("password"), "{why}");
+    let (status, opened) = app_vault(&b.engine, "POST", "/api/app/vault/open", json!({"password": PASSWORD})).await;
+    assert_eq!(status, 200, "{opened}");
+    assert_eq!(vault_key_of(&cloud, &b_keeper), vk);
 }
 
 /// An app whose vault keeper the test can look into.
@@ -2499,14 +2868,14 @@ async fn app_kept(cloud: &Cloud) -> (App, Arc<common::TestKeeper>) {
     (App { engine, host, env, dir }, keeper)
 }
 
-/// The vault key, as this Mac's lock in the fake tTerm and the KEK the
-/// keeper kept give it back.
+/// The vault key, as this Mac's lock in the fake tTerm (the app lock the
+/// keeper's KEK opens: there may be another Mac's too) gives it back.
 fn vault_key_of(cloud: &Cloud, keeper: &common::TestKeeper) -> [u8; 32] {
     use tterm_engine::crypto;
     let vault = cloud.st.lock().unwrap().vault.clone().expect("a vault");
-    let lock = vault["locks"].as_array().unwrap().iter().find(|l| l["kind"] == "app").expect("an app lock").clone();
     let kek = crypto::key_of(&keeper.kek(vault["id"].as_str().unwrap()).expect("a KEK")).unwrap();
-    let vk = crypto::open_key(&kek, &crypto::from_b64u(lock["wrap"].as_str().unwrap()).unwrap(), &crypto::lock_aad(lock["id"].as_str().unwrap())).expect("the lock opens");
+    let opens = |l: &Value| crypto::open_key(&kek, &crypto::from_b64u(l["wrap"].as_str()?)?, &crypto::lock_aad(l["id"].as_str()?));
+    let vk = vault["locks"].as_array().unwrap().iter().filter(|l| l["kind"] == "app").find_map(opens).expect("this Mac's lock opens");
     *vk
 }
 
@@ -2529,7 +2898,7 @@ async fn open_without_touch_id_is_refused() {
     let cloud = Cloud::start().await;
     let (a, keeper) = app_kept(&cloud).await;
     sign_in(&cloud, &a).await;
-    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    create_vault(&a.engine).await;
     app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
     // The person cancels the LocalAuthentication: open is refused with 403
     // (not the 401 of a session that ended), and the gate was asked.
@@ -2549,7 +2918,7 @@ async fn signing_out_forgets_the_vaults_key_locked_or_open() {
     let cloud = Cloud::start().await;
     let (a, keeper) = app_kept(&cloud).await;
     sign_in(&cloud, &a).await;
-    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    create_vault(&a.engine).await;
     let vault_id = cloud.st.lock().unwrap().vault.as_ref().unwrap()["id"].as_str().unwrap().to_string();
     // Locked first: Sign out forgets the KEK all the same.
     app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
@@ -2566,7 +2935,7 @@ async fn a_device_forgotten_in_a_browser_locks_the_vault_here() {
     let cloud = Cloud::start().await;
     let (a, keeper) = app_kept(&cloud).await;
     sign_in(&cloud, &a).await;
-    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    create_vault(&a.engine).await;
     let vault_id = cloud.st.lock().unwrap().vault.as_ref().unwrap()["id"].as_str().unwrap().to_string();
     let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
     assert_eq!(v["open"], true);
@@ -2574,13 +2943,137 @@ async fn a_device_forgotten_in_a_browser_locks_the_vault_here() {
     // device gone, and it is signed out here. The vault opened in that
     // account locks, its KEK goes, and the API says signed out.
     cloud.forget_devices();
-    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/recovery", Value::Null).await;
+    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/password", json!({"password": ANOTHER})).await;
     assert_eq!(status, 401, "{why}");
     assert_eq!(why["signedOut"], true, "{why}");
     let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
     assert_eq!(v["open"], false, "{v}");
     assert!(v["keys"].as_array().unwrap().is_empty());
     assert!(keeper.kek(&vault_id).is_none(), "the KEK is gone");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_password_waiting_for_touch_id_across_another_sign_in_goes_nowhere() {
+    let cloud = Cloud::start().await;
+    let (a, keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    create_vault(&a.engine).await;
+    let vault_id = cloud.st.lock().unwrap().vault.as_ref().unwrap()["id"].as_str().unwrap().to_string();
+    // Touch ID is asked for the new password and waits for the person;
+    // meanwhile the session ends in a browser and they sign in again. The
+    // vault opened before is still held here: nothing has told it.
+    keeper.hold();
+    let e = a.engine.clone();
+    let asked = tokio::spawn(async move { app_vault(&e, "POST", "/api/app/vault/password", json!({"password": ANOTHER})).await });
+    assert!(until(10, || keeper.waiting() == 1).await, "Touch ID is asked");
+    signed_in_again(&cloud, &a).await;
+    keeper.release();
+    let (status, why) = asked.await.unwrap();
+    // The request is of the account before: signed out, as a session that
+    // ended (changes 23, 50), and no new password went to tTerm in the new
+    // session; the vault opened before is locked and its KEK forgotten.
+    assert_eq!((status, why["signedOut"].clone()), (401, json!(true)), "{why}");
+    assert_eq!(keeper.reasons_since(0), [reason(&a.engine, "vault.reason_password")]);
+    assert_eq!(cloud.count("PUT", "/api/vault/password"), 0);
+    assert!(cloud.st.lock().unwrap().password_puts.is_empty());
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!((v["exists"].clone(), v["open"].clone()), (json!(true), json!(false)), "{v}");
+    assert!(keeper.kek(&vault_id).is_none(), "the KEK is gone");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_password_answered_after_another_sign_in_opens_nothing() {
+    let cloud = Cloud::start().await;
+    let (a, _) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    create_vault(&a.engine).await;
+    let (b, keeper) = second_mac(&cloud).await;
+    // On a second Mac, tTerm's answer for the right password comes late:
+    // after the session ended and the person signed in again.
+    cloud.st.lock().unwrap().slow.insert("POST /api/vault/password/open".into(), 3000);
+    let e = b.engine.clone();
+    let opening = tokio::spawn(async move { app_vault(&e, "POST", "/api/app/vault/open", json!({"password": PASSWORD})).await });
+    assert!(until(30, || cloud.count("POST", "/api/vault/password/open") == 1).await, "the password is tried");
+    signed_in_again(&cloud, &b).await;
+    let (status, why) = opening.await.unwrap();
+    // Signed out; no lock of this Mac's added in the new session, no KEK
+    // kept, and the vault not open.
+    assert_eq!((status, why["signedOut"].clone()), (401, json!(true)), "{why}");
+    assert_eq!(cloud.count("POST", "/api/vault/locks"), 0);
+    assert_eq!(cloud.st.lock().unwrap().locks_added, 0);
+    assert_eq!(keeper.keks(), 0, "no KEK kept");
+    let (_, v) = app_vault(&b.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!(v["open"], false, "{v}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vault_made_across_another_sign_in_is_not_kept() {
+    let cloud = Cloud::start().await;
+    let (a, keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    // tTerm says late that the account has no vault yet: the person signed
+    // in again meanwhile. Nothing is made, in either session.
+    cloud.st.lock().unwrap().slow.insert("GET /api/vault".into(), 3000);
+    let e = a.engine.clone();
+    let making = tokio::spawn(async move { app_vault(&e, "POST", "/api/app/vault/create", json!({"password": PASSWORD})).await });
+    assert!(until(10, || cloud.count("GET", "/api/vault") == 1).await, "tTerm is asked");
+    signed_in_again(&cloud, &a).await;
+    let (status, why) = making.await.unwrap();
+    assert_eq!((status, why["signedOut"].clone()), (401, json!(true)), "{why}");
+    assert!(cloud.st.lock().unwrap().vault_posted.is_none(), "no vault posted");
+    assert_eq!(keeper.keks(), 0, "no KEK kept");
+    // Now tTerm's answer to the vault itself comes late: tTerm made it in
+    // the session it was asked in, and this Mac keeps nothing of it.
+    cloud.st.lock().unwrap().slow = HashMap::from([("POST /api/vault".to_string(), 3000)]);
+    let e = a.engine.clone();
+    let making = tokio::spawn(async move { app_vault(&e, "POST", "/api/app/vault/create", json!({"password": PASSWORD})).await });
+    assert!(until(30, || cloud.st.lock().unwrap().vault_posted.is_some()).await, "the vault is posted");
+    signed_in_again(&cloud, &a).await;
+    let (status, why) = making.await.unwrap();
+    assert_eq!((status, why["signedOut"].clone()), (401, json!(true)), "{why}");
+    assert_eq!(keeper.keks(), 0, "its KEK is forgotten");
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!((v["exists"].clone(), v["open"].clone()), (json!(true), json!(false)), "{v}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_password_that_gives_another_vault_key_than_this_macs_lock_opens_nothing() {
+    use tterm_engine::crypto;
+    let cloud = Cloud::start().await;
+    let (a, keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    create_vault(&a.engine).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    let (vault_id, salt, right_wrap) = {
+        let st = cloud.st.lock().unwrap();
+        let v = st.vault.as_ref().unwrap();
+        (v["id"].as_str().unwrap().to_string(), crypto::from_b64u(v["password"]["salt"].as_str().unwrap()).unwrap(), st.password_wrap.clone().unwrap())
+    };
+    let kek = keeper.kek(&vault_id).expect("this Mac's KEK");
+    // For the right password tTerm hands out the wrap of another vault key:
+    // it opens with the password, and holds not the key this Mac's own lock
+    // holds. One of the two was replaced: neither is taken.
+    let keys = crypto::password_keys(&crypto::password_text(PASSWORD).unwrap(), &salt, &crypto::Kdf::NEW).unwrap();
+    let another = crypto::seal(&keys.kek, &[7u8; 32], &crypto::password_aad(&vault_id));
+    cloud.st.lock().unwrap().password_wrap = Some(crypto::b64u(&another));
+    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({"password": PASSWORD})).await;
+    assert_eq!(status, 502, "{why}");
+    assert!(why["error"].as_str().unwrap().starts_with("Your vault's locks do not agree: "), "{why}");
+    assert!(why.get("signedOut").is_none() && why.get("wrong").is_none(), "{why}");
+    // Locked, and nothing kept or added: no new lock, the keychain item as
+    // it was, this Mac's lock the vault's only one.
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!((v["open"].clone(), v["keys"].clone()), (json!(false), json!([])), "{v}");
+    assert_eq!(cloud.count("POST", "/api/vault/locks"), 0);
+    assert_eq!(cloud.st.lock().unwrap().vault.as_ref().unwrap()["locks"].as_array().unwrap().len(), 1);
+    assert_eq!(keeper.kek(&vault_id).as_ref(), Some(&kek), "the KEK stays as it was");
+    // The right wrap again: the password opens the vault, this Mac's lock
+    // kept as its own.
+    cloud.st.lock().unwrap().password_wrap = Some(right_wrap);
+    let (status, opened) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({"password": PASSWORD})).await;
+    assert_eq!((status, opened.clone()), (200, json!({"open": true})), "{opened}");
+    assert_eq!(cloud.count("POST", "/api/vault/locks"), 0, "its own lock kept");
+    assert_eq!(keeper.kek(&vault_id), Some(kek));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2602,6 +3095,12 @@ async fn a_vault_made_in_a_browser_opens_once_with_the_code_then_with_touch_id()
     let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({})).await;
     assert_eq!(status, 409, "{why}");
     assert!(why["error"].as_str().unwrap().contains("recovery code"), "{why}");
+    assert_eq!(keeper.auths(), before);
+    // With a password, which it has none of yet: 409, nothing tried.
+    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({"password": PASSWORD})).await;
+    assert_eq!(status, 409, "{why}");
+    assert!(why["error"].as_str().unwrap().contains("no password"), "{why}");
+    assert_eq!(cloud.count("POST", "/api/vault/password/open"), 0);
     assert_eq!(keeper.auths(), before);
     // Not a code, or another vault's: 422, and no lock.
     let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({"recoveryCode": "not a code"})).await;
@@ -2643,7 +3142,7 @@ async fn this_macs_lock_taken_off_in_a_browser_locks_the_vault_here() {
     let cloud = Cloud::start().await;
     let (a, keeper) = app_kept(&cloud).await;
     sign_in(&cloud, &a).await;
-    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    create_vault(&a.engine).await;
     let vault_id = cloud.st.lock().unwrap().vault.as_ref().unwrap()["id"].as_str().unwrap().to_string();
     assert!(keeper.kek(&vault_id).is_some());
     // In a browser's Settings › Keys this Mac's lock is taken off; tTerm
@@ -2660,6 +3159,14 @@ async fn this_macs_lock_taken_off_in_a_browser_locks_the_vault_here() {
     assert!(keeper.kek(&vault_id).is_none(), "its KEK is no use and is gone");
     let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({})).await;
     assert_eq!(status, 409, "{why}");
+    assert!(why["error"].as_str().unwrap().contains("vault password"), "{why}");
+    // The password gives this Mac a new lock, and Touch ID opens it again.
+    let (status, opened) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({"password": PASSWORD})).await;
+    assert_eq!(status, 200, "{opened}");
+    assert!(keeper.kek(&vault_id).is_some(), "a new KEK");
+    app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    let (status, opened) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({})).await;
+    assert_eq!(status, 200, "{opened}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2668,7 +3175,7 @@ async fn a_new_browser_is_paired_while_the_vault_is_locked() {
     let cloud = Cloud::start().await;
     let (a, keeper) = app_kept(&cloud).await;
     sign_in(&cloud, &a).await;
-    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    create_vault(&a.engine).await;
     app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
     let id = "abcdefab-cdef-4abc-8def-0123456789ab";
     let (pub_b, priv_b) = x25519_pair();
@@ -2724,7 +3231,7 @@ async fn the_engine_signs_logins_on_the_socket_and_nothing_else() {
     let cloud = Cloud::start().await;
     let (a, keeper) = app_kept(&cloud).await;
     sign_in(&cloud, &a).await;
-    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    create_vault(&a.engine).await;
     let (fingerprint, case) = seal_vector_key(&cloud, &vault_key_of(&cloud, &keeper));
     let login = case["data"].as_str().unwrap().to_string();
     let arbitrary = crypto::b64u(b"an SSHSIG, a git commit, a challenge of anything");
@@ -2768,7 +3275,7 @@ async fn a_new_browser_is_paired_from_the_mac() {
     let cloud = Cloud::start().await;
     let a = app(&cloud).await;
     sign_in(&cloud, &a).await;
-    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    create_vault(&a.engine).await;
     // The new browser makes its X25519 pair and seeds a waiting pairing
     // with its commit and the pubB it will reveal.
     let id = "abcdefab-cdef-4abc-8def-abcdefabcdef";
@@ -2930,7 +3437,7 @@ async fn moving_a_server_signs_in_with_its_key_then_seals_it_once() {
     let cloud = Cloud::start().await;
     let (a, keeper) = app_kept(&cloud).await;
     sign_in(&cloud, &a).await;
-    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    create_vault(&a.engine).await;
     // Not one of ssh's default names: lab-box (no IdentityFile) has no key.
     let key_path = lab.key("work_key", "");
     let pub_line = std::fs::read_to_string(key_path.with_extension("pub")).unwrap();
@@ -3009,7 +3516,7 @@ async fn a_key_server_moves_only_as_the_person_said() {
     let (_, moved) = app_vault(&a.engine, "POST", "/api/app/move", move_web(json!([{"path": "~/.ssh/id_ed25519"}]))).await;
     assert_eq!(moved["results"][0]["ok"], false, "{moved}");
     assert!(moved["results"][0]["error"].as_str().unwrap().contains("Open your vault"), "{moved}");
-    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    create_vault(&a.engine).await;
     // Its key not ticked: not moved, nothing uploaded, no login.
     let (_, moved) = app_vault(&a.engine, "POST", "/api/app/move", move_web(json!([]))).await;
     assert_eq!(moved["results"][0]["ok"], false, "{moved}");
@@ -3052,7 +3559,7 @@ async fn a_passphrase_answers_only_the_passphrase_question() {
     let cloud = Cloud::start().await;
     let a = app(&cloud).await;
     sign_in(&cloud, &a).await;
-    app_vault(&a.engine, "POST", "/api/app/vault/create", Value::Null).await;
+    create_vault(&a.engine).await;
     let key_path = lab.key("id_ed25519", "open sesame");
     lab_config(&lab, &key_path);
     let (_, listed) = app_vault(&a.engine, "GET", "/api/app/ssh", Value::Null).await;

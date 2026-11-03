@@ -45,5 +45,50 @@
   "type": "ssh-ed25519",
   "data": "c2Vzc2lvbi1pZC1hbmQtdXNlcmF1dGgtcmVxdWVzdA",
   "raw_sig": "61ca-LF5ORwc8UnOqmY5zTl1v8qTGzfzZUZXZO3T5bvGczN56xrEgeoyNY7onxsQBjv8Jy-J1MscgixTB2hKCw"
+ },
+ "password": {
+  "about": "The vault password (v2). argon2 = Argon2id v0x13 of utf8(NFC(password)), 32 bytes; kek and auth = HKDF-SHA256(ikm = argon2, salt = 32 zero bytes, info); check = SHA-256(auth), what the core keeps; wrap = box(kek, vk, aad) with the vectors' nonce.",
+  "small": {
+   "vault_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+   "password": "Correct horse 7 \u00e9te\u0301 \u0442\u0451\u043f\u043b\u044b\u0439",
+   "nfc": "Correct horse 7 \u00e9t\u00e9 \u0442\u0451\u043f\u043b\u044b\u0439",
+   "utf8": "Q29ycmVjdCBob3JzZSA3IMOpdMOpINGC0ZHQv9C70YvQuQ",
+   "salt": "EREREREREREREREREREREQ",
+   "kdf": {
+    "alg": "argon2id",
+    "m": 256,
+    "t": 2,
+    "p": 1
+   },
+   "argon2": "bnfWD7GLLaMxJu2gzakMuqAp4pJnGyPWc59PZIxUV-c",
+   "kek_info": "tterm/vault/password/kek/v1",
+   "auth_info": "tterm/vault/password/auth/v1",
+   "kek": "xaiJSnQ0-JcA5FF4mx82cUtgqgoktdp1CkZC7dXBz4g",
+   "auth": "pmxCOp-hUixKmkwRICI1l72SCEFblvYzBw1JuCgEdGA",
+   "check": "9wjIN82-BURE_9RAWLsQEoYz_TtDJBwKmIa6s-UuPxc",
+   "aad": "tterm/vault/password/v1/0f0e0d0c-0b0a-4908-8706-050403020100",
+   "wrap": "BwcHBwcHBwcHBwcH2HQMktb7yPpCFC__Qokf5UAuGTP6sgF5IkwAjtQOPnmYIt8PkSmHxghG5qsTUq9i"
+  },
+  "default": {
+   "vault_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+   "password": "correct horse battery staple",
+   "nfc": "correct horse battery staple",
+   "utf8": "Y29ycmVjdCBob3JzZSBiYXR0ZXJ5IHN0YXBsZQ",
+   "salt": "IiIiIiIiIiIiIiIiIiIiIg",
+   "kdf": {
+    "alg": "argon2id",
+    "m": 65536,
+    "t": 3,
+    "p": 1
+   },
+   "argon2": "YrY6ytU969njKab8ROdkRrg3zLtG_chGDNxDnBCMRTQ",
+   "kek_info": "tterm/vault/password/kek/v1",
+   "auth_info": "tterm/vault/password/auth/v1",
+   "kek": "a8AgKviH_xVtl-AxfMrtXPk3gB30xToZSJkvZnysGdI",
+   "auth": "PxN3lLDxZkwkF0IwQCYSeOqd3S0Gp8cLtAM8SyQtDWA",
+   "check": "W2CIkLknArTlgSdas4rLi2vm-BlsPT3l8Us28Qj-Dxo",
+   "aad": "tterm/vault/password/v1/0f0e0d0c-0b0a-4908-8706-050403020100",
+   "wrap": "BwcHBwcHBwcHBwcHNSAMw4T2XilBfle8E0aFhdlGFfdSceTVKolnn8qiA7bUdypTGRLsaUpOM0aBzSvF"
+  }
  }
 }

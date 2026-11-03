@@ -112,7 +112,6 @@ update.not_saved = 无法在这台电脑上保存设置。
 # in ja, ko and tr the string comes last, after a colon (ja …次の操作を実行し
 # ようとしています: …, tr … şu işlemi yapmaya çalışıyor: …): a noun phrase.
 vault.reason_open = 打开你的 tTerm 保险库
-vault.reason_create = 创建你的 tTerm 保险库
 vault.reason_lock = 允许这台 Mac 打开你的 tTerm 保险库
 vault.reason_approve = 允许新的浏览器打开你的 tTerm 保险库
-vault.reason_recovery = 为你的 tTerm 保险库生成新的恢复代码
+vault.reason_password = 为你的 tTerm 保险库设置新密码

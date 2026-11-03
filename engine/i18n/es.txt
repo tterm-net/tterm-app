@@ -112,7 +112,6 @@ update.not_saved = No se pudo guardar la configuración en esta computadora.
 # in ja, ko and tr the string comes last, after a colon (ja …次の操作を実行し
 # ようとしています: …, tr … şu işlemi yapmaya çalışıyor: …): a noun phrase.
 vault.reason_open = abrir tu bóveda de tTerm
-vault.reason_create = crear tu bóveda de tTerm
 vault.reason_lock = permitir que esta Mac abra tu bóveda de tTerm
 vault.reason_approve = permitir que un navegador nuevo abra tu bóveda de tTerm
-vault.reason_recovery = crear un código de recuperación nuevo para tu bóveda de tTerm
+vault.reason_password = establecer una contraseña nueva para tu bóveda de tTerm

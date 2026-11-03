@@ -112,7 +112,6 @@ update.not_saved = Impossible d’enregistrer les paramètres sur cet ordinateur
 # in ja, ko and tr the string comes last, after a colon (ja …次の操作を実行し
 # ようとしています: …, tr … şu işlemi yapmaya çalışıyor: …): a noun phrase.
 vault.reason_open = ouvrir votre coffre tTerm
-vault.reason_create = créer votre coffre tTerm
 vault.reason_lock = permettre à ce Mac d’ouvrir votre coffre tTerm
 vault.reason_approve = permettre à un nouveau navigateur d’ouvrir votre coffre tTerm
-vault.reason_recovery = générer un nouveau code de récupération pour votre coffre tTerm
+vault.reason_password = définir un nouveau mot de passe pour votre coffre tTerm

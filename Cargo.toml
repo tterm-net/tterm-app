@@ -3,11 +3,20 @@ resolver = "2"
 members = ["engine", "app", "agent"]
 
 [workspace.package]
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["Denis Gerasimenko"]
 repository = "https://github.com/tterm-net/tterm-app"
+
+[profile.dev.package.argon2]
+# Argon2id of the vault password (engine/src/crypto.rs) at full speed in
+# debug builds and the checks too: unoptimized, one password takes seconds.
+opt-level = 3
+
+[profile.dev.package.blake2]
+# Argon2id's hash.
+opt-level = 3
 
 [profile.release]
 # One small, fast binary: the app ships as it is built.

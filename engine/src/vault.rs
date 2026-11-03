@@ -15,10 +15,16 @@
 //! biometrics, so the check is a gate before reading a normal item, not a
 //! lock on the item itself (PROJECT.md).
 //!
-//! A vault made in a browser has no lock of this Mac's: it opens here once
-//! with its recovery code, and then gets the app's own lock, so that the next
-//! open is Touch ID only. What needs the vault key (allowing a new browser,
-//! a new recovery code) opens the vault too, under the same one check.
+//! The vault password (from 0.8.0) opens the vault anywhere, with no Mac:
+//! it is made up when the vault is made (no Touch ID then), its keys are
+//! Argon2id and HKDF of it (crypto.rs), and tTerm keeps the vault key
+//! wrapped for it, handing the wrap out only for the password's proof. A
+//! Mac with no lock of its own (a second Mac, a vault made in a browser,
+//! this Mac's lock taken off) opens it here once with the password, and then
+//! gets the app's own lock, so that the next open is Touch ID only; a vault
+//! made before, with no password yet, does the same with its recovery code.
+//! What needs the vault key (allowing a new browser, a new password) opens
+//! the vault too, under the same one check.
 //!
 //! The keychain and LocalAuthentication are the app's (macOS); the engine
 //! reaches them through `Keeper`, which the app implements and the checks
@@ -44,16 +50,28 @@ pub const KEYCHAIN_SERVICE: &str = "net.tterm.desktop.vault";
 /// own words (engine/i18n, say.rs): macOS shows each after "tTerm is trying
 /// to …" in its own dialog, so it is said in the language the app shows.
 pub const REASON_OPEN: &str = "vault.reason_open";
-pub const REASON_CREATE: &str = "vault.reason_create";
 pub const REASON_LOCK: &str = "vault.reason_lock";
 pub const REASON_APPROVE: &str = "vault.reason_approve";
-pub const REASON_RECOVERY: &str = "vault.reason_recovery";
+pub const REASON_PASSWORD: &str = "vault.reason_password";
 
-/// What the page shows when this Mac has no lock of the vault (a vault made
-/// in a browser, or this Mac's lock taken off): the recovery code opens it
-/// once, and then this Mac has its own.
-pub const NO_LOCK_HERE: &str = "This Mac has no lock on your vault yet. Open it once with your recovery code: after that Touch ID opens it here.";
+/// What the page shows when this Mac has no lock of the vault (a second Mac,
+/// a vault made in a browser, or this Mac's lock taken off): the vault
+/// password opens it once, and then this Mac has its own.
+pub const NO_LOCK_HERE: &str = "This Mac has no lock on your vault yet. Open it once with your vault password: after that Touch ID opens it here.";
+/// The same for a vault that has no password yet (made before 0.8.0): its
+/// recovery code opens it once.
+pub const NO_LOCK_HERE_CODE: &str = "This Mac has no lock on your vault yet. Open it once with your recovery code: after that Touch ID opens it here.";
 const SIGNED_OUT: &str = "Signed out of tTerm on this computer.";
+
+// What a password may be told, in the engine's words; the page says the
+// wrong one and the pause in its own, from `wrong`, `left`, `paused` and
+// `retryAt` next to these.
+const PASSWORD_SHORT: &str = "The password needs at least 12 characters.";
+const PASSWORD_LONG: &str = "The password can have at most 256 characters.";
+const PASSWORD_WRONG: &str = "That password does not open your vault.";
+const PASSWORD_PAUSED: &str = "Too many wrong passwords. Try again later.";
+const NO_PASSWORD: &str = "Your vault has no password yet: open it with your recovery code.";
+const PASSWORD_NOT_UNDERSTOOD: &str = "tTerm's answer for the vault password was not understood.";
 
 /// How long `answer` waits for the new browser to reveal its key, at most
 /// (it asks every two seconds; the pairing lasts five minutes).
@@ -129,16 +147,28 @@ pub struct Vault {
 
 /// What a vault request could not do, as a status and a sentence the page
 /// shows (the local API answers with them); `signed_out` when tTerm says the
-/// app's session is over, which the page takes as the rest of the API does.
+/// app's session is over, which the page takes as the rest of the API does;
+/// `more` for what goes next to the sentence (a wrong password's `wrong`
+/// and `left`, a pause's `paused` and `retryAt`).
 pub struct Failed {
     pub status: u16,
     pub message: String,
     pub signed_out: bool,
+    pub more: Option<Value>,
 }
 
 impl Failed {
     fn new(status: u16, message: impl Into<String>) -> Failed {
-        Failed { status, message: message.into(), signed_out: false }
+        Failed { status, message: message.into(), signed_out: false, more: None }
+    }
+
+    fn with(mut self, more: Value) -> Failed {
+        self.more = Some(more);
+        self
+    }
+
+    fn signed_out() -> Failed {
+        Failed { status: 401, message: SIGNED_OUT.into(), signed_out: true, more: None }
     }
 }
 
@@ -192,7 +222,13 @@ impl Vault {
     }
 
     fn know(&self, engine: &Arc<Engine>, vault_id: &str) {
-        if let Some(epoch) = Self::epoch(engine) {
+        self.know_at(Self::epoch(engine), vault_id);
+    }
+
+    /// The vault of the account of `epoch` (a request's): if that account is
+    /// gone by now, the next check of the account forgets its KEK.
+    fn know_at(&self, epoch: Option<u64>, vault_id: &str) {
+        if let Some(epoch) = epoch {
             *self.known.lock().unwrap() = Some((vault_id.to_string(), epoch));
         }
     }
@@ -237,21 +273,29 @@ impl Vault {
         } else {
             false
         };
+        // The tTerm Web this app is signed in to, as the person types it in
+        // a browser ("app.tterm.net"): Move to cloud's result tells them to
+        // open it anywhere (from 0.8.0).
+        let web = engine.cloud.as_ref().map(|a| a.cloud.host().to_string());
         json!({
             "available": self.available(),
             "exists": exists,
             "open": open,
             "keys": self.can_now(),
+            "web": web,
         })
     }
 
     // -------------------------------------------------- create, open, lock
 
-    /// `POST /api/app/vault/create`: a new vault, its app lock and a recovery
-    /// code. The KEK goes in the keychain, the wraps to tTerm; the recovery
-    /// code is shown once and kept nowhere.
-    pub async fn create(&self, engine: &Arc<Engine>) -> Done<Value> {
+    /// `POST /api/app/vault/create`: a new vault, its app lock and its
+    /// password, which the person has just made up: no Touch ID for it (the
+    /// owner, 02.11). The KEK goes in the keychain; the wraps, and the
+    /// password's salt, settings and proof, to tTerm. No recovery code.
+    pub async fn create(&self, engine: &Arc<Engine>, password: Option<&str>) -> Done<Value> {
+        let epoch = Self::epoch(engine);
         self.check_account(engine).await;
+        let password = password_rule(password)?;
         let _one = self.one.lock().await;
         if !self.available() {
             return Err(Failed::new(409, "This computer cannot hold a vault lock. Open the vault in a browser with a passkey, or use a Mac."));
@@ -259,30 +303,29 @@ impl Vault {
         if self.is_open() {
             return Err(Failed::new(409, "The vault is open already."));
         }
-        if self.cloud_get(engine).await?.is_some() {
+        if self.cloud_get_in(engine, epoch).await?.is_some() {
             return Err(Failed::new(409, "A vault exists for this account already. Open it instead."));
         }
-        self.authenticate(engine, REASON_CREATE).await?;
         let vault_id = Uuid::new_v4().to_string();
         let vk = crypto::new_key();
         let kek = crypto::new_key();
         let lock_id = Uuid::new_v4().to_string();
         let wrap = crypto::seal(&kek, vk.as_ref(), &crypto::lock_aad(&lock_id));
-        let code = crypto::new_recovery_code();
-        let salt = crypto::random::<{ crypto::RECOVERY_SALT_LEN }>();
-        let normalized = crypto::normalize_code(&code).expect("a code we just made");
-        let rkek = crypto::recovery_kek(&normalized, &salt);
-        let recovery_wrap = crypto::seal(&rkek, vk.as_ref(), &crypto::recovery_aad(&vault_id));
+        let salt = crypto::random::<{ crypto::PASSWORD_SALT_LEN }>();
+        let keys = derive(password, &salt, crypto::Kdf::NEW).await?;
+        let password_wrap = crypto::seal(&keys.kek, vk.as_ref(), &crypto::password_aad(&vault_id));
+        self.same_account(engine, epoch).await?;
         // The KEK first, so a vault tTerm takes always has its lock here; a
-        // failure after this takes the item out again.
+        // failure after this takes the item out again, and so does a
+        // sign-out from now on (it is the vault this account names).
         self.save_kek(&vault_id, kek.as_ref()).await?;
+        self.know_at(epoch, &vault_id);
         let body = json!({
             "id": vault_id,
-            "recoverySalt": crypto::b64u(&salt),
-            "recoveryWrap": crypto::b64u(&recovery_wrap),
+            "password": password_json(&salt, crypto::Kdf::NEW, &keys, &password_wrap),
             "lock": {"id": lock_id, "kind": "app", "wrap": crypto::b64u(&wrap), "label": self.label},
         });
-        let answer = match self.cloud_call(engine, "POST", "/api/vault", Some(&body)).await {
+        let answer = match self.cloud_call_in(engine, epoch, "POST", "/api/vault", Some(&body)).await {
             Ok(a) => a,
             Err(f) => {
                 self.forget_kek(&vault_id).await;
@@ -293,49 +336,58 @@ impl Vault {
             self.forget_kek(&vault_id).await;
             return Err(self.from_cloud(&answer, "The vault could not be made"));
         }
-        self.hold(engine, vault_id, lock_id, vk, Vec::new());
-        Ok(json!({"recoveryCode": code.as_str()}))
+        self.hold(epoch, vault_id, lock_id, vk, Vec::new());
+        Ok(json!({"open": true}))
     }
 
     /// `POST /api/app/vault/open`: with this Mac's lock (Touch ID, the KEK
     /// from the keychain, the lock's wrap from `GET /api/vault`); or, with
-    /// `recovery_code`, a vault this Mac has no lock of yet (made in a
-    /// browser): the code opens it, and this Mac gets its own lock.
-    pub async fn open(&self, engine: &Arc<Engine>, recovery_code: Option<&str>) -> Done<Value> {
+    /// `password`, on a Mac with no lock of its own yet (a second Mac, a
+    /// vault made in a browser, this Mac's lock lost): the password opens
+    /// it, and this Mac gets its own lock; or, with `recovery_code`, the same
+    /// for a vault that has no password yet (made before 0.8.0).
+    pub async fn open(&self, engine: &Arc<Engine>, password: Option<&str>, recovery_code: Option<&str>) -> Done<Value> {
+        let epoch = Self::epoch(engine);
         self.check_account(engine).await;
         let _one = self.one.lock().await;
         if self.is_open() {
+            self.same_account(engine, epoch).await?;
             return Ok(json!({"open": true}));
         }
         if !self.available() {
-            return Err(Failed::new(409, "This computer cannot open the vault. Use a browser with a passkey, or the recovery code."));
+            return Err(Failed::new(409, "This computer cannot open the vault. Open it in a browser instead."));
         }
-        let Some(vault) = self.cloud_get(engine).await? else {
+        let Some(vault) = self.cloud_get_in(engine, epoch).await? else {
             return Err(Failed::new(404, "There is no vault yet. Make one first."));
         };
-        match recovery_code.map(str::trim).filter(|c| !c.is_empty()) {
-            Some(code) => self.open_with_code(engine, &vault, code).await?,
-            None => self.open_with_lock(engine, &vault, true).await?,
+        // A password as typed: nothing trimmed (crypto::password_text).
+        match (password.filter(|p| !p.is_empty()), recovery_code.map(str::trim).filter(|c| !c.is_empty())) {
+            (Some(password), _) => self.open_with_password(engine, epoch, &vault, password).await?,
+            (None, Some(code)) => self.open_with_code(engine, epoch, &vault, code).await?,
+            (None, None) => self.open_with_lock(engine, epoch, &vault, true).await?,
         }
+        // Open for the account the request began in, or not at all.
+        self.same_account(engine, epoch).await?;
         Ok(json!({"open": true}))
     }
 
     /// Opens the vault with this Mac's lock: the KEK from the keychain opens
     /// the wrap of one of the vault's app locks (this device's first). The
     /// check comes first unless the caller made it already.
-    async fn open_with_lock(&self, engine: &Arc<Engine>, vault: &Value, check: bool) -> Done<()> {
+    async fn open_with_lock(&self, engine: &Arc<Engine>, epoch: Option<u64>, vault: &Value, check: bool) -> Done<()> {
         let vault_id = vault["id"].as_str().unwrap_or_default().to_string();
         let locks = app_locks(vault);
         // No lock of an app at all (a vault made in a browser): Touch ID
         // would open nothing, so it is not asked.
         if locks.is_empty() {
-            return Err(Failed::new(409, NO_LOCK_HERE));
+            return Err(no_lock_here(vault));
         }
         if check {
             self.authenticate(engine, REASON_OPEN).await?;
+            self.same_account(engine, epoch).await?;
         }
         let Some(kek) = self.load_kek(&vault_id).await? else {
-            return Err(Failed::new(409, NO_LOCK_HERE));
+            return Err(no_lock_here(vault));
         };
         let kek = crypto::key_of(&kek).ok_or_else(|| Failed::new(500, "This Mac's keychain item is not a vault key."))?;
         let opened = locks.iter().find_map(|(lock_id, wrap)| crypto::open_key(&kek, wrap, &crypto::lock_aad(lock_id)).map(|vk| (lock_id.clone(), vk)));
@@ -343,11 +395,57 @@ impl Vault {
             // This Mac's key opens none of the locks: its own was taken off
             // (in a browser's Settings › Keys). The item is no use any more.
             self.forget_kek(&vault_id).await;
-            return Err(Failed::new(409, NO_LOCK_HERE));
+            return Err(no_lock_here(vault));
         };
+        // The keychain can wait for the person too.
+        self.same_account(engine, epoch).await?;
         let keys = read_keys(vault, &vk);
-        self.hold(engine, vault_id, lock_id.clone(), vk, keys);
-        self.lock_used(engine, &lock_id);
+        self.hold(epoch, vault_id, lock_id.clone(), vk, keys);
+        self.lock_used(engine, epoch, &lock_id);
+        Ok(())
+    }
+
+    /// Opens the vault with its password, on a Mac with no lock of its own
+    /// yet: the password's salt and settings are the vault's (`GET
+    /// /api/vault`), its keys are made here, and tTerm gives the wrap of the
+    /// vault key for the proof (`POST /api/vault/password/open`). Then this
+    /// Mac's own lock, as with the recovery code but with no Touch ID: the
+    /// person has just typed the password. A wrong one, and tTerm's pause
+    /// after too many, are said with what the page says them from.
+    async fn open_with_password(&self, engine: &Arc<Engine>, epoch: Option<u64>, vault: &Value, password: &str) -> Done<()> {
+        let vault_id = vault["id"].as_str().unwrap_or_default().to_string();
+        // One that is not 12 to 256 characters is no vault's password: it
+        // is not tried, and costs no try.
+        let password = password_rule(Some(password))?;
+        let Some(kept) = vault.get("password").filter(|p| p.is_object()) else {
+            return Err(Failed::new(409, NO_PASSWORD));
+        };
+        let salt = kept["salt"].as_str().and_then(crypto::from_b64u).filter(|s| s.len() == crypto::PASSWORD_SALT_LEN);
+        let (Some(salt), Some(kdf)) = (salt, kdf_of(&kept["kdf"])) else {
+            return Err(Failed::new(502, PASSWORD_NOT_UNDERSTOOD));
+        };
+        // Weaker settings than a password is set with would make the proof
+        // cheaper to guess the password from, heavier ones would take the
+        // Mac's memory: with either, the password is not tried.
+        if !kdf.acceptable() {
+            return Err(Failed::new(502, "tTerm keeps your vault password with settings this app does not take, so it was not tried."));
+        }
+        let keys = derive(password, &salt, kdf).await?;
+        let body = json!({"auth": crypto::b64u(keys.auth.as_ref())});
+        let answer = self.cloud_call_in(engine, epoch, "POST", "/api/vault/password/open", Some(&body)).await?;
+        let got = answer.json().unwrap_or(Value::Null);
+        match answer.status {
+            200..=299 => {}
+            403 if got["wrong"] == true => return Err(Failed::new(422, PASSWORD_WRONG).with(json!({"wrong": true, "left": got["left"]}))),
+            429 if got["paused"] == true => return Err(Failed::new(429, PASSWORD_PAUSED).with(json!({"paused": true, "retryAt": got["retryAt"]}))),
+            404 => return Err(Failed::new(409, NO_PASSWORD)),
+            _ => return Err(self.from_cloud(&answer, "The vault password could not be tried")),
+        }
+        let wrap = got["wrap"].as_str().and_then(crypto::from_b64u).ok_or_else(|| Failed::new(502, PASSWORD_NOT_UNDERSTOOD))?;
+        let vk = crypto::open_key(&keys.kek, &wrap, &crypto::password_aad(&vault_id)).ok_or_else(|| Failed::new(502, "The vault key tTerm gave back for the password does not open with it."))?;
+        let lock_id = self.own_lock(engine, epoch, vault, &vault_id, &vk, "password").await?;
+        let keys = read_keys(vault, &vk);
+        self.hold(epoch, vault_id, lock_id, vk, keys);
         Ok(())
     }
 
@@ -356,10 +454,14 @@ impl Vault {
     /// Touch ID, a new KEK in the keychain, `POST /api/vault/locks` of kind
     /// app. If this Mac's keychain still opens one of the vault's app locks,
     /// that lock is kept and none is added.
-    async fn open_with_code(&self, engine: &Arc<Engine>, vault: &Value, code: &str) -> Done<()> {
+    async fn open_with_code(&self, engine: &Arc<Engine>, epoch: Option<u64>, vault: &Value, code: &str) -> Done<()> {
         let vault_id = vault["id"].as_str().unwrap_or_default().to_string();
+        // Its first password made tTerm forget the code.
+        if vault["password"].is_object() {
+            return Err(Failed::new(409, "Your vault has a password now, and no recovery code: open it with the password."));
+        }
         let normalized = crypto::normalize_code(code).ok_or_else(|| Failed::new(422, "That is not a recovery code: it is 24 letters and digits, as XXXX-XXXX-XXXX-XXXX-XXXX-XXXX."))?;
-        let answer = self.cloud_call(engine, "GET", "/api/vault/recovery", None).await?;
+        let answer = self.cloud_call_in(engine, epoch, "GET", "/api/vault/recovery", None).await?;
         if answer.status != 200 {
             return Err(self.from_cloud(&answer, "The vault's recovery could not be read"));
         }
@@ -371,30 +473,47 @@ impl Vault {
         let vk = crypto::open_key(&rkek, &wrap, &crypto::recovery_aad(&vault_id)).ok_or_else(|| Failed::new(422, "That recovery code does not open your vault."))?;
         // The code is right: now this Mac's own lock, with the person's say.
         self.authenticate(engine, REASON_LOCK).await?;
-        let kept = match self.load_kek(&vault_id).await? {
+        self.same_account(engine, epoch).await?;
+        let lock_id = self.own_lock(engine, epoch, vault, &vault_id, &vk, "recovery code").await?;
+        let keys = read_keys(vault, &vk);
+        self.hold(epoch, vault_id, lock_id, vk, keys);
+        Ok(())
+    }
+
+    /// This Mac's own lock, the vault key in hand (from the password or the
+    /// recovery code, `by`): the lock the KEK in this Mac's keychain still
+    /// opens, kept as it is when it holds that same vault key; else a new one.
+    /// One that holds another vault key means one of the two was replaced:
+    /// nothing is kept or added, the keychain item stays as it is, and the
+    /// vault stays locked.
+    async fn own_lock(&self, engine: &Arc<Engine>, epoch: Option<u64>, vault: &Value, vault_id: &str, vk: &Key, by: &str) -> Done<String> {
+        let kept = match self.load_kek(vault_id).await? {
             Some(kek) => crypto::key_of(&kek).and_then(|kek| {
-                app_locks(vault).into_iter().find(|(lock_id, wrap)| crypto::open_key(&kek, wrap, &crypto::lock_aad(lock_id)).is_some()).map(|(lock_id, _)| lock_id)
+                app_locks(vault).into_iter().find_map(|(lock_id, wrap)| crypto::open_key(&kek, &wrap, &crypto::lock_aad(&lock_id)).map(|held| (lock_id, held)))
             }),
             None => None,
         };
-        let lock_id = match kept {
-            Some(lock_id) => lock_id,
-            None => self.add_lock(engine, &vault_id, &vk).await?,
-        };
-        let keys = read_keys(vault, &vk);
-        self.hold(engine, vault_id, lock_id, vk, keys);
-        Ok(())
+        match kept {
+            Some((lock_id, held)) if crypto::same(held.as_ref(), vk.as_ref()) => Ok(lock_id),
+            Some(_) => {
+                eprintln!("tterm: this Mac's own lock holds another vault key than the {by} gave: the vault stays locked, and nothing was changed");
+                self.drop_open();
+                Err(locks_disagree(by))
+            }
+            None => self.add_lock(engine, epoch, vault_id, vk).await,
+        }
     }
 
     /// A new app lock for this Mac: a new KEK in the keychain (in place of a
     /// stale one), the vault key wrapped for it, `POST /api/vault/locks`.
-    async fn add_lock(&self, engine: &Arc<Engine>, vault_id: &str, vk: &Key) -> Done<String> {
+    async fn add_lock(&self, engine: &Arc<Engine>, epoch: Option<u64>, vault_id: &str, vk: &Key) -> Done<String> {
+        self.same_account(engine, epoch).await?;
         let kek = crypto::new_key();
         let lock_id = Uuid::new_v4().to_string();
         let wrap = crypto::seal(&kek, vk.as_ref(), &crypto::lock_aad(&lock_id));
         self.save_kek(vault_id, kek.as_ref()).await?;
         let body = json!({"id": lock_id, "kind": "app", "wrap": crypto::b64u(&wrap), "label": self.label});
-        let answer = match self.cloud_call(engine, "POST", "/api/vault/locks", Some(&body)).await {
+        let answer = match self.cloud_call_in(engine, epoch, "POST", "/api/vault/locks", Some(&body)).await {
             Ok(a) => a,
             Err(f) => {
                 self.forget_kek(vault_id).await;
@@ -409,13 +528,16 @@ impl Vault {
     }
 
     /// `POST /api/vault/locks/{id}/used`, in the background: Settings › Keys
-    /// shows when each lock was last used. Nothing waits for it.
-    fn lock_used(&self, engine: &Arc<Engine>, lock_id: &str) {
+    /// shows when each lock was last used. Nothing waits for it; it is not
+    /// sent in another account than the one of `epoch`.
+    fn lock_used(&self, engine: &Arc<Engine>, epoch: Option<u64>, lock_id: &str) {
         let Some(account) = engine.cloud.clone() else { return };
         let path = format!("/api/vault/locks/{lock_id}/used");
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _ = account.call("POST", &path, Some(b"{}"), true).await;
+                if account.signed_in() && Some(account.epoch_now()) == epoch {
+                    let _ = account.call("POST", &path, Some(b"{}"), true).await;
+                }
             });
         }
     }
@@ -464,41 +586,84 @@ impl Vault {
         }
     }
 
-    /// `POST /api/app/vault/recovery`: a new recovery code, the old one no
-    /// longer opening the vault. Touch ID first; a locked vault opens with
-    /// this Mac's lock under the same check.
-    pub async fn new_recovery_code(&self, engine: &Arc<Engine>) -> Done<Value> {
-        let (vault_id, vk) = self.vault_key_checked(engine, REASON_RECOVERY).await?;
-        let code = crypto::new_recovery_code();
-        let salt = crypto::random::<{ crypto::RECOVERY_SALT_LEN }>();
-        let normalized = crypto::normalize_code(&code).expect("a code we just made");
-        let rkek = crypto::recovery_kek(&normalized, &salt);
-        let wrap = crypto::seal(&rkek, vk.as_ref(), &crypto::recovery_aad(&vault_id));
-        let body = json!({"recoverySalt": crypto::b64u(&salt), "recoveryWrap": crypto::b64u(&wrap)});
-        let answer = self.cloud_call(engine, "PUT", "/api/vault/recovery", Some(&body)).await?;
-        if answer.status != 204 && answer.status != 200 {
-            return Err(self.from_cloud(&answer, "The recovery code could not be changed"));
+    /// `POST /api/app/vault/password`: a new vault password in place of the
+    /// one it has, the old one no longer opening it; for a vault made before
+    /// 0.8.0, its first, and tTerm forgets the recovery code. Touch ID first
+    /// (one that is not 12 to 256 characters is refused before it); a
+    /// locked vault opens with this Mac's lock under the same check. A new
+    /// salt each time.
+    pub async fn set_password(&self, engine: &Arc<Engine>, password: Option<&str>) -> Done<Value> {
+        let epoch = Self::epoch(engine);
+        self.check_account(engine).await;
+        let password = password_rule(password)?;
+        let (vault_id, vk) = self.vault_key_checked(engine, epoch, REASON_PASSWORD).await?;
+        let salt = crypto::random::<{ crypto::PASSWORD_SALT_LEN }>();
+        let keys = derive(password, &salt, crypto::Kdf::NEW).await?;
+        let wrap = crypto::seal(&keys.kek, vk.as_ref(), &crypto::password_aad(&vault_id));
+        let body = password_json(&salt, crypto::Kdf::NEW, &keys, &wrap);
+        let answer = self.cloud_call_in(engine, epoch, "PUT", "/api/vault/password", Some(&body)).await?;
+        if !(200..300).contains(&answer.status) {
+            return Err(self.from_cloud(&answer, "The vault password could not be set"));
         }
-        Ok(json!({"recoveryCode": code.as_str()}))
+        Ok(json!({"ok": true}))
+    }
+
+    /// The account a request began in (its epoch, noted first thing) still
+    /// the one signed in: a sign-out, or another sign-in, while the request
+    /// waited (for Touch ID, Argon2id, tTerm) ends it, as signed out, so that
+    /// nothing of one account's vault goes to another's.
+    async fn same_account(&self, engine: &Arc<Engine>, epoch: Option<u64>) -> Done<()> {
+        if epoch.is_some() && Self::epoch(engine) == epoch {
+            return Ok(());
+        }
+        if engine.cloud.is_none() {
+            return Err(Failed::new(409, "Sign in to tTerm first."));
+        }
+        self.check_account(engine).await;
+        Err(Failed::signed_out())
+    }
+
+    /// A call to tTerm for a request that began in `epoch`: not made when the
+    /// account is another one by now, and its answer not taken when it became
+    /// another one meanwhile.
+    async fn cloud_call_in(&self, engine: &Arc<Engine>, epoch: Option<u64>, method: &str, path: &str, body: Option<&Value>) -> Done<Answer> {
+        self.same_account(engine, epoch).await?;
+        let answer = self.cloud_call(engine, method, path, body).await?;
+        self.same_account(engine, epoch).await?;
+        Ok(answer)
+    }
+
+    /// `GET /api/vault` for a request that began in `epoch`, as above.
+    async fn cloud_get_in(&self, engine: &Arc<Engine>, epoch: Option<u64>) -> Done<Option<Value>> {
+        self.same_account(engine, epoch).await?;
+        let vault = self.cloud_get(engine).await?;
+        self.same_account(engine, epoch).await?;
+        Ok(vault)
     }
 
     /// The vault id and key, after one LocalAuthentication check: the vault
-    /// open already, or opened now with this Mac's lock under that check.
-    async fn vault_key_checked(&self, engine: &Arc<Engine>, reason: &'static str) -> Done<(String, Key)> {
+    /// open already, or opened now with this Mac's lock under that check;
+    /// for a request that began in `epoch`, and only in that account still
+    /// (Touch ID waits as long as the person does).
+    async fn vault_key_checked(&self, engine: &Arc<Engine>, epoch: Option<u64>, reason: &'static str) -> Done<(String, Key)> {
         self.check_account(engine).await;
         let _one = self.one.lock().await;
         if !self.available() {
             return Err(Failed::new(409, "This computer cannot hold the vault."));
         }
         self.authenticate(engine, reason).await?;
-        if let Ok(open) = self.vault_key() {
-            return Ok(open);
+        match self.vault_key(engine, epoch).await {
+            Ok(open) => return Ok(open),
+            // Signed out meanwhile: so is the vault opened in that account.
+            Err(f) if f.signed_out => return Err(f),
+            // Locked: it opens with this Mac's lock, under the check made.
+            Err(_) => {}
         }
-        let Some(vault) = self.cloud_get(engine).await? else {
+        let Some(vault) = self.cloud_get_in(engine, epoch).await? else {
             return Err(Failed::new(404, "There is no vault yet. Make one first."));
         };
-        self.open_with_lock(engine, &vault, false).await?;
-        self.vault_key()
+        self.open_with_lock(engine, epoch, &vault, false).await?;
+        self.vault_key(engine, epoch).await
     }
 
     // ---------------------------------------------------------- signing
@@ -571,13 +736,14 @@ impl Vault {
     /// key sealed for the new browser. A locked vault opens with this Mac's
     /// lock under the same check.
     pub async fn pairing_approve(&self, engine: &Arc<Engine>, id: &str) -> Done<Value> {
+        let epoch = Self::epoch(engine);
         let ready = self.pairings.lock().unwrap().get(id).map(|p| p.pub_b.is_some());
         match ready {
             None => return Err(Failed::new(409, "Answer the request first.")),
             Some(false) => return Err(Failed::new(409, "The new browser has not shown its key yet.")),
             Some(true) => {}
         }
-        let (_vault_id, vk) = self.vault_key_checked(engine, REASON_APPROVE).await?;
+        let (_vault_id, vk) = self.vault_key_checked(engine, epoch, REASON_APPROVE).await?;
         // Sealed once; a post that did not go through sends the same again.
         let sealed = {
             let mut pairings = self.pairings.lock().unwrap();
@@ -596,7 +762,7 @@ impl Vault {
             }
         };
         let body = json!({"sealed": crypto::b64u(&sealed)});
-        let answer = self.cloud_call(engine, "POST", &format!("/api/vault/pairings/{id}/approve"), Some(&body)).await?;
+        let answer = self.cloud_call_in(engine, epoch, "POST", &format!("/api/vault/pairings/{id}/approve"), Some(&body)).await?;
         if answer.status != 204 && answer.status != 200 {
             return Err(self.from_cloud(&answer, "The browser could not be allowed"));
         }
@@ -704,10 +870,11 @@ impl Vault {
     /// vault open; their keys are the ticked ones (`keys`), each uploaded
     /// once (none that the vault has already), after a login with it.
     pub async fn move_to_cloud(&self, engine: &Arc<Engine>, project: &str, servers: &[(String, String)], keys: &[(String, Option<String>)]) -> Done<Value> {
+        let epoch = Self::epoch(engine);
         self.check_account(engine).await;
         let ssh = self.ssh();
         let ticked: HashMap<String, Option<String>> = keys.iter().map(|(p, ph)| (expand(&ssh.home, p), ph.clone().filter(|p| !p.is_empty()))).collect();
-        let mut work = Moving { ticked, in_vault: None, uploaded: HashMap::new(), saved_with: BTreeSet::new() };
+        let mut work = Moving { epoch, ticked, in_vault: None, uploaded: HashMap::new(), saved_with: BTreeSet::new() };
         let mut results = Vec::new();
         // Each server as the person reached it: the user and port they typed
         // in tTerm's terminals, over the config's (0.7.1).
@@ -724,13 +891,13 @@ impl Vault {
         // saved for a server that fails.
         for (path, (key_id, _)) in &work.uploaded {
             if !work.saved_with.contains(key_id) {
-                let _ = self.cloud_call(engine, "DELETE", &format!("/api/vault/keys/{key_id}"), None).await;
+                let _ = self.cloud_call_in(engine, work.epoch, "DELETE", &format!("/api/vault/keys/{key_id}"), None).await;
                 eprintln!("tterm: move: {} went out of the vault again, its servers did not move", shorten(&ssh.home, path));
             }
         }
         // The vault's keys as tTerm has them now: what it can sign for.
         if !work.uploaded.is_empty() {
-            if let Ok(Some(vault)) = self.cloud_get(engine).await {
+            if let Ok(Some(vault)) = self.cloud_get_in(engine, work.epoch).await {
                 self.refresh(&vault);
             }
         }
@@ -837,7 +1004,7 @@ impl Vault {
     /// alone, as the core takes the app's word for it; then it is sealed and
     /// uploaded, once per move, unless the vault has it.
     async fn key_for(&self, engine: &Arc<Engine>, ssh: &crate::ssh::Ssh, dest: &str, settings: &crate::ssh::Settings, work: &mut Moving) -> Result<String, String> {
-        let (_vault_id, vk) = self.vault_key().map_err(|_| "Open your vault first.".to_string())?;
+        let (_vault_id, vk) = self.vault_key(engine, work.epoch).await.map_err(|f| if f.signed_out { f.message } else { "Open your vault first.".to_string() })?;
         let files = existing_identity_files(&ssh.home, settings);
         if files.is_empty() {
             return Err("No key of this server is in ~/.ssh. Move it through this Mac instead.".into());
@@ -891,7 +1058,7 @@ impl Vault {
             "source": "mac",
             "sourceLabel": self.label,
         });
-        let answer = self.cloud_call(engine, "POST", "/api/vault/keys", Some(&body)).await.map_err(|f| f.message)?;
+        let answer = self.cloud_call_in(engine, work.epoch, "POST", "/api/vault/keys", Some(&body)).await.map_err(|f| f.message)?;
         if answer.status != 201 && answer.status != 200 {
             return Err(self.from_cloud(&answer, "The key could not be saved in your vault").message);
         }
@@ -909,7 +1076,7 @@ impl Vault {
             }
             return Ok(all);
         }
-        let vault = self.cloud_get(engine).await.map_err(|f| f.message)?;
+        let vault = self.cloud_get_in(engine, work.epoch).await.map_err(|f| f.message)?;
         let known: HashMap<String, String> = vault
             .as_ref()
             .and_then(|v| v["keys"].as_array())
@@ -1013,7 +1180,7 @@ impl Vault {
             Err(Trouble::SignedOut) => {
                 // The account is gone: so is the vault opened in it.
                 Box::pin(self.check_account(engine)).await;
-                Err(Failed { status: 401, message: SIGNED_OUT.into(), signed_out: true })
+                Err(Failed::signed_out())
             }
             Err(Trouble::Offline) => Err(Failed::new(503, crate::cloud_api::OFFLINE)),
         }
@@ -1074,20 +1241,30 @@ impl Vault {
 
     // --------------------------------------------------------- the state
 
-    /// The vault id and key while open, or a refusal.
-    fn vault_key(&self) -> Done<(String, Key)> {
-        let open = self.open.lock().unwrap();
-        match open.as_ref() {
-            Some(o) => Ok((o.vault_id.clone(), Zeroizing::new(*o.vk))),
+    /// The vault id and key while open, for a request that began in `epoch`
+    /// and in that account still; or a refusal: 409 while locked, signed out
+    /// for a request of an account that is gone by now, and for a vault
+    /// opened in an older epoch than the request's (a sign-out, or another
+    /// sign-in, since it opened), which locks then and its KEK goes.
+    async fn vault_key(&self, engine: &Arc<Engine>, epoch: Option<u64>) -> Done<(String, Key)> {
+        self.same_account(engine, epoch).await?;
+        let open = self.open.lock().unwrap().as_ref().map(|o| (o.epoch, o.vault_id.clone(), Zeroizing::new(*o.vk)));
+        match open {
+            Some((opened, vault_id, vk)) if Some(opened) == epoch => Ok((vault_id, vk)),
+            Some(_) => {
+                self.check_account(engine).await;
+                Err(Failed::signed_out())
+            }
             None => Err(Failed::new(409, "Open the vault first.")),
         }
     }
 
-    fn hold(&self, engine: &Arc<Engine>, vault_id: String, lock_id: String, vk: Key, keys: Vec<Held>) {
-        let epoch = Self::epoch(engine).unwrap_or_default();
-        self.know(engine, &vault_id);
+    /// The vault open, for the account of `epoch` (the request's, checked
+    /// still the one signed in just before).
+    fn hold(&self, epoch: Option<u64>, vault_id: String, lock_id: String, vk: Key, keys: Vec<Held>) {
+        self.know_at(epoch, &vault_id);
         self.set_can(&keys);
-        *self.open.lock().unwrap() = Some(Open { vault_id, lock_id, vk, keys, epoch });
+        *self.open.lock().unwrap() = Some(Open { vault_id, lock_id, vk, keys, epoch: epoch.unwrap_or_default() });
     }
 
     fn drop_open(&self) {
@@ -1106,10 +1283,13 @@ impl Vault {
     }
 }
 
-/// What one move keeps from server to server: the ticked keys with their
-/// passphrases, the vault's keys as tTerm said them, the keys uploaded in
-/// this move (by path: id and fingerprint), and those a saved server uses.
+/// What one move keeps from server to server: the account's epoch it began
+/// in (the vault's key and requests are for that account only), the ticked
+/// keys with their passphrases, the vault's keys as tTerm said them, the
+/// keys uploaded in this move (by path: id and fingerprint), and those a
+/// saved server uses.
 struct Moving {
+    epoch: Option<u64>,
     ticked: HashMap<String, Option<String>>,
     in_vault: Option<HashMap<String, String>>,
     uploaded: HashMap<String, (String, String)>,
@@ -1239,6 +1419,64 @@ fn app_locks(vault: &Value) -> Vec<(String, Vec<u8>)> {
     app.iter().filter_map(|l| Some((l["id"].as_str()?.to_string(), crypto::from_b64u(l["wrap"].as_str()?)?))).collect()
 }
 
+/// This Mac has no lock of the vault: the page is to open it once with its
+/// password, or, while it has none, with its recovery code.
+fn no_lock_here(vault: &Value) -> Failed {
+    Failed::new(409, if vault["password"].is_object() { NO_LOCK_HERE } else { NO_LOCK_HERE_CODE })
+}
+
+/// This Mac's own lock holds another vault key than the one `by` (the
+/// password, or the recovery code) gave: one of the two was replaced, at
+/// tTerm or on the way to this Mac, and neither is taken.
+fn locks_disagree(by: &str) -> Failed {
+    Failed::new(502, format!("Your vault's locks do not agree: the vault key your {by} gave is not the one this Mac's own lock holds. The vault stays locked, and nothing was changed."))
+}
+
+/// The password of a request by the contract's rule (12 to 256 code points
+/// after NFC), as its keys are made from it; or the sentence for one that is
+/// not, or none.
+fn password_rule(given: Option<&str>) -> Done<Zeroizing<String>> {
+    match crypto::password_text(given.unwrap_or_default()) {
+        Ok(nfc) => Ok(nfc),
+        Err(n) if n < crypto::PASSWORD_MIN => Err(Failed::new(422, PASSWORD_SHORT)),
+        Err(_) => Err(Failed::new(422, PASSWORD_LONG)),
+    }
+}
+
+/// The keys of a password (Argon2id, then HKDF), on a thread that may take
+/// its time: Argon2id takes its 64 MiB and a while on purpose, never on the
+/// async threads. The password is wiped there when done.
+async fn derive(password: Zeroizing<String>, salt: &[u8], kdf: crypto::Kdf) -> Done<crypto::PasswordKeys> {
+    let salt = salt.to_vec();
+    tokio::task::spawn_blocking(move || crypto::password_keys(&password, &salt, &kdf))
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| Failed::new(500, "The keys of the vault password could not be made."))
+}
+
+/// A password as tTerm takes it (`POST /api/vault`, `PUT
+/// /api/vault/password`): its salt and settings, its proof (of which tTerm
+/// keeps the SHA-256), and the vault key wrapped for it.
+fn password_json(salt: &[u8], kdf: crypto::Kdf, keys: &crypto::PasswordKeys, wrap: &[u8]) -> Value {
+    json!({
+        "salt": crypto::b64u(salt),
+        "kdf": {"alg": "argon2id", "m": kdf.m, "t": kdf.t, "p": kdf.p},
+        "auth": crypto::b64u(keys.auth.as_ref()),
+        "wrap": crypto::b64u(wrap),
+    })
+}
+
+/// A password's settings as tTerm keeps them, `{"alg":"argon2id","m","t",
+/// "p"}`; None for another algorithm, or numbers that are none.
+fn kdf_of(kdf: &Value) -> Option<crypto::Kdf> {
+    if kdf["alg"] != "argon2id" {
+        return None;
+    }
+    let n = |k: &str| kdf[k].as_u64().and_then(|n| u32::try_from(n).ok());
+    Some(crypto::Kdf { m: n("m")?, t: n("t")?, p: n("p")? })
+}
+
 /// The keys the vault holds, from tTerm's vault object: those whose sealed
 /// box opens with the vault key (a key sealed for another vault is left out
 /// rather than taken for one this can sign), and whose fingerprint is the
@@ -1282,7 +1520,7 @@ mod tests {
 
     #[test]
     fn the_touch_id_reasons_are_words_of_the_app() {
-        for key in [REASON_OPEN, REASON_CREATE, REASON_LOCK, REASON_APPROVE, REASON_RECOVERY] {
+        for key in [REASON_OPEN, REASON_LOCK, REASON_APPROVE, REASON_PASSWORD] {
             for lang in crate::say::LANGUAGES {
                 let said = crate::say::say(lang, key);
                 assert!(!said.is_empty() && said != key, "{lang}: {key} is not in engine/i18n");
@@ -1290,6 +1528,32 @@ mod tests {
             }
         }
         assert_eq!(crate::say::say("en", REASON_OPEN), "open your tTerm vault");
+        assert_eq!(crate::say::say("en", REASON_PASSWORD), "set a new password for your tTerm vault");
+        assert_eq!(crate::say::say("ru", REASON_PASSWORD), "задать новый пароль хранилища tTerm");
+        // No Touch ID when the vault is made, and no recovery codes made.
+        for gone in ["vault.reason_create", "vault.reason_recovery"] {
+            assert_eq!(crate::say::say("en", gone), gone, "{gone} is gone from engine/i18n");
+        }
+    }
+
+    #[test]
+    fn a_password_and_its_settings_as_tterm_has_them() {
+        assert_eq!(password_rule(Some("eleven char")).err().map(|f| (f.status, f.message)), Some((422, PASSWORD_SHORT.to_string())));
+        assert_eq!(password_rule(None).err().map(|f| f.status), Some(422));
+        assert_eq!(password_rule(Some(&"x".repeat(257))).err().map(|f| f.message), Some(PASSWORD_LONG.to_string()));
+        assert_eq!(password_rule(Some("cafe\u{301} au lait!")).ok().map(|p| p.to_string()), Some("caf\u{e9} au lait!".to_string()));
+        let kdf = kdf_of(&json!({"alg": "argon2id", "m": 65536, "t": 3, "p": 1})).unwrap();
+        assert_eq!(kdf, crypto::Kdf::NEW);
+        assert!(kdf_of(&json!({"alg": "argon2i", "m": 65536, "t": 3, "p": 1})).is_none());
+        assert!(kdf_of(&json!({"alg": "argon2id", "m": -1, "t": 3, "p": 1})).is_none());
+        assert!(kdf_of(&json!({"alg": "argon2id", "m": 65536, "t": 3})).is_none());
+        let keys = crypto::PasswordKeys { kek: crypto::new_key(), auth: Zeroizing::new([7u8; 32]) };
+        let j = password_json(&[1u8; 16], kdf, &keys, &[2u8; 60]);
+        assert_eq!(j["kdf"], json!({"alg": "argon2id", "m": 65536, "t": 3, "p": 1}));
+        assert_eq!(j["auth"], crypto::b64u(&[7u8; 32]));
+        assert_eq!(j.as_object().unwrap().len(), 4, "salt, kdf, auth and wrap, and never the key: {j}");
+        assert_eq!(no_lock_here(&json!({"password": {"salt": "x"}})).message, NO_LOCK_HERE);
+        assert_eq!(no_lock_here(&json!({"password": null})).message, NO_LOCK_HERE_CODE);
     }
 
     #[test]

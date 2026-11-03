@@ -112,7 +112,6 @@ update.not_saved = Не удалось сохранить настройки н�
 # in ja, ko and tr the string comes last, after a colon (ja …次の操作を実行し
 # ようとしています: …, tr … şu işlemi yapmaya çalışıyor: …): a noun phrase.
 vault.reason_open = открыть хранилище tTerm
-vault.reason_create = создать хранилище tTerm
 vault.reason_lock = разрешить этому Mac открывать хранилище tTerm
 vault.reason_approve = разрешить новому браузеру открыть хранилище tTerm
-vault.reason_recovery = создать новый код восстановления хранилища tTerm
+vault.reason_password = задать новый пароль хранилища tTerm

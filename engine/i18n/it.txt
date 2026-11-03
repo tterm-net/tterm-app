@@ -112,7 +112,6 @@ update.not_saved = Impossibile salvare le impostazioni su questo computer.
 # in ja, ko and tr the string comes last, after a colon (ja …次の操作を実行し
 # ようとしています: …, tr … şu işlemi yapmaya çalışıyor: …): a noun phrase.
 vault.reason_open = aprire la tua cassaforte di tTerm
-vault.reason_create = creare la tua cassaforte di tTerm
 vault.reason_lock = consentire a questo Mac di aprire la tua cassaforte di tTerm
 vault.reason_approve = consentire a un nuovo browser di aprire la tua cassaforte di tTerm
-vault.reason_recovery = creare un nuovo codice di recupero per la tua cassaforte di tTerm
+vault.reason_password = impostare una nuova password per la tua cassaforte di tTerm

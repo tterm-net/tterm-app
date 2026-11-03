@@ -11,7 +11,7 @@ repository.workspace = true
 # tTerm Web in the cloud, for the app (from 0.3.0): signing in with the
 # browser, the page's requests and its socket to app.tterm.net. The agent
 # has no need of it, and builds without it.
-cloud = ["dep:reqwest", "dep:ring", "dep:zeroize", "dep:ssh-key", "dep:num-bigint"]
+cloud = ["dep:reqwest", "dep:ring", "dep:zeroize", "dep:ssh-key", "dep:num-bigint", "dep:argon2", "dep:unicode-normalization"]
 
 [dependencies]
 base64 = "0.22"
@@ -43,7 +43,13 @@ ring = { version = "0.17", optional = true }
 zeroize = { version = "1", optional = true }
 ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ecdsa", "encryption", "rsa"], optional = true }
 num-bigint = { version = "0.4", optional = true }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# The vault password (from 0.8.0, with `cloud`): Argon2id of it (argon2,
+# RustCrypto's, its memory wiped when done), in Unicode NFC first
+# (unicode-normalization), so that the same password typed on any keyboard
+# makes the same keys (crypto.rs).
+argon2 = { version = "0.5", default-features = false, features = ["zeroize"], optional = true }
+unicode-normalization = { version = "0.1", optional = true }
+rustls ={ version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "__rustls-tls"] }
 webpki-roots = "1"

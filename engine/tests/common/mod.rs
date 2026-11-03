@@ -24,7 +24,8 @@ pub use keeper::TestKeeper;
 mod keeper {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
     use tterm_engine::vault::Keeper;
 
     #[derive(Default)]
@@ -32,7 +33,20 @@ mod keeper {
         keks: Mutex<HashMap<String, Vec<u8>>>,
         pub auth_fails: AtomicBool,
         pub auths: AtomicUsize,
+        /// The words of each check, in order, as macOS would show them
+        /// after "tTerm is trying to" (as the app's test keeper writes each
+        /// check down, change 32).
+        reasons: Mutex<Vec<String>>,
+        /// While held, a check waits for `release`, as Touch ID waits for
+        /// the person: what the test does meanwhile (signs in again) comes
+        /// while the request waits. How many wait now.
+        gate: Mutex<(bool, usize)>,
+        opened: Condvar,
     }
+
+    /// How long a held check waits at most: a check that went wrong does
+    /// not keep the test from ending.
+    const HELD_AT_MOST: Duration = Duration::from_secs(30);
 
     impl TestKeeper {
         pub fn new() -> Arc<TestKeeper> {
@@ -44,8 +58,34 @@ mod keeper {
             self.keks.lock().unwrap().get(vault_id).cloned()
         }
 
+        /// How many KEKs are kept, of any vault.
+        pub fn keks(&self) -> usize {
+            self.keks.lock().unwrap().len()
+        }
+
         pub fn auths(&self) -> usize {
             self.auths.load(Ordering::SeqCst)
+        }
+
+        /// The words of the checks asked from the `from`th on.
+        pub fn reasons_since(&self, from: usize) -> Vec<String> {
+            self.reasons.lock().unwrap().iter().skip(from).cloned().collect()
+        }
+
+        /// The checks from now on wait, until `release`.
+        pub fn hold(&self) {
+            self.gate.lock().unwrap().0 = true;
+        }
+
+        /// The checks waiting go on, and the next ones do not wait.
+        pub fn release(&self) {
+            self.gate.lock().unwrap().0 = false;
+            self.opened.notify_all();
+        }
+
+        /// How many checks wait now.
+        pub fn waiting(&self) -> usize {
+            self.gate.lock().unwrap().1
         }
     }
 
@@ -53,7 +93,17 @@ mod keeper {
         fn available(&self) -> bool {
             true
         }
-        fn authenticate(&self, _reason: &str) -> Result<(), String> {
+        fn authenticate(&self, reason: &str) -> Result<(), String> {
+            self.reasons.lock().unwrap().push(reason.to_string());
+            {
+                let until = Instant::now() + HELD_AT_MOST;
+                let mut gate = self.gate.lock().unwrap();
+                gate.1 += 1;
+                while gate.0 && Instant::now() < until {
+                    gate = self.opened.wait_timeout(gate, until.saturating_duration_since(Instant::now())).unwrap().0;
+                }
+                gate.1 -= 1;
+            }
             self.auths.fetch_add(1, Ordering::SeqCst);
             if self.auth_fails.load(Ordering::SeqCst) {
                 Err("the person cancelled".into())

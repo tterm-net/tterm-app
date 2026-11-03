@@ -1,15 +1,17 @@
 //! The vault's cryptography (from 0.7.0), exactly as the contract between
 //! the core, the page and the app has it (vault-design.md, "Crypto"): what a
-//! box is, how its keys are derived, the recovery code, and the numbers of
-//! pairing a new browser. The page does the same with WebCrypto; the shared
-//! vectors (tests/vault-vectors.json) hold both to the same bytes.
+//! box is, how its keys are derived, the vault password (from 0.8.0), the
+//! recovery code of a vault made before, and the numbers of pairing a new
+//! browser. The page does the same with WebCrypto and Argon2id of its own;
+//! the shared vectors (tests/vault-vectors.json) hold both to the same bytes.
 //!
 //! A box is AES-256-GCM with a random nonce of 12 bytes: the nonce, then the
 //! ciphertext with its tag of 16, what WebCrypto's encrypt returns after the
 //! nonce. Every box says what it is for in its additional data (`tterm/vault/
 //! key/v1/<id>` and the like), so that one cannot be passed off as another.
 //! Keys are HKDF-SHA256 (RFC 5869); a new browser and this app agree on one
-//! with X25519. All of it is ring's, the TLS of the rest of the engine.
+//! with X25519. All of it is ring's, the TLS of the rest of the engine; the
+//! password's Argon2id is RustCrypto's (argon2).
 
 use base64::alphabet;
 use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
@@ -18,7 +20,8 @@ use base64::Engine as _;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey, X25519};
 use ring::rand::{SecureRandom, SystemRandom};
-use zeroize::Zeroizing;
+use unicode_normalization::UnicodeNormalization;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Base64url without padding, as every binary value of the vault is
 /// written in JSON; padding is taken when it comes all the same.
@@ -66,6 +69,11 @@ pub fn key_aad(key_id: &str) -> String {
 /// The vault key wrapped for a lock (a passkey, the app).
 pub fn lock_aad(lock_id: &str) -> String {
     format!("tterm/vault/lock/v1/{lock_id}")
+}
+
+/// The vault key wrapped for the vault password.
+pub fn password_aad(vault_id: &str) -> String {
+    format!("tterm/vault/password/v1/{vault_id}")
 }
 
 /// The vault key wrapped for the recovery code.
@@ -127,6 +135,8 @@ pub fn hkdf(ikm: &[u8], salt: &[u8], info: &str) -> Key {
 }
 
 pub const PRF_INFO: &str = "tterm/vault/prf/v1";
+pub const PASSWORD_KEK_INFO: &str = "tterm/vault/password/kek/v1";
+pub const PASSWORD_AUTH_INFO: &str = "tterm/vault/password/auth/v1";
 pub const RECOVERY_INFO: &str = "tterm/vault/recovery/v1";
 pub const PAIR_INFO: &str = "tterm/vault/pair/v1";
 
@@ -136,38 +146,106 @@ pub fn prf_kek(prf_output: &[u8]) -> Key {
     hkdf(prf_output, &[0u8; 32], PRF_INFO)
 }
 
+// ---------------------------------------------------------- the password
+
+/// The vault password (from 0.8.0), the one way into the vault from any
+/// browser with no Mac: as typed, in Unicode NFC, from 12 to 256 code
+/// points then, nothing trimmed. The core never sees it.
+pub const PASSWORD_MIN: usize = 12;
+pub const PASSWORD_MAX: usize = 256;
+/// The password's salt: new each time a password is set.
+pub const PASSWORD_SALT_LEN: usize = 16;
+
+/// Argon2id's settings for a password (RFC 9106, version 0x13): `m` KiB of
+/// memory, `t` passes, `p` lanes, as tTerm keeps them with the password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Kdf {
+    pub m: u32,
+    pub t: u32,
+    pub p: u32,
+}
+
+impl Kdf {
+    /// What a password is set with: 64 MiB, three passes, one lane.
+    pub const NEW: Kdf = Kdf { m: 65536, t: 3, p: 1 };
+
+    /// Whether a vault password may have these settings (the core takes no
+    /// others): never weaker than a new one's, as weaker ones would make the
+    /// proof sent to tTerm cheaper to guess the password from, nor so heavy
+    /// that working it out would take the Mac's memory.
+    pub fn acceptable(&self) -> bool {
+        (65536..=1_048_576).contains(&self.m) && (3..=10).contains(&self.t) && (1..=4).contains(&self.p)
+    }
+}
+
+/// A vault password as typed, the way its keys are made from it: in Unicode
+/// NFC (an "é" typed as "e" and an accent is the "é" of every other
+/// keyboard), nothing trimmed. Err with how many code points it has when
+/// that is not 12 to 256.
+pub fn password_text(typed: &str) -> Result<Zeroizing<String>, usize> {
+    // Many times longer than any password can be: not worth normalizing.
+    if typed.len() > PASSWORD_MAX * 64 {
+        return Err(typed.chars().count());
+    }
+    // Room for all of it at once (NFC is at most three times as long), so
+    // that no shorter copy is left behind as it grows.
+    let mut nfc = Zeroizing::new(String::with_capacity(typed.len() * 3));
+    nfc.extend(typed.nfc());
+    let n = nfc.chars().count();
+    if (PASSWORD_MIN..=PASSWORD_MAX).contains(&n) {
+        Ok(nfc)
+    } else {
+        Err(n)
+    }
+}
+
+/// Argon2id of `password` with `salt`, 32 bytes, no secret and no associated
+/// data, in memory of its own that is wiped when done (Argon2id fills all of
+/// it from the password). None for settings Argon2 does not take, or a salt
+/// shorter than 8 bytes.
+pub fn argon2id(password: &[u8], salt: &[u8], kdf: &Kdf) -> Option<Key> {
+    use argon2::{Algorithm, Argon2, Block, Params, Version};
+    let params = Params::new(kdf.m, kdf.t, kdf.p, Some(32)).ok()?;
+    let mut memory = vec![Block::default(); params.block_count()];
+    let mut out = Zeroizing::new([0u8; 32]);
+    let done = Argon2::new(Algorithm::Argon2id, Version::V0x13, params).hash_password_into_with_memory(password, salt, out.as_mut(), &mut memory[..]);
+    memory.iter_mut().for_each(Zeroize::zeroize);
+    done.ok()?;
+    Some(out)
+}
+
+/// What a vault password gives: the key its wrap of the vault key opens
+/// with, and the proof tTerm asks for before it hands that wrap out (it
+/// keeps the proof's SHA-256 only, never the proof, and never sees the key).
+pub struct PasswordKeys {
+    pub kek: Key,
+    pub auth: Key,
+}
+
+/// The keys of a password, from its NFC text (password_text), its salt and
+/// its settings: Argon2id, then HKDF of that with 32 zero bytes of salt and
+/// each one's info.
+pub fn password_keys(nfc: &str, salt: &[u8], kdf: &Kdf) -> Option<PasswordKeys> {
+    let out = argon2id(nfc.as_bytes(), salt, kdf)?;
+    Some(PasswordKeys {
+        kek: hkdf(out.as_ref(), &[0u8; 32], PASSWORD_KEK_INFO),
+        auth: hkdf(out.as_ref(), &[0u8; 32], PASSWORD_AUTH_INFO),
+    })
+}
+
+/// What tTerm keeps of the proof: its SHA-256. The core makes it, never
+/// this app; here for the checks, which play tTerm.
+pub fn password_check(auth: &[u8]) -> [u8; 32] {
+    sha256(&[auth])
+}
+
 // ---------------------------------------------------------- recovery code
 
 /// Crockford's base32, as the sign-in code (account.rs): no I, L, O or U.
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-/// The code's signs: 24 of them, 120 bits.
+/// The code's signs: 24 of them, 120 bits. A vault made before 0.8.0 has
+/// one until its first password; no new codes are made.
 pub const CODE_LEN: usize = 24;
-/// The recovery salt's bytes, as the core keeps them.
-pub const RECOVERY_SALT_LEN: usize = 16;
-
-/// A new recovery code, as it is shown once: six groups of four signs,
-/// "K7QF-29XM-PL4D-8VHT-R2NC-6WJB".
-pub fn new_recovery_code() -> Zeroizing<String> {
-    let bytes = Zeroizing::new(random::<15>());
-    let mut signs = Zeroizing::new(String::with_capacity(CODE_LEN + 5));
-    // 15 bytes are 120 bits: five at a time, from the first.
-    let (mut acc, mut bits) = (0u32, 0u32);
-    let mut n = 0;
-    for b in bytes.iter() {
-        acc = (acc << 8) | u32::from(*b);
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            if n > 0 && n % 4 == 0 {
-                signs.push('-');
-            }
-            signs.push(CROCKFORD[((acc >> bits) & 31) as usize] as char);
-            n += 1;
-        }
-        acc &= (1 << bits) - 1;
-    }
-    signs
-}
 
 /// A recovery code as typed, the way the KEK is made from it: upper case,
 /// without dashes or spaces, O as 0, I and L as 1. None when it is not 24
@@ -302,14 +380,39 @@ mod tests {
     }
 
     #[test]
+    fn the_password_as_its_keys_are_made_from_it() {
+        // NFC: "e" and a combining accent are the "é" typed at once.
+        assert_eq!(password_text("caf\u{65}\u{301} au lait!").unwrap().as_str(), "caf\u{e9} au lait!");
+        // 12 code points at least, 256 at most, after NFC; nothing trimmed.
+        assert_eq!(password_text("eleven char"), Err(11));
+        assert_eq!(password_text("twelve chars").unwrap().as_str(), "twelve chars");
+        assert_eq!(password_text("  spaces too  ").unwrap().as_str(), "  spaces too  ");
+        assert_eq!(password_text(&"e\u{301}".repeat(11)), Err(11), "11 after NFC, though 22 typed");
+        assert_eq!(password_text("тёплый вечер").unwrap().chars().count(), 12);
+        assert!(password_text(&"x".repeat(256)).is_ok());
+        assert_eq!(password_text(&"x".repeat(257)), Err(257));
+        assert_eq!(password_text(&"x".repeat(100_000)), Err(100_000));
+        assert_eq!(password_text(""), Err(0));
+        // The settings a vault password may have: a new one's, never weaker.
+        assert!(Kdf::NEW.acceptable());
+        assert!(!Kdf { m: 256, t: 2, p: 1 }.acceptable(), "the small vectors' are for the checks only");
+        assert!(!Kdf { m: 65536, t: 2, p: 1 }.acceptable());
+        assert!(!Kdf { m: 2 * 1_048_576, t: 3, p: 1 }.acceptable());
+        assert!(Kdf { m: 1_048_576, t: 10, p: 4 }.acceptable());
+        // What Argon2 does not take is no key.
+        assert!(argon2id(b"twelve chars", &[1u8; 7], &Kdf { m: 64, t: 1, p: 1 }).is_none(), "a salt under 8 bytes");
+        assert!(argon2id(b"twelve chars", &[1u8; 16], &Kdf { m: 4, t: 1, p: 1 }).is_none());
+        let small = Kdf { m: 64, t: 1, p: 1 };
+        let a = password_keys("twelve chars", &[1u8; 16], &small).unwrap();
+        let b = password_keys("twelve chars", &[2u8; 16], &small).unwrap();
+        assert_ne!(a.kek.as_slice(), a.auth.as_slice(), "the key and the proof are not the same");
+        assert_ne!(a.kek.as_slice(), b.kek.as_slice(), "another salt, another key");
+        assert_eq!(password_aad("v1"), "tterm/vault/password/v1/v1");
+    }
+
+    #[test]
     fn recovery_codes() {
-        for _ in 0..200 {
-            let code = new_recovery_code();
-            assert_eq!(code.len(), 29, "{}", code.as_str());
-            assert_eq!(code.split('-').count(), 6);
-            assert!(code.split('-').all(|g| g.len() == 4));
-            assert_eq!(normalize_code(&code).unwrap().len(), CODE_LEN);
-        }
+        assert_eq!(normalize_code("K7QF-29XM-PL4D-8VHT-R2NC-6WJB").unwrap().len(), CODE_LEN);
         assert_eq!(normalize_code(" k7qf 29xm-pl4d-8vht-r2nc-6wjb ").unwrap().as_str(), "K7QF29XMP14D8VHTR2NC6WJB");
         assert_eq!(normalize_code("OOOO-IIII-LLLL-0000-1111-2222").unwrap().as_str(), "000011111111000011112222");
         assert!(normalize_code("K7QF-29XM-PL4D-8VHT-R2NC-6WJ").is_none(), "one short");
