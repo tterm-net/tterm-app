@@ -112,10 +112,12 @@ impl PageSocket {
             self.json(json!({"op": "error", "message": "Not understood."})).await;
             return;
         };
-        // The page's own vault messages, with no channel (from 0.7.0): to
-        // tTerm, through the relay, where the engine's own vault joins them.
+        // The page's own vault messages (from 0.7.0): to tTerm, through the
+        // relay, where the engine's own vault joins them; and never as a
+        // channel's, with a `ch` (0.8.1): tTerm reads none of theirs, and the
+        // relay keeps the proof of the keys open to the engine's own.
         #[cfg(feature = "cloud")]
-        if msg.get("ch").is_none() && op.starts_with("vault.") {
+        if op.starts_with("vault.") {
             if let Some(relay) = self.cloud_relay() {
                 relay.page_vault(text, &msg);
             }

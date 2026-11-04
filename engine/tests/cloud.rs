@@ -5,7 +5,11 @@
 //! socket with a terminal of its own; from 0.4.0 the agents' hub too, where
 //! the app's link connects (reach.rs). The checks act as the browser where
 //! the person would: they allow the app, and bring the code back to the
-//! engine's port on 127.0.0.1.
+//! engine's port on 127.0.0.1. From 0.8.1 it asks each socket to prove the
+//! keys open, as tTerm Web 0.1.28 does (the contract's v3): a nonce first,
+//! the proof by a key of the vault or by the password's, its terminal of a
+//! guarded machine locked on a socket that did not, and a change of the
+//! vault refused (423) from a session none of whose sockets did.
 //!
 //! What only the real tTerm Web can tell is checked against it by hand, and
 //! in the app's window (see the checks of 0.3.0 in PROJECT.md).
@@ -160,6 +164,18 @@ struct Fake {
     /// that it went.
     support: Vec<(HashMap<String, String>, Vec<u8>)>,
     support_answer: Option<(u16, Value)>,
+    /// The proof of the keys open (tTerm Web 0.1.28): the sessions with a
+    /// socket that proved them, and how many; the proofs and the
+    /// vault.closed heard; whether the socket's terminal is of a guarded
+    /// machine (it attaches only where the keys are proved open, and is
+    /// locked elsewhere); the locked said, and the changes of the vault
+    /// refused for want of a proof.
+    proven: HashMap<String, usize>,
+    proofs: Vec<Value>,
+    keys_closed: usize,
+    guarded: bool,
+    locked: Vec<Value>,
+    refused_locked: usize,
 }
 
 impl Fake {
@@ -452,6 +468,21 @@ fn answer(st: &Arc<Mutex<Fake>>, base: &str, method: &str, path: &str, headers: 
     let signed = cookie_of(headers, &st.cookie.clone()).map(|s| st.sessions.contains_key(&s)).unwrap_or(false);
     if !signed {
         return (401, json!({"error": "Sign in to go on.", "signedOut": true}));
+    }
+    // tTerm Web 0.1.28: once the keys guard something (the vault has a
+    // password or a key), a change of the vault comes only from a session
+    // one of whose sockets proved them open (page.py keys_needed).
+    // So does a server with the person's key (0.1.28, add_own; one through
+    // the app's own computer needs none, as the fake takes every one).
+    let own_key = (method, path) == ("POST", "/api/machines/own") && body["method"] == "key";
+    let change = own_key || matches!((method, path), ("PUT", "/api/vault/password") | ("PUT", "/api/vault/recovery") | ("POST", "/api/vault/keys")) || (method == "DELETE" && (path.starts_with("/api/vault/keys/") || path.starts_with("/api/vault/locks/")));
+    if change {
+        let guarding = st.vault.as_ref().map(|v| v["keys"].as_array().map(|k| !k.is_empty()).unwrap_or(false)).unwrap_or(false) || (st.vault.is_some() && st.password_check.is_some());
+        let session = cookie_of(headers, &st.cookie.clone()).unwrap_or_default();
+        if guarding && st.proven.get(&session).copied().unwrap_or(0) == 0 {
+            st.refused_locked += 1;
+            return (423, json!({"error": "Open the keys on this device first: then change the vault.", "locked": true}));
+        }
     }
     match (method, path) {
         ("POST", "/api/computers/this") => {
@@ -750,16 +781,20 @@ async fn socket(stream: TcpStream, st: Arc<Mutex<Fake>>, mut gone: tokio::sync::
     let st2 = st.clone();
     let signed_was = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let signed_in = signed_was.clone();
+    let session_was = Arc::new(Mutex::new(String::new()));
+    let session_in = session_was.clone();
     let check = move |req: &WsRequest, resp: WsResponse| -> Result<WsResponse, ErrorResponse> {
         let headers: HashMap<String, String> = req.headers().iter().map(|(k, v)| (k.as_str().to_ascii_lowercase(), v.to_str().unwrap_or("").to_string())).collect();
         let fake = st2.lock().unwrap();
-        let signed = cookie_of(&headers, &fake.cookie).map(|s| fake.sessions.contains_key(&s)).unwrap_or(false);
+        let session = cookie_of(&headers, &fake.cookie);
+        let signed = session.as_ref().map(|s| fake.sessions.contains_key(s)).unwrap_or(false);
         if fake.no_sockets || headers.get("origin").map(|o| !o.starts_with("http://127.0.0.1:")).unwrap_or(true) {
             let mut refused = ErrorResponse::new(Some("no".into()));
             *refused.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
             return Err(refused);
         }
         signed_in.store(signed, std::sync::atomic::Ordering::SeqCst);
+        *session_in.lock().unwrap() = session.unwrap_or_default();
         Ok(resp)
     };
     let Ok(ws) = tokio_tungstenite::accept_hdr_async(stream, check).await else { return };
@@ -770,6 +805,12 @@ async fn socket(stream: TcpStream, st: Arc<Mutex<Fake>>, mut gone: tokio::sync::
         let _ = sink.send(Message::Close(Some(CloseFrame { code: CloseCode::from(4401), reason: "signed out".into() }))).await;
         return;
     }
+    // As tTerm Web 0.1.28: the socket's nonce first; the proof on it lives
+    // as long as the socket, or until it says the keys closed.
+    let nonce = tterm_engine::crypto::b64u(&tterm_engine::crypto::random::<32>());
+    let _ = sink.send(Message::Text(json!({"op": "vault.challenge", "nonce": nonce}).to_string().into())).await;
+    let mut proven = Proven { st: st.clone(), session: session_was.lock().unwrap().clone(), on: false };
+    let mut attached: Vec<u32> = Vec::new();
     let mut seq: HashMap<u32, u64> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     loop {
@@ -817,11 +858,48 @@ async fn socket(stream: TcpStream, st: Arc<Mutex<Fake>>, mut gone: tokio::sync::
                     st.lock().unwrap().signed.push(msg.clone());
                     continue;
                 }
+                if msg["op"] == "vault.prove" {
+                    let word = proof_word(&st, &nonce, &msg);
+                    st.lock().unwrap().proofs.push(msg.clone());
+                    if word["op"] == "vault.proven" {
+                        proven.set(true);
+                    }
+                    let _ = sink.send(Message::Text(word.to_string().into())).await;
+                    continue;
+                }
+                if msg["op"] == "vault.closed" {
+                    st.lock().unwrap().keys_closed += 1;
+                    proven.set(false);
+                    // As ws.py _keys_closed: the guarded terminals it
+                    // watched turn locked.
+                    let guarded = st.lock().unwrap().guarded;
+                    if guarded {
+                        for ch in std::mem::take(&mut attached) {
+                            let locked = locked_message(ch);
+                            st.lock().unwrap().locked.push(locked.clone());
+                            let _ = sink.send(Message::Text(locked.to_string().into())).await;
+                        }
+                    }
+                    continue;
+                }
                 if msg["op"] == "attach" {
                     st.lock().unwrap().attaches.push(msg.clone());
                     if msg["id"] != "11111111-1111-1111-1111-111111111111" {
                         let _ = sink.send(Message::Text(json!({"op": "gone", "ch": ch, "terminal": null}).to_string().into())).await;
                         continue;
+                    }
+                    // A guarded machine's terminal, on a socket that did not
+                    // prove the keys open: nothing of it, but that it is
+                    // locked.
+                    let guarded = st.lock().unwrap().guarded;
+                    if guarded && !proven.on {
+                        let locked = locked_message(ch);
+                        st.lock().unwrap().locked.push(locked.clone());
+                        let _ = sink.send(Message::Text(locked.to_string().into())).await;
+                        continue;
+                    }
+                    if !attached.contains(&ch) {
+                        attached.push(ch);
                     }
                     let after = msg["after"].as_u64();
                     let terminal = json!({"id": "11111111-1111-1111-1111-111111111111", "machineId": "s1", "state": "open"});
@@ -843,6 +921,69 @@ async fn socket(stream: TcpStream, st: Arc<Mutex<Fake>>, mut gone: tokio::sync::
             _ => {}
         }
     }
+}
+
+/// A socket's proof of the keys open, counted for its session while it
+/// lasts (page.py keys_open): gone with the socket.
+struct Proven {
+    st: Arc<Mutex<Fake>>,
+    session: String,
+    on: bool,
+}
+
+impl Proven {
+    fn set(&mut self, on: bool) {
+        if self.on == on {
+            return;
+        }
+        self.on = on;
+        let mut f = self.st.lock().unwrap();
+        let n = f.proven.entry(self.session.clone()).or_insert(0);
+        *n = if on { *n + 1 } else { n.saturating_sub(1) };
+    }
+}
+
+impl Drop for Proven {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
+
+/// tTerm's word on a proof (vault.py prove_by_key and open_with_password,
+/// ws.py _prove): by a key of the vault, its Ed25519 signature over the
+/// blob of this socket's nonce; by the password's proof, checked and
+/// counted as password/open does.
+fn proof_word(st: &Arc<Mutex<Fake>>, nonce: &str, msg: &Value) -> Value {
+    use tterm_engine::crypto;
+    let mut f = st.lock().unwrap();
+    let refused = |why: &str| json!({"op": "vault.unproven", "error": why});
+    if let Some(auth) = msg.get("auth").and_then(Value::as_str) {
+        let Some(check) = f.password_check else { return refused("This vault has no password.") };
+        let auth = crypto::from_b64u(auth).unwrap_or_default();
+        if auth.len() == 32 && crypto::same(&crypto::password_check(&auth), &check) {
+            f.password_wrong = 0;
+            return json!({"op": "vault.proven"});
+        }
+        f.password_wrong += 1;
+        return json!({"op": "vault.unproven", "error": "That password does not open your vault.", "wrong": true, "left": 10u32.saturating_sub(f.password_wrong)});
+    }
+    let key = msg["key"].as_str().unwrap_or_default();
+    let public = f.vault.as_ref().and_then(|v| v["keys"].as_array()?.iter().find(|k| k["fingerprint"] == key)?["publicKey"].as_str().map(str::to_string));
+    let Some(public) = public else { return refused("That key is not in your vault.") };
+    if msg["alg"] != "ssh-ed25519" {
+        return refused("That key does not sign that way.");
+    }
+    let sig = crypto::from_b64u(msg["sig"].as_str().unwrap_or_default()).unwrap_or_default();
+    if ed25519_verifies(&public, &tterm_engine::sshkeys::proof_blob(nonce), &sig) {
+        json!({"op": "vault.proven"})
+    } else {
+        refused("That proof does not check out.")
+    }
+}
+
+/// What tTerm says of its terminal on a socket the keys are closed to.
+fn locked_message(ch: u32) -> Value {
+    json!({"op": "locked", "ch": ch, "terminal": {"id": "11111111-1111-1111-1111-111111111111", "name": "1", "machine": "web-01", "machineId": "s1"}})
 }
 
 /// What tTerm Web says to a computer it removed (agents.REMOVED).
@@ -2788,6 +2929,9 @@ async fn a_new_password_replaces_the_old_with_touch_id() {
     let (a, keeper) = app_kept(&cloud).await;
     sign_in(&cloud, &a).await;
     create_vault(&a.engine).await;
+    // A key in the vault (0.8.1): what proves the keys open here once Touch
+    // ID has opened them, for tTerm to take a new password from this Mac.
+    seal_vector_key(&cloud, &vault_key_of(&cloud, &keeper));
     app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
     let first_salt = cloud.st.lock().unwrap().vault.as_ref().unwrap()["password"]["salt"].clone();
     // Under 12 characters: refused before Touch ID is asked.
@@ -3270,6 +3414,127 @@ async fn the_engine_signs_logins_on_the_socket_and_nothing_else() {
     assert!(until(5, || cloud.st.lock().unwrap().cans.last().map(|c| !c.contains(&fingerprint)).unwrap_or(false)).await);
 }
 
+/// A cloud terminal's attach, as the page sends it.
+fn attach_cloud(ch: u32) -> Value {
+    json!({"op": "attach", "ch": ch, "id": "11111111-1111-1111-1111-111111111111", "after": null, "cols": 100, "rows": 30, "focus": true})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_engine_proves_the_keys_open_on_its_socket_and_says_when_they_close() {
+    let cloud = Cloud::start().await;
+    let (a, keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    create_vault(&a.engine).await;
+    let (fingerprint, _) = seal_vector_key(&cloud, &vault_key_of(&cloud, &keeper));
+    // Opened again with Touch ID: the vault holds the key, and no password.
+    app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    let (status, opened) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({})).await;
+    assert_eq!(status, 200, "{opened}");
+    cloud.st.lock().unwrap().guarded = true;
+    // The page's socket: tTerm's nonce, the proof by the vault's key over it,
+    // and the terminal of a guarded machine attaches at once.
+    let mut page = Page::new(&a.engine);
+    page.send(attach_cloud(5)).await;
+    assert!(page.until(10, |p| p.msgs.iter().any(|m| m["op"] == "attached" && m["ch"] == 5)).await, "{:?}", page.msgs);
+    let proof = cloud.st.lock().unwrap().proofs[0].clone();
+    assert_eq!((proof["key"].clone(), proof["alg"].clone()), (json!(fingerprint), json!("ssh-ed25519")), "{proof}");
+    assert!(proof.get("auth").is_none(), "by the key: {proof}");
+    assert!(page.until(5, |p| p.msgs.iter().any(|m| m["op"] == "vault.proven")).await, "{:?}", page.msgs);
+    assert!(page.msgs.iter().any(|m| m["op"] == "vault.challenge"), "the page hears the nonce too");
+    // The network drops the socket: back, the proof goes before the attach
+    // again, and the terminal was never locked.
+    cloud.drop_connections();
+    assert!(page.until(10, |p| p.msgs.iter().filter(|m| m["op"] == "attached" && m["ch"] == 5).count() == 2).await, "{:?}", page.msgs);
+    assert_eq!(cloud.st.lock().unwrap().proofs.len(), 2, "a proof on each socket");
+    assert!(cloud.st.lock().unwrap().locked.is_empty(), "{:?}", cloud.st.lock().unwrap().locked);
+    // The page's own proof messages go nowhere: the proof is the engine's;
+    // nor as a channel's (tTerm reads no channel of a vault message).
+    page.send(json!({"op": "vault.closed"})).await;
+    page.send(json!({"op": "vault.prove", "auth": tterm_engine::crypto::b64u(&[7u8; 32])})).await;
+    page.send(json!({"op": "vault.closed", "ch": 5})).await;
+    page.send(json!({"op": "vault.prove", "ch": 5, "auth": tterm_engine::crypto::b64u(&[7u8; 32])})).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    {
+        let st = cloud.st.lock().unwrap();
+        assert_eq!((st.keys_closed, st.proofs.len()), (0, 2));
+    }
+    // Locked: tTerm hears the keys closed, its terminal turns locked, and the
+    // page hears both.
+    app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    assert!(until(5, || cloud.st.lock().unwrap().keys_closed == 1).await, "vault.closed");
+    assert!(page.until(5, |p| p.msgs.iter().any(|m| m["op"] == "locked" && m["ch"] == 5) && p.msgs.iter().any(|m| m["op"] == "vault.closed")).await, "{:?}", page.msgs);
+    // Opened again: proved on the same socket, and the terminal attaches
+    // again when the page asks (as its reattachLocked does).
+    app_vault(&a.engine, "POST", "/api/app/vault/open", json!({})).await;
+    assert!(page.until(5, |p| p.msgs.iter().filter(|m| m["op"] == "vault.proven").count() == 3).await, "{:?}", page.msgs);
+    page.send(attach_cloud(5)).await;
+    assert!(page.until(10, |p| p.msgs.iter().filter(|m| m["op"] == "attached" && m["ch"] == 5).count() == 3).await, "{:?}", page.msgs);
+    assert_eq!(cloud.st.lock().unwrap().locked.len(), 1);
+    page.sock.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vault_with_no_key_yet_proves_with_its_password() {
+    use tterm_engine::crypto;
+    let cloud = Cloud::start().await;
+    let (a, _keeper) = app_kept(&cloud).await;
+    sign_in(&cloud, &a).await;
+    create_vault(&a.engine).await;
+    // Made here: the password's proof proves it, on the page's socket.
+    let mut page = Page::new(&a.engine);
+    assert!(page.until(10, |p| p.msgs.iter().any(|m| m["op"] == "vault.proven")).await, "{:?}", page.msgs);
+    let proof = cloud.st.lock().unwrap().proofs[0].clone();
+    assert!(proof["auth"].is_string() && proof.get("key").is_none(), "{proof}");
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!(v["proves"], true, "{v}");
+    // Locked and opened with Touch ID: nothing to prove it by, so tTerm
+    // takes no new password from this Mac, and nothing is sent.
+    app_vault(&a.engine, "POST", "/api/app/vault/lock", Value::Null).await;
+    app_vault(&a.engine, "POST", "/api/app/vault/open", json!({})).await;
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!((v["open"].clone(), v["proves"].clone()), (json!(true), json!(false)), "{v}");
+    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/password", json!({"password": ANOTHER})).await;
+    assert_eq!(status, 423, "{why}");
+    assert!(cloud.st.lock().unwrap().password_puts.is_empty());
+    assert_eq!(cloud.st.lock().unwrap().proofs.len(), 1, "no proof without anything to prove it by");
+    // The password typed while it is open: a wrong one is said and counted;
+    // the right one is kept, and the keys are proved open on the socket.
+    let (status, why) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({"password": ANOTHER})).await;
+    assert_eq!((status, why["wrong"].clone()), (422, json!(true)), "{why}");
+    let (status, opened) = app_vault(&a.engine, "POST", "/api/app/vault/open", json!({"password": PASSWORD})).await;
+    assert_eq!(status, 200, "{opened}");
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!(v["proves"], true, "{v}");
+    assert!(page.until(5, |p| p.msgs.iter().filter(|m| m["op"] == "vault.proven").count() == 2).await, "{:?}", page.msgs);
+    // Now the new password goes, on a socket proved with the old one; and
+    // proves the keys open from then on.
+    let (status, done) = app_vault(&a.engine, "POST", "/api/app/vault/password", json!({"password": ANOTHER})).await;
+    assert_eq!((status, done.clone()), (200, json!({"ok": true})), "{done}");
+    cloud.drop_connections();
+    assert!(page.until(10, |p| p.msgs.iter().filter(|m| m["op"] == "vault.proven").count() == 3).await, "{:?}", page.msgs);
+    // The password changed elsewhere: the proof this Mac has is refused
+    // once (one wrong try), then not sent again, and the page is told to
+    // ask for the password.
+    let salt = [3u8; 16];
+    let other = crypto::password_keys(&crypto::password_text("changed in a browser!").unwrap(), &salt, &crypto::Kdf { m: 65536, t: 3, p: 1 }).unwrap();
+    {
+        let mut st = cloud.st.lock().unwrap();
+        st.password_check = Some(crypto::password_check(other.auth.as_ref()));
+        st.password_wrong = 0;
+    }
+    let before = cloud.st.lock().unwrap().proofs.len();
+    cloud.drop_connections();
+    assert!(page.until(10, |p| p.msgs.iter().any(|m| m["op"] == "vault.unproven")).await, "{:?}", page.msgs);
+    assert!(until(5, || cloud.st.lock().unwrap().password_wrong == 1).await);
+    let (_, v) = app_vault(&a.engine, "GET", "/api/app/vault", Value::Null).await;
+    assert_eq!((v["open"].clone(), v["proves"].clone()), (json!(true), json!(false)), "{v}");
+    cloud.drop_connections();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(cloud.st.lock().unwrap().proofs.len(), before + 1, "not sent again");
+    assert_eq!(cloud.st.lock().unwrap().password_wrong, 1, "one wrong try, no more");
+    page.sock.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_browser_is_paired_from_the_mac() {
     let cloud = Cloud::start().await;
@@ -3677,6 +3942,15 @@ fn userauth(session: &[u8], user: &str, alg: &str, blob: &[u8]) -> Vec<u8> {
 }
 
 /// An Ed25519 raw signature verified against an OpenSSH public line.
+/// Whether an Ed25519 signature over `data` verifies with the OpenSSH key.
+fn ed25519_verifies(public_openssh: &str, data: &[u8], sig: &[u8]) -> bool {
+    let Some(blob) = public_openssh.split_whitespace().nth(1).map(base64_decode) else { return false };
+    if blob.len() < 32 {
+        return false;
+    }
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &blob[blob.len() - 32..]).verify(data, sig).is_ok()
+}
+
 fn verify_ed25519(public_openssh: &str, data: &[u8], sig: &[u8]) {
     let parts: Vec<&str> = public_openssh.split_whitespace().collect();
     let blob = base64_decode(parts[1]);

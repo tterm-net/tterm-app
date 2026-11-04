@@ -90,5 +90,13 @@
    "aad": "tterm/vault/password/v1/0f0e0d0c-0b0a-4908-8706-050403020100",
    "wrap": "BwcHBwcHBwcHBwcHNSAMw4T2XilBfle8E0aFhdlGFfdSceTVKolnn8qiA7bUdypTGRLsaUpOM0aBzSvF"
   }
+ },
+ "proof": {
+  "about": "The proof that the keys are open on a device (0.1.28, vault-design.md v3): the SSHSIG blob of namespace tterm-keys@tterm.net, hash sha512, over the UTF-8 of \"tterm keys open v1\\n\" followed by the socket's nonce as sent; the raw signature of the vector key (key.plaintext) over that blob, as vault.prove carries it.",
+  "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "blob": "U1NIU0lHAAAAFHR0ZXJtLWtleXNAdHRlcm0ubmV0AAAAAAAAAAZzaGE1MTIAAABADwJ3PVU9mrVMqB-nAoVPxYYunOsZCjmDhk6gCnB3VNYL2S1WD7KVdnWbfjIZTsl8dAAG7tx6MEJiT7tFNPjcqg",
+  "key": "SHA256:doxiASlJnKSD9j+JpVoWpfEFHjUrsF9ZYr+cir4FYjo",
+  "alg": "ssh-ed25519",
+  "raw_sig": "pZx9K5JiiYef9XP15ev-jtx-eM76178Zbk9knFmFH7EDfC_KcvdbxWa636qCLMNofCXtO_ZanXkXdFpQkVeJBQ"
  }
 }

@@ -149,6 +149,30 @@ fn a_pairing_matches_the_vectors() {
     assert_eq!(vk.as_ref(), &key32(&v, &["vk"]));
 }
 
+/// The proof that the keys are open on a device (0.8.1, the contract's v3):
+/// the SSHSIG blob of the vectors' nonce, and the vector key's signature
+/// over it, are the vectors' bytes, which the page and the core make too
+/// (Ed25519 signs the same bytes the same way). A login is no proof, nor a
+/// proof a login: the engine's login signer takes no proof blob.
+#[test]
+fn the_proof_matches_the_vector() {
+    use tterm_engine::sshkeys;
+    let v = vectors();
+    let p = &v["proof"];
+    let nonce = s(p, &["nonce"]);
+    assert_eq!(crypto::b64u(&sshkeys::proof_blob(nonce)), s(p, &["blob"]), "the blob");
+    let plain = s(&v, &["key", "plaintext"]).as_bytes();
+    assert_eq!(sshkeys::fingerprint(plain).unwrap(), s(p, &["key"]), "the vector key");
+    let (alg, sig) = sshkeys::prove(plain, nonce).expect("it proves");
+    assert_eq!(alg, s(p, &["alg"]));
+    assert_eq!(crypto::b64u(&sig), s(p, &["raw_sig"]), "the signature is the vector's bytes");
+    assert!(matches!(sshkeys::sign(plain, alg, &sshkeys::proof_blob(nonce)), Err(sshkeys::SignError::NotLogin(_))), "the login signer takes no proof");
+    // What is not a nonce as tTerm gives one is not signed at all.
+    for bad in ["", "two words", "line\nbreak", &"n".repeat(129)] {
+        assert!(sshkeys::prove(plain, bad).is_err(), "{bad:?}");
+    }
+}
+
 /// The private keys of the vectors' pairing agree on the shared secret
 /// both ways (X25519), as the app and the new browser do.
 #[test]

@@ -11,6 +11,17 @@
 //! channel the page focused last takes the keys again, and one the page had
 //! paused is paused again. A session that ended (close code 4401) is renewed
 //! with the device's key first. When the page is gone, the relay is too.
+//!
+//! From 0.8.1 (the contract's v3, tTerm Web 0.1.28) the engine proves on
+//! each such socket that the vault is open on this Mac (vault.rs `proof`):
+//! tTerm gives the socket a nonce first, and with the vault open the proof
+//! goes before the channels' attaches, which tTerm takes in that order, so
+//! a terminal of a guarded machine attaches at once. The vault opening later
+//! proves it then; locking it says `vault.closed`. The page hears tTerm's
+//! `vault.challenge` and its word (`vault.proven`, `vault.unproven`), and the
+//! engine's `vault.closed`: it shows the keys open or closed by them, and
+//! attaches again what tTerm said was locked. The page's own proof messages
+//! go nowhere: in the app it has no key to prove with.
 
 use crate::account::{Account, Trouble};
 use crate::terminals::{Outgoing, INPUT, OUTPUT};
@@ -24,11 +35,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio_tungstenite::tungstenite::Message;
+use zeroize::Zeroizing;
 
 /// Waits before connecting again, in turn (as the page's socket.ts).
 const RETRY_MS: [u64; 5] = [300, 1000, 2000, 4000, 8000];
 /// The close code of a session that ended (tterm/api/ws.py).
 const SIGNED_OUT: u16 = 4401;
+/// How long a new socket waits for tTerm's nonce before it attaches the
+/// channels, with the vault open here (0.8.1): it comes first, at once; a
+/// tTerm before 0.1.28 sends none.
+const CHALLENGE_WAIT: Duration = Duration::from_secs(2);
+/// The keys closed on this Mac, to tTerm and to the page (0.8.1).
+const CLOSED: &str = r#"{"op":"vault.closed"}"#;
 
 /// A channel of the page's on tTerm: what attaching it again takes.
 #[derive(Clone, Debug)]
@@ -54,6 +72,19 @@ struct Inner {
     /// `vault.can`, from 0.7.0): sent with the engine's, as one list, since
     /// the core takes the last `vault.can` of a socket as the whole of it.
     page_can: Vec<String>,
+}
+
+/// The proof of the keys open on one socket to tTerm (0.8.1).
+#[derive(Default)]
+struct Proving {
+    /// The nonce tTerm gave this socket.
+    nonce: Option<String>,
+    /// A proof sent, tTerm's word on it still to come.
+    asked: bool,
+    /// The vault password's proof, when that was the one sent.
+    password: Option<Zeroizing<String>>,
+    /// tTerm took it: the keys are open on this socket.
+    proven: bool,
 }
 
 /// How a connection to tTerm ended.
@@ -136,6 +167,13 @@ impl Relay {
     /// the list the core gets; the rest go as the page wrote them.
     pub fn page_vault(self: &Arc<Self>, raw: &str, msg: &Value) {
         let op = msg.get("op").and_then(Value::as_str).unwrap_or("");
+        // The proof of the keys open on this socket is the engine's (0.8.1):
+        // the page in the app has no key to prove with, nor a word to say
+        // of it.
+        if op == "vault.prove" || op == "vault.closed" {
+            self.start();
+            return;
+        }
         let mut inner = self.inner.lock().unwrap();
         if op == "vault.can" {
             inner.page_can = msg.get("keys").and_then(Value::as_array).map(|keys| keys.iter().filter_map(|k| k.as_str().map(str::to_string)).collect()).unwrap_or_default();
@@ -302,6 +340,42 @@ impl Relay {
         // The vault's keys now, and whenever they change while this socket
         // is up: the core asks a socket to sign only for what it announced.
         let mut can = self.vault_can();
+        // The vault opening, locking, or what proves it changing (0.8.1).
+        let mut news = self.vault_turns();
+        news.borrow_and_update();
+        let (mut can_on, mut news_on) = (true, true);
+        {
+            let inner = self.inner.lock().unwrap();
+            let all = joined(&can.borrow_and_update(), &inner.page_can);
+            let _ = tx.send(Message::Text(can_message(&all).into()));
+        }
+        // With the vault open here, tTerm's nonce (its first message on a
+        // new socket) is waited for, and the proof goes before the attaches
+        // (0.8.1): tTerm takes them in that order. The nonce goes on to the
+        // page from the loop, as anything tTerm says.
+        let mut proving = Proving::default();
+        let mut first = None;
+        if self.engine.vault.as_ref().map(|v| v.proves()).unwrap_or(false) {
+            match tokio::time::timeout(CHALLENGE_WAIT, stream.next()).await {
+                Ok(Some(Ok(message))) => {
+                    if let Some(nonce) = match &message {
+                        Message::Text(text) => challenge_of(text.as_str()),
+                        _ => None,
+                    } {
+                        proving.nonce = Some(nonce);
+                        self.prove(&tx, &mut proving);
+                    }
+                    first = Some(Ok(message));
+                }
+                Ok(Some(Err(_))) | Ok(None) => {
+                    self.inner.lock().unwrap().link = None;
+                    return Ended::Dropped;
+                }
+                // None in time (a tTerm before 0.1.28): on without.
+                Err(_) => {}
+            }
+        }
+        let mut stream = futures_util::stream::iter(first).chain(stream);
         {
             let mut inner = self.inner.lock().unwrap();
             for (ch, channel) in &inner.channels {
@@ -310,16 +384,29 @@ impl Relay {
                     let _ = tx.send(Message::Text(json!({"op": "pause", "ch": ch}).to_string().into()));
                 }
             }
-            let all = joined(&can.borrow_and_update(), &inner.page_can);
-            let _ = tx.send(Message::Text(can_message(&all).into()));
             inner.link = Some(tx.clone());
         }
         let ended = loop {
             tokio::select! {
-                _ = can.changed() => {
+                changed = can.changed(), if can_on => {
+                    // A vault that is gone says nothing more.
+                    if changed.is_err() {
+                        can_on = false;
+                        continue;
+                    }
                     let all = joined(&can.borrow_and_update(), &self.inner.lock().unwrap().page_can);
                     if tx.send(Message::Text(can_message(&all).into())).is_err() {
                         break Ended::Dropped;
+                    }
+                }
+                changed = news.changed(), if news_on => {
+                    if changed.is_err() {
+                        news_on = false;
+                        continue;
+                    }
+                    news.borrow_and_update();
+                    if self.vault_turned(&tx, &mut proving).await.is_err() {
+                        break Ended::PageGone;
                     }
                 }
                 out = rx.recv() => match out {
@@ -346,6 +433,11 @@ impl Relay {
                         // engine has read the vault again, so what the page
                         // asks then (GET /api/app/vault) is new already.
                         if self.vault_news(&text) {
+                            continue;
+                        }
+                        // The proof on this socket (0.8.1): tTerm's nonce,
+                        // and its word on the proof.
+                        if !self.heard_proof(&text, &tx, &mut proving) {
                             continue;
                         }
                         self.heard_text(&text);
@@ -415,6 +507,18 @@ fn can_message(keys: &[String]) -> String {
     json!({"op": "vault.can", "keys": keys}).to_string()
 }
 
+/// The nonce of tTerm's `vault.challenge`, when `text` is one.
+fn challenge_of(text: &str) -> Option<String> {
+    if !text.contains("\"vault.challenge\"") {
+        return None;
+    }
+    let msg: Value = serde_json::from_str(text).ok()?;
+    if msg.get("op").and_then(Value::as_str) != Some("vault.challenge") {
+        return None;
+    }
+    msg.get("nonce").and_then(Value::as_str).map(str::to_string)
+}
+
 /// The engine's fingerprints and the page's, each once, the engine's first.
 fn joined(engine: &[String], page: &[String]) -> Vec<String> {
     let mut all = engine.to_vec();
@@ -427,12 +531,98 @@ fn joined(engine: &[String], page: &[String]) -> Vec<String> {
 }
 
 impl Relay {
-    /// What the vault can sign for, to watch; an always-empty, never-changing
-    /// one when there is no vault (so the socket still announces, as locked).
+    /// What the vault can sign for, to watch; an always-empty one when there
+    /// is no vault (so the socket still announces, as locked), which is
+    /// closed at once: the pump stops watching it.
     fn vault_can(&self) -> tokio::sync::watch::Receiver<Vec<String>> {
         match self.engine.vault.as_ref() {
             Some(v) => v.watch_can(),
             None => tokio::sync::watch::channel(Vec::new()).1,
+        }
+    }
+
+    /// The vault opening, locking, or what proves it changing, to watch; as
+    /// the above when there is no vault.
+    fn vault_turns(&self) -> tokio::sync::watch::Receiver<u64> {
+        match self.engine.vault.as_ref() {
+            Some(v) => v.watch_news(),
+            None => tokio::sync::watch::channel(0).1,
+        }
+    }
+
+    /// Sends the proof of the vault open here for this socket's nonce, when
+    /// there is none on its way and it is not proved already; nothing when
+    /// the vault is locked or has nothing to prove it by.
+    fn prove(&self, link: &mpsc::UnboundedSender<Message>, proving: &mut Proving) {
+        if proving.asked || proving.proven {
+            return;
+        }
+        let (Some(nonce), Some(vault)) = (proving.nonce.as_deref(), self.engine.vault.as_ref()) else { return };
+        let Some(made) = vault.proof(nonce) else { return };
+        if link.send(Message::Text(made.message.as_str().into())).is_ok() {
+            proving.asked = true;
+            proving.password = made.password;
+        }
+    }
+
+    /// The vault opened, locked, or what proves it changed: opened, the
+    /// proof goes now; locked, tTerm hears that the keys closed here, and
+    /// so does the page. Err when the page went.
+    async fn vault_turned(&self, link: &mpsc::UnboundedSender<Message>, proving: &mut Proving) -> Result<(), ()> {
+        if self.engine.vault.as_ref().map(|v| v.is_open()).unwrap_or(false) {
+            self.prove(link, proving);
+            return Ok(());
+        }
+        if proving.proven || proving.asked {
+            proving.proven = false;
+            proving.asked = false;
+            proving.password = None;
+            let _ = link.send(Message::Text(CLOSED.into()));
+            self.to_page.send(Outgoing::Text(CLOSED.to_string())).await.map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
+    /// tTerm's messages of the proof on this socket: its nonce (proved at
+    /// once, with the vault open here), its word on the proof. Whether the
+    /// message goes on to the page: all do, but a word that came after the
+    /// vault locked meanwhile, which is answered with `vault.closed` again.
+    fn heard_proof(&self, text: &str, link: &mpsc::UnboundedSender<Message>, proving: &mut Proving) -> bool {
+        if !text.contains("\"vault.") {
+            return true;
+        }
+        let Ok(msg) = serde_json::from_str::<Value>(text) else { return true };
+        match msg.get("op").and_then(Value::as_str) {
+            Some("vault.challenge") => {
+                let nonce = msg.get("nonce").and_then(Value::as_str).unwrap_or_default().to_string();
+                if proving.nonce.as_deref() != Some(nonce.as_str()) {
+                    *proving = Proving { nonce: Some(nonce), ..Proving::default() };
+                    self.prove(link, proving);
+                }
+                true
+            }
+            Some("vault.proven") => {
+                proving.asked = false;
+                if !self.engine.vault.as_ref().map(|v| v.is_open()).unwrap_or(false) {
+                    let _ = link.send(Message::Text(CLOSED.into()));
+                    return false;
+                }
+                proving.proven = true;
+                true
+            }
+            Some("vault.unproven") => {
+                proving.asked = false;
+                // A password changed elsewhere: its old proof is not sent
+                // again, and the page asks for the password.
+                if msg.get("wrong") == Some(&Value::Bool(true)) {
+                    if let (Some(sent), Some(vault)) = (proving.password.take(), self.engine.vault.as_ref()) {
+                        vault.forget_password_proof(&sent);
+                    }
+                }
+                eprintln!("tterm: tTerm did not take the proof of the keys open on the page's socket: {}", msg.get("error").cloned().unwrap_or(Value::Null));
+                true
+            }
+            _ => true,
         }
     }
 

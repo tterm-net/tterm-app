@@ -26,6 +26,16 @@
 //! What needs the vault key (allowing a new browser, a new password) opens
 //! the vault too, under the same one check.
 //!
+//! From 0.8.1 (the contract's v3, tTerm Web 0.1.28) the vault open here is
+//! proved to tTerm on each socket of the app's there (`proof`): with a key
+//! of the vault, signing the nonce tTerm gave the socket; with no key yet,
+//! with the vault password's proof, while this Mac knows it (made or typed
+//! here since the vault opened). Until then tTerm shows the app nothing of
+//! a guarded machine (a server with the person's key, one through another
+//! Mac, another computer) but this Mac's own, and takes no change of the
+//! vault from it: a password, a key in or out go on a socket that proved it
+//! (`proved`).
+//!
 //! The keychain and LocalAuthentication are the app's (macOS); the engine
 //! reaches them through `Keeper`, which the app implements and the checks
 //! stand in for on Linux.
@@ -34,12 +44,14 @@ use crate::account::Trouble;
 use crate::crypto::{self, Key, Pairer};
 use crate::upstream::Answer;
 use crate::Engine;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
+use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -77,6 +89,9 @@ const PASSWORD_NOT_UNDERSTOOD: &str = "tTerm's answer for the vault password was
 /// (it asks every two seconds; the pairing lasts five minutes).
 const REVEAL_WAIT: Duration = Duration::from_secs(120);
 const REVEAL_POLL: Duration = Duration::from_secs(1);
+/// How long a socket for a change of the vault waits for tTerm's nonce, and
+/// then for its word on the proof (0.8.1), at most.
+const PROOF_WAIT: Duration = Duration::from_secs(8);
 
 /// What the engine needs of the app for the vault: the macOS keychain, where
 /// the app's KEK is kept, and the LocalAuthentication gate before it is read.
@@ -115,6 +130,26 @@ struct Open {
     vk: Key,
     keys: Vec<Held>,
     epoch: u64,
+    /// The vault password's proof (crypto::password_keys' `auth`), while
+    /// this Mac knows it: the vault made here, opened or given a password
+    /// here since it opened (0.8.1). With no key in the vault it is what
+    /// proves the keys open to tTerm; it goes when the vault locks.
+    auth: Option<Key>,
+}
+
+/// A proof of the vault open on this Mac for one socket of the app's on
+/// tTerm (0.8.1): the `vault.prove` to send, and when it is the vault
+/// password's, the proof sent (to forget one tTerm refuses).
+pub struct Proof {
+    pub message: Zeroizing<String>,
+    pub password: Option<Zeroizing<String>>,
+}
+
+/// A socket on tTerm that proved the keys open (`Vault::proved`), held for
+/// as long as this lives: tTerm takes a change of the vault from the app's
+/// session while it is open. Dropped, the socket closes.
+pub struct Proved {
+    _hold: tokio::sync::oneshot::Sender<()>,
 }
 
 /// One pairing of a new browser being answered on this Mac: this side's
@@ -137,6 +172,11 @@ pub struct Vault {
     /// page's socket to the cloud (upstream_socket.rs) watches it and sends
     /// `vault.can` upstream on each change.
     can: watch::Sender<Vec<String>>,
+    /// One more each time the vault opens, locks, or what proves it open
+    /// changes (its keys, the password's proof): the page's socket to the
+    /// cloud watches it, to prove the keys open there or say they closed
+    /// (0.8.1).
+    news: watch::Sender<u64>,
     /// What opens or makes the vault, or adds a lock, one at a time: two
     /// opens at once with the recovery code make one lock, not two.
     one: tokio::sync::Mutex<()>,
@@ -182,6 +222,7 @@ impl Vault {
             open: Mutex::new(None),
             pairings: Mutex::new(HashMap::new()),
             can: watch::channel(Vec::new()).0,
+            news: watch::channel(0).0,
             one: tokio::sync::Mutex::new(()),
             known: Mutex::new(None),
         }
@@ -253,6 +294,15 @@ impl Vault {
         self.can.borrow().clone()
     }
 
+    /// The vault opened, locked, or what proves it open changed, to watch.
+    pub fn watch_news(&self) -> watch::Receiver<u64> {
+        self.news.subscribe()
+    }
+
+    fn tell(&self) {
+        self.news.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
     fn set_can(&self, keys: &[Held]) {
         let fps: Vec<String> = keys.iter().map(|k| k.fingerprint.clone()).collect();
         self.can.send_replace(fps);
@@ -283,6 +333,11 @@ impl Vault {
             "open": open,
             "keys": self.can_now(),
             "web": web,
+            // Whether this Mac can prove the vault open to tTerm (0.8.1): it
+            // can with a key of the vault, or the password typed here; open
+            // with neither (a vault with no key yet, opened with Touch ID),
+            // the page asks for the password.
+            "proves": self.proves(),
         })
     }
 
@@ -336,7 +391,7 @@ impl Vault {
             self.forget_kek(&vault_id).await;
             return Err(self.from_cloud(&answer, "The vault could not be made"));
         }
-        self.hold(epoch, vault_id, lock_id, vk, Vec::new());
+        self.hold(epoch, vault_id, lock_id, vk, Vec::new(), Some(keys.auth));
         Ok(json!({"open": true}))
     }
 
@@ -352,6 +407,14 @@ impl Vault {
         let _one = self.one.lock().await;
         if self.is_open() {
             self.same_account(engine, epoch).await?;
+            // Open with no key to prove it by (a vault with its password and
+            // no key yet, opened with Touch ID): the password typed now is
+            // what proves it to tTerm from here on (0.8.1).
+            if let Some(password) = password.filter(|p| !p.is_empty()) {
+                if !self.proves() {
+                    self.know_password(engine, epoch, password).await?;
+                }
+            }
             return Ok(json!({"open": true}));
         }
         if !self.available() {
@@ -400,7 +463,7 @@ impl Vault {
         // The keychain can wait for the person too.
         self.same_account(engine, epoch).await?;
         let keys = read_keys(vault, &vk);
-        self.hold(epoch, vault_id, lock_id.clone(), vk, keys);
+        self.hold(epoch, vault_id, lock_id.clone(), vk, keys, None);
         self.lock_used(engine, epoch, &lock_id);
         Ok(())
     }
@@ -413,6 +476,19 @@ impl Vault {
     /// person has just typed the password. A wrong one, and tTerm's pause
     /// after too many, are said with what the page says them from.
     async fn open_with_password(&self, engine: &Arc<Engine>, epoch: Option<u64>, vault: &Value, password: &str) -> Done<()> {
+        let vault_id = vault["id"].as_str().unwrap_or_default().to_string();
+        let (auth, vk) = self.password_wrap(engine, epoch, vault, password).await?;
+        let lock_id = self.own_lock(engine, epoch, vault, &vault_id, &vk, "password").await?;
+        let keys = read_keys(vault, &vk);
+        self.hold(epoch, vault_id, lock_id, vk, keys, Some(auth));
+        Ok(())
+    }
+
+    /// The vault password tried with tTerm: its keys made here from the
+    /// vault's salt and settings, the proof sent (`POST /api/vault/password
+    /// /open`, which counts the wrong ones), and the vault key from the wrap
+    /// tTerm gives back for the right one. The proof and the vault key.
+    async fn password_wrap(&self, engine: &Arc<Engine>, epoch: Option<u64>, vault: &Value, password: &str) -> Done<(Key, Key)> {
         let vault_id = vault["id"].as_str().unwrap_or_default().to_string();
         // One that is not 12 to 256 characters is no vault's password: it
         // is not tried, and costs no try.
@@ -443,9 +519,35 @@ impl Vault {
         }
         let wrap = got["wrap"].as_str().and_then(crypto::from_b64u).ok_or_else(|| Failed::new(502, PASSWORD_NOT_UNDERSTOOD))?;
         let vk = crypto::open_key(&keys.kek, &wrap, &crypto::password_aad(&vault_id)).ok_or_else(|| Failed::new(502, "The vault key tTerm gave back for the password does not open with it."))?;
-        let lock_id = self.own_lock(engine, epoch, vault, &vault_id, &vk, "password").await?;
-        let keys = read_keys(vault, &vk);
-        self.hold(epoch, vault_id, lock_id, vk, keys);
+        Ok((keys.auth, vk))
+    }
+
+    /// The vault password typed while the vault is open (0.8.1): tried with
+    /// tTerm as any, and its proof kept for proving the keys open, when it
+    /// opens this very vault key. A wrong one is said as when opening.
+    async fn know_password(&self, engine: &Arc<Engine>, epoch: Option<u64>, password: &str) -> Done<()> {
+        let Some(vault) = self.cloud_get_in(engine, epoch).await? else {
+            return Err(Failed::new(404, "There is no vault yet. Make one first."));
+        };
+        if !vault.get("password").map(Value::is_object).unwrap_or(false) {
+            return Err(Failed::new(409, NO_PASSWORD));
+        }
+        let (auth, vk) = self.password_wrap(engine, epoch, &vault, password).await?;
+        self.same_account(engine, epoch).await?;
+        let kept = {
+            let mut open = self.open.lock().unwrap();
+            match open.as_mut() {
+                Some(o) if o.vault_id == vault["id"].as_str().unwrap_or_default() && crypto::same(o.vk.as_ref(), vk.as_ref()) => {
+                    o.auth = Some(auth);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !kept {
+            return Err(Failed::new(502, "The vault key your password gave is not the one open on this Mac. Nothing was changed."));
+        }
+        self.tell();
         Ok(())
     }
 
@@ -476,7 +578,7 @@ impl Vault {
         self.same_account(engine, epoch).await?;
         let lock_id = self.own_lock(engine, epoch, vault, &vault_id, &vk, "recovery code").await?;
         let keys = read_keys(vault, &vk);
-        self.hold(epoch, vault_id, lock_id, vk, keys);
+        self.hold(epoch, vault_id, lock_id, vk, keys, None);
         Ok(())
     }
 
@@ -601,10 +703,20 @@ impl Vault {
         let keys = derive(password, &salt, crypto::Kdf::NEW).await?;
         let wrap = crypto::seal(&keys.kek, vk.as_ref(), &crypto::password_aad(&vault_id));
         let body = password_json(&salt, crypto::Kdf::NEW, &keys, &wrap);
+        // tTerm takes a password only from where the keys are open, once
+        // they guard something (0.8.1): on a socket that proved it, with a
+        // key of the vault or the password it has now.
+        let proved = self.proved(engine, epoch).await;
         let answer = self.cloud_call_in(engine, epoch, "PUT", "/api/vault/password", Some(&body)).await?;
+        drop(proved);
         if !(200..300).contains(&answer.status) {
             return Err(self.from_cloud(&answer, "The vault password could not be set"));
         }
+        // The new password's proof is the one that proves it from now on.
+        if let Some(o) = self.open.lock().unwrap().as_mut().filter(|o| o.vault_id == vault_id) {
+            o.auth = Some(keys.auth);
+        }
+        self.tell();
         Ok(json!({"ok": true}))
     }
 
@@ -691,6 +803,159 @@ impl Vault {
                 None
             }
         }
+    }
+
+    // ------------------------------------- the proof of the keys open here
+
+    /// Whether the vault is open here with something to prove it by: a key
+    /// of the vault, or the vault password's proof.
+    pub fn proves(&self) -> bool {
+        self.open.lock().unwrap().as_ref().map(|o| !o.keys.is_empty() || o.auth.is_some()).unwrap_or(false)
+    }
+
+    /// The proof of the vault open on this Mac for the socket tTerm gave
+    /// `nonce` (0.8.1, the contract's v3): a key of the vault signs the SSHSIG
+    /// blob the engine builds of the nonce (sshkeys::prove), the first key
+    /// that can; with none, the vault password's proof, when this Mac knows
+    /// it. None while locked, or with nothing to prove it by.
+    pub fn proof(&self, nonce: &str) -> Option<Proof> {
+        let open = self.open.lock().unwrap();
+        let open = open.as_ref()?;
+        for held in &open.keys {
+            let Some(plaintext) = crypto::open(&open.vk, &held.sealed, &crypto::key_aad(&held.key_id)) else { continue };
+            match crate::sshkeys::prove(&plaintext, nonce) {
+                Ok((alg, sig)) => {
+                    let message = json!({"op": "vault.prove", "key": held.fingerprint, "alg": alg, "sig": crypto::b64u(&sig)});
+                    return Some(Proof { message: Zeroizing::new(message.to_string()), password: None });
+                }
+                Err(e) => eprintln!("tterm: the vault could not prove the keys open with {}: {e:?}", held.fingerprint),
+            }
+        }
+        let auth = Zeroizing::new(crypto::b64u(open.auth.as_ref()?.as_ref()));
+        let message = Zeroizing::new(format!(r#"{{"op":"vault.prove","auth":"{}"}}"#, auth.as_str()));
+        Some(Proof { message, password: Some(auth) })
+    }
+
+    /// tTerm did not take the password's proof `sent` (the password was
+    /// changed elsewhere): it is not sent again, and the page asks for the
+    /// password. One this Mac learned since stays.
+    pub fn forget_password_proof(&self, sent: &str) {
+        let forgot = {
+            let mut open = self.open.lock().unwrap();
+            match open.as_mut() {
+                Some(o) if o.auth.as_ref().map(|a| Zeroizing::new(crypto::b64u(a.as_ref())).as_str() == sent).unwrap_or(false) => {
+                    o.auth = None;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if forgot {
+            eprintln!("tterm: tTerm did not take the vault password this Mac knew (changed elsewhere?): it is asked for again");
+            self.tell();
+        }
+    }
+
+    /// A socket of the app's on tTerm on which the keys are proved open
+    /// (0.8.1): tTerm takes a change of the vault (a password, a key in or
+    /// out) from a session only while one of its sockets did, once the keys
+    /// guard something. Held open while the change is made. None when there
+    /// is nothing to prove them by (the vault locked, or with no key and no
+    /// password known here), or tTerm did not take the proof: the change is
+    /// asked all the same, and tTerm says whether it needed one.
+    async fn proved(&self, engine: &Arc<Engine>, epoch: Option<u64>) -> Option<Proved> {
+        let account = engine.cloud.clone()?;
+        if !self.proves() || Self::epoch(engine) != epoch {
+            return None;
+        }
+        let (cookie, _) = account.socket_cookie().await.ok()?;
+        let socket = match account.cloud.socket(&cookie).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("tterm: no socket on tTerm to prove the keys open for a change of the vault: {e:?}");
+                return None;
+            }
+        };
+        let (mut sink, mut stream) = socket.split();
+        // The nonce first, then the proof, then tTerm's word on it; what
+        // else comes on this socket (the vault's news for every device) is
+        // not this one's.
+        let word = |want: &'static [&'static str]| {
+            move |m: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>| -> Option<Option<Value>> {
+                match m {
+                    Some(Ok(Message::Text(text))) => {
+                        let msg = serde_json::from_str::<Value>(text.as_str()).ok()?;
+                        if want.contains(&msg["op"].as_str()?) {
+                            Some(Some(msg))
+                        } else {
+                            None
+                        }
+                    }
+                    Some(Ok(_)) => None,
+                    _ => Some(None),
+                }
+            }
+        };
+        let challenge = word(&["vault.challenge"]);
+        let nonce = tokio::time::timeout(PROOF_WAIT, async {
+            loop {
+                if let Some(got) = challenge(stream.next().await) {
+                    return got.and_then(|m| m["nonce"].as_str().map(str::to_string));
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        let made = nonce.as_deref().and_then(|n| self.proof(n));
+        let Some(made) = made else {
+            let _ = sink.send(Message::Close(None)).await;
+            return None;
+        };
+        if sink.send(Message::Text(made.message.as_str().into())).await.is_err() {
+            return None;
+        }
+        let answer = word(&["vault.proven", "vault.unproven"]);
+        let said = tokio::time::timeout(PROOF_WAIT, async {
+            loop {
+                if let Some(got) = answer(stream.next().await) {
+                    return got;
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        match said {
+            Some(msg) if msg["op"] == "vault.proven" => {}
+            other => {
+                if let (Some(sent), Some(msg)) = (made.password.as_deref(), other.as_ref()) {
+                    if msg["wrong"] == true {
+                        self.forget_password_proof(sent);
+                    }
+                }
+                eprintln!("tterm: tTerm did not take the proof of the keys open for a change of the vault: {}", other.map(|m| m["error"].to_string()).unwrap_or_else(|| "no answer".into()));
+                let _ = sink.send(Message::Close(None)).await;
+                return None;
+            }
+        }
+        // Held open, read (so its pings are answered), until let go, or
+        // until the vault locks: its proof goes with it.
+        let (hold, mut gone) = tokio::sync::oneshot::channel::<()>();
+        let vault = engine.vault.clone()?;
+        let mut news = self.watch_news();
+        news.borrow_and_update();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut gone => break,
+                    changed = news.changed() => if changed.is_err() || !vault.is_open() { break },
+                    m = stream.next() => if !matches!(m, Some(Ok(_))) { return },
+                }
+            }
+            let _ = sink.send(Message::Close(None)).await;
+        });
+        Some(Proved { _hold: hold })
     }
 
     // ---------------------------------------------------------- pairing
@@ -874,7 +1139,7 @@ impl Vault {
         self.check_account(engine).await;
         let ssh = self.ssh();
         let ticked: HashMap<String, Option<String>> = keys.iter().map(|(p, ph)| (expand(&ssh.home, p), ph.clone().filter(|p| !p.is_empty()))).collect();
-        let mut work = Moving { epoch, ticked, in_vault: None, uploaded: HashMap::new(), saved_with: BTreeSet::new() };
+        let mut work = Moving { epoch, ticked, in_vault: None, uploaded: HashMap::new(), saved_with: BTreeSet::new(), proved: None };
         let mut results = Vec::new();
         // Each server as the person reached it: the user and port they typed
         // in tTerm's terminals, over the config's (0.7.1).
@@ -978,6 +1243,11 @@ impl Vault {
             }
             other => return Err(format!("There is no way in called {other}.")),
         }
+        // A server with your key, or through this Mac, goes in only from
+        // where the keys are open (0.8.1): on the move's proved socket.
+        if (method == "key" || method == "mac") && work.proved.is_none() {
+            work.proved = Some(self.proved(engine, work.epoch).await);
+        }
         let saved = self.cloud_call(engine, "POST", "/api/machines/own", Some(&body)).await;
         let refused = match saved {
             Ok(answer) if answer.status == 201 || answer.status == 200 => {
@@ -1045,6 +1315,12 @@ impl Vault {
         }
         if let Some((id, _)) = work.uploaded.get(&path) {
             return Ok(id.clone());
+        }
+        // tTerm takes a key only from where the keys are open, once they
+        // guard something (0.8.1): on a socket that proved it, one for the
+        // whole move.
+        if work.proved.is_none() {
+            work.proved = Some(self.proved(engine, work.epoch).await);
         }
         let key_id = Uuid::new_v4().to_string();
         let sealed = crypto::seal(&vk, key.plaintext.as_bytes(), &crypto::key_aad(&key_id));
@@ -1261,24 +1537,33 @@ impl Vault {
 
     /// The vault open, for the account of `epoch` (the request's, checked
     /// still the one signed in just before).
-    fn hold(&self, epoch: Option<u64>, vault_id: String, lock_id: String, vk: Key, keys: Vec<Held>) {
+    /// Held open first, then said: whoever hears of it finds it open.
+    fn hold(&self, epoch: Option<u64>, vault_id: String, lock_id: String, vk: Key, keys: Vec<Held>, auth: Option<Key>) {
         self.know_at(epoch, &vault_id);
-        self.set_can(&keys);
-        *self.open.lock().unwrap() = Some(Open { vault_id, lock_id, vk, keys, epoch: epoch.unwrap_or_default() });
+        let fingerprints: Vec<String> = keys.iter().map(|k| k.fingerprint.clone()).collect();
+        *self.open.lock().unwrap() = Some(Open { vault_id, lock_id, vk, keys, epoch: epoch.unwrap_or_default(), auth });
+        self.can.send_replace(fingerprints);
+        self.tell();
     }
 
     fn drop_open(&self) {
-        *self.open.lock().unwrap() = None;
+        let was = self.open.lock().unwrap().take().is_some();
         self.can.send_replace(Vec::new());
+        if was {
+            self.tell();
+        }
     }
 
     /// The vault's keys read again from tTerm's vault object (after a move,
     /// or `vault.changed`): what it can sign for.
     pub fn refresh(&self, vault: &Value) {
-        let mut open = self.open.lock().unwrap();
-        if let Some(o) = open.as_mut() {
+        let read = self.open.lock().unwrap().as_mut().map(|o| {
             o.keys = read_keys(vault, &o.vk);
-            self.set_can(&o.keys);
+            o.keys.clone()
+        });
+        if let Some(keys) = read {
+            self.set_can(&keys);
+            self.tell();
         }
     }
 }
@@ -1286,14 +1571,17 @@ impl Vault {
 /// What one move keeps from server to server: the account's epoch it began
 /// in (the vault's key and requests are for that account only), the ticked
 /// keys with their passphrases, the vault's keys as tTerm said them, the
-/// keys uploaded in this move (by path: id and fingerprint), and those a
-/// saved server uses.
+/// keys uploaded in this move (by path: id and fingerprint), those a saved
+/// server uses, and the socket that proved the keys open for them (0.8.1:
+/// tried once, at the first key that goes up; held to the end of the move,
+/// for a key that goes out again too).
 struct Moving {
     epoch: Option<u64>,
     ticked: HashMap<String, Option<String>>,
     in_vault: Option<HashMap<String, String>>,
     uploaded: HashMap<String, (String, String)>,
     saved_with: BTreeSet<String>,
+    proved: Option<Option<Proved>>,
 }
 
 /// The person's home, where `~/.ssh` is, and whether it is their own. A

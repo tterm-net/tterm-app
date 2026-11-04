@@ -245,7 +245,9 @@ before it uses it: Ed25519's 64 bytes, RSA PKCS#1 v1.5 (SHA-256 or
 SHA-512), ECDSA's `r || s` of fixed length. Only a login is signed: what the
 core asks to sign must be exactly the SSH user-auth request (RFC 4252 §7) of
 a public-key login with that very key, or nothing is signed, so the key
-cannot be used for anything else through tTerm. Security keys (`sk-*`),
+cannot be used for anything else through tTerm. An ECDSA key whose secret
+OpenSSH wrote short (one in 256: the number with no zero in front) is read
+with it padded, from 0.8.1. Security keys (`sk-*`),
 keys only an agent holds, and other types are not moved — their servers go
 Through this Mac.
 
@@ -258,7 +260,8 @@ as ssh took them then; known_hosts' entries of servers already listed are
 not listed again, and a server only known_hosts knows is not ticked (from
 0.7.0's first runs). For each server the way in
 the person chose: **My key** (the key sealed and uploaded, the login signed
-by this Mac or whatever browser is open), **Let tTerm in** (the app signs in
+by the device that opened the terminal, where the keys are open: this Mac for
+its own, a browser for its own), **Let tTerm in** (the app signs in
 once and adds tTerm's CA line to `authorized_keys`, then the core signs in
 with a short certificate), or **Through this Mac** (a terminal of this Mac
 that runs `ssh`, while the Mac is online). A key moves only when it is
@@ -271,7 +274,19 @@ answers nothing but the passphrase question.
 On the page's socket to the cloud — up while the page's is, terminals or
 not — the engine says which keys it can sign for (`vault.can`), answers the
 core's `vault.sign` for them itself, and never passes a signing request to
-the page. A `mac` terminal (Through this Mac)
+the page. From 0.8.1 (tTerm Web 0.1.28) the core shows a device nothing of
+a guarded machine — a server with the person's key, one through their Mac,
+a computer — until the device proves its keys open, and asks only the
+sockets of the session that opened a terminal to sign its login: no other
+device, this Mac included. So the engine proves on each such socket that
+the vault is open here, before it attaches the page's terminals: with a key
+of the vault, over the nonce tTerm gave the socket (an SSHSIG blob the
+engine builds itself, which no login is and the login signer refuses), or,
+with no key in the vault yet, with the vault password's proof while this
+Mac knows it (made, opened or set here since the vault opened). Lock says
+`vault.closed`. Its own changes of the vault (a new password, the keys of a
+move) go on a socket it proved for them. This Mac's own terminals and the
+servers through it need no proof in the app. A `mac` terminal (Through this Mac)
 the core opens with an `exec` of `ssh -- <target>`, which the engine runs
 directly in place of the login shell, in the classic mode.
 

@@ -9,6 +9,12 @@
 //! A key of another kind, a security key (sk-*), or one only an agent has is
 //! told apart with the reason the page shows, and its servers go through the
 //! Mac instead.
+//!
+//! From 0.8.1 a key also proves that the vault is open on this Mac (`prove`,
+//! vault-design.md v3): an SSHSIG blob the engine builds itself from the
+//! nonce of its socket to tTerm. And an ECDSA key whose secret number
+//! OpenSSH wrote shorter than its curve's (one in 256: it writes the number
+//! with no zero in front) is read too (`padded`), which ssh-key 0.6 does not.
 
 use crate::crypto::b64u;
 use num_bigint::BigUint;
@@ -155,7 +161,11 @@ pub fn read(text: &str, passphrase: Option<&str>) -> Result<VaultKey, Unread> {
     let key = parse(text)?;
     let key = if key.is_encrypted() {
         let phrase = passphrase.filter(|p| !p.is_empty()).ok_or(Unread::Passphrase)?;
-        key.decrypt(phrase).map_err(|_| Unread::WrongPassphrase)?
+        match key.decrypt(phrase) {
+            Ok(open) => open,
+            // A right passphrase, and the secret written short (0.8.1).
+            Err(_) => decrypt_padded(&key, phrase).ok_or(Unread::WrongPassphrase)?,
+        }
     } else {
         key
     };
@@ -178,9 +188,10 @@ pub fn read(text: &str, passphrase: Option<&str>) -> Result<VaultKey, Unread> {
 }
 
 /// A private key from the text of a file. A format this does not read (an
-/// old PEM key) is Broken, so its servers go through the Mac.
+/// old PEM key) is Broken, so its servers go through the Mac. An ECDSA key
+/// whose secret is written short is read padded (from 0.8.1).
 fn parse(text: &str) -> Result<PrivateKey, Unread> {
-    PrivateKey::from_openssh(text.trim()).map_err(|e| Unread::Broken(ssh_error(&e)))
+    PrivateKey::from_openssh(text.trim()).or_else(|e| padded(text).ok_or_else(|| Unread::Broken(ssh_error(&e))))
 }
 
 /// ssh-key's error in a few words, without its debug punctuation.
@@ -399,6 +410,159 @@ fn fixed(be: &[u8], len: usize) -> Option<Vec<u8>> {
     let mut out = vec![0u8; len - digits.len()];
     out.extend_from_slice(digits);
     Some(out)
+}
+
+// ------------------------------------------ ECDSA's secret written short
+
+/// The magic of OpenSSH's own private-key format (PROTOCOL.key).
+const OPENSSH_MAGIC: &[u8] = b"openssh-key-v1\0";
+
+/// The private part of an OpenSSH key, its ECDSA secret written shorter
+/// than the curve's (OpenSSH writes the number with no zero in front: one
+/// key in 256) padded to its full length, which is what ssh-key 0.6 reads;
+/// its padding after, for blocks of `block`. None when there is nothing to
+/// pad (another type, the full length) or it is not the shape it should be.
+/// Found by the build of the v0.8.0 tag: its test key was one of them.
+fn pad_section(section: &[u8], block: usize) -> Option<Zeroizing<Vec<u8>>> {
+    let mut at = section;
+    let (checks, rest) = at.split_at_checked(8)?;
+    at = rest;
+    let kind = take_string(&mut at)?;
+    let size = match kind {
+        b"ecdsa-sha2-nistp256" => 32,
+        b"ecdsa-sha2-nistp384" => 48,
+        _ => return None,
+    };
+    let curve = take_string(&mut at)?;
+    let point = take_string(&mut at)?;
+    let secret = take_string(&mut at)?;
+    let comment = take_string(&mut at)?;
+    // What follows is the padding: 1, 2, 3…
+    if !at.iter().enumerate().all(|(i, b)| usize::from(*b) == i + 1) {
+        return None;
+    }
+    if secret.is_empty() || secret.len() >= size {
+        return None;
+    }
+    let mut full = Zeroizing::new(vec![0u8; size - secret.len()]);
+    full.extend_from_slice(secret);
+    let mut out = Zeroizing::new(Vec::with_capacity(section.len() + size));
+    out.extend_from_slice(checks);
+    put_string(&mut out, kind);
+    put_string(&mut out, curve);
+    put_string(&mut out, point);
+    put_string(&mut out, &full);
+    put_string(&mut out, comment);
+    let mut next = 1u8;
+    while out.len() % block != 0 {
+        out.push(next);
+        next += 1;
+    }
+    Some(out)
+}
+
+/// An OpenSSH key with no passphrase, of the public key's blob and its
+/// private part: what ssh-key reads.
+fn unencrypted(public: &[u8], section: &[u8]) -> Option<PrivateKey> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    bytes.extend_from_slice(OPENSSH_MAGIC);
+    put_string(&mut bytes, b"none");
+    put_string(&mut bytes, b"none");
+    put_string(&mut bytes, b"");
+    bytes.extend_from_slice(&1u32.to_be_bytes());
+    put_string(&mut bytes, public);
+    put_string(&mut bytes, section);
+    PrivateKey::from_bytes(&bytes).ok()
+}
+
+/// A key with no passphrase that ssh-key did not read, read with its
+/// secret padded; None when that was not what kept it from reading.
+fn padded(text: &str) -> Option<PrivateKey> {
+    use base64::Engine as _;
+    let body: Zeroizing<String> = Zeroizing::new(text.trim().lines().filter(|l| !l.starts_with("-----")).map(str::trim).collect());
+    let raw = Zeroizing::new(base64::engine::general_purpose::STANDARD.decode(body.as_bytes()).ok()?);
+    let mut at = raw.strip_prefix(OPENSSH_MAGIC)?;
+    if take_string(&mut at)? != b"none" || take_string(&mut at)? != b"none" {
+        return None;
+    }
+    take_string(&mut at)?;
+    let (count, rest) = at.split_first_chunk::<4>()?;
+    at = rest;
+    if u32::from_be_bytes(*count) != 1 {
+        return None;
+    }
+    let public = take_string(&mut at)?;
+    let section = take_string(&mut at)?;
+    unencrypted(public, &pad_section(section, 8)?)
+}
+
+/// A key with a passphrase that ssh-key opened but did not read: its
+/// private part decrypted here as ssh-key does (the KDF, the cipher), its
+/// secret padded, and read as a key with no passphrase. None for a wrong
+/// passphrase (the check numbers differ), for a cipher with a tag (ssh-key
+/// keeps the tag to itself; OpenSSH writes aes256-ctr), or nothing to pad.
+fn decrypt_padded(key: &PrivateKey, passphrase: &str) -> Option<PrivateKey> {
+    let cipher = key.cipher();
+    let (secret, iv) = key.kdf().derive_key_and_iv(cipher, passphrase).ok()?;
+    let mut section = Zeroizing::new(key.key_data().encrypted()?.to_vec());
+    cipher.decrypt(&secret, &iv, &mut section, None).ok()?;
+    if section.len() < 8 || section[..4] != section[4..8] {
+        return None;
+    }
+    let public = key.public_key().to_bytes().ok()?;
+    unencrypted(&public, &pad_section(&section, 8)?)
+}
+
+// --------------------------------------- the proof of the vault open here
+
+/// What a key signs to prove the vault open on this Mac (0.8.1, the
+/// contract's v3): an SSHSIG blob (OpenSSH PROTOCOL.sshsig) of this
+/// namespace, hash sha512, over this message and the nonce of the socket.
+pub const PROOF_NAMESPACE: &str = "tterm-keys@tterm.net";
+pub const PROOF_MESSAGE: &str = "tterm keys open v1\n";
+/// A nonce as tTerm sends it: base64url of 32 bytes (43 characters); one
+/// longer than this is not one.
+const NONCE_MAX: usize = 128;
+
+/// The blob of the proof for `nonce`: "SSHSIG" · string(namespace) ·
+/// string("") · string("sha512") · string(SHA-512(message · nonce)). It
+/// starts with "SSHSIG", which no login does (one starts with the length of
+/// its session id), so neither stands for the other.
+pub fn proof_blob(nonce: &str) -> Vec<u8> {
+    let mut message = PROOF_MESSAGE.as_bytes().to_vec();
+    message.extend_from_slice(nonce.as_bytes());
+    let digest = ring::digest::digest(&ring::digest::SHA512, &message);
+    let mut out = b"SSHSIG".to_vec();
+    put_string(&mut out, PROOF_NAMESPACE.as_bytes());
+    put_string(&mut out, b"");
+    put_string(&mut out, b"sha512");
+    put_string(&mut out, digest.as_ref());
+    out
+}
+
+/// The algorithm a key of each type proves with.
+fn proof_alg(kind: &str) -> Option<&'static str> {
+    match kind {
+        ED25519 => Some(ALG_ED25519),
+        P256 => Some(ALG_P256),
+        P384 => Some(ALG_P384),
+        RSA => Some(ALG_RSA_SHA512),
+        _ => None,
+    }
+}
+
+/// The proof by the key in `plaintext` for the socket given `nonce`: the
+/// algorithm and the raw signature over `proof_blob(nonce)`, as `vault.prove`
+/// carries them. The blob is built here: nothing of the core's choosing is
+/// signed, only its nonce hashed into the engine's own blob.
+pub fn prove(plaintext: &[u8], nonce: &str) -> Result<(&'static str, Vec<u8>), SignError> {
+    if nonce.is_empty() || nonce.len() > NONCE_MAX || !nonce.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(SignError::Failed);
+    }
+    let secret: Secret = serde_json::from_slice(plaintext).map_err(|e| SignError::Key(e.to_string()))?;
+    let alg = proof_alg(&secret.kind).ok_or(SignError::Algorithm)?;
+    let sig = sign_raw(&secret, alg, &proof_blob(nonce))?;
+    Ok((alg, sig))
 }
 
 // ------------------------------------------------------ what is a login
